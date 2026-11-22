@@ -1,165 +1,299 @@
-const sites = [
-  {
-    name: 'Марианская впадина', ocean: 'Тихий океан', depth: '≈ 10 900 м', latitude: 11.35, longitude: 142.2,
-    summary: 'В Бездне Челленджера находится самая глубокая известная точка Мирового океана.',
-    story: '23 января 1960 года Жак Пикар и Дон Уолш впервые достигли дна Бездны Челленджера на батискафе «Триест». Спуск занял несколько часов. На такой глубине давление воды превышает атмосферное у поверхности более чем в тысячу раз.',
-    source: 'https://oceanservice.noaa.gov/facts/oceandepth.html'
-  },
-  {
-    name: 'Атлантический каньон', ocean: 'Атлантический океан', depth: '≈ 3 500 м', latitude: 39.6, longitude: -72.25,
-    summary: 'Каньон Гудзона прорезает континентальный склон у восточного побережья США.',
-    story: 'Каньон Гудзона начинается у края континентального шельфа и спускается в глубокую Атлантику. NOAA исследует здесь глубоководные кораллы, губки и сообщества, обитающие рядом с выходами метана.',
-    source: 'https://oceanexplorer.noaa.gov/'
-  },
-  {
-    name: 'Затерянный город', ocean: 'Атлантический океан', depth: '≈ 800 м', latitude: 30.13, longitude: -42.12,
-    summary: 'Светлые карбонатные башни поднимаются над дном Срединно-Атлантического хребта.',
-    story: 'Гидротермальное поле открыли в 2000 году. Вода реагирует с горными породами и выносит растворённые вещества, из которых растут карбонатные башни. Эти условия поддерживают сообщества микроорганизмов, живущих без солнечного света.',
-    source: 'https://oceanexplorer.noaa.gov/'
-  },
-  {
-    name: 'Зондский жёлоб', ocean: 'Индийский океан', depth: '≈ 7 200 м', latitude: -11.1, longitude: 114.9,
-    summary: 'Глубочайшая область Индийского океана лежит к югу от Индонезии.',
-    story: 'Зондский жёлоб сформировался там, где океаническая плита погружается под соседнюю плиту. В 2019 году экспедиция Five Deeps выполнила пилотируемое погружение в этот район и уточнила его глубину.',
-    source: 'https://fivedeeps.com/'
-  },
-  {
-    name: 'Каньон Монтерей', ocean: 'Тихий океан', depth: '≈ 4 000 м', latitude: 36.7, longitude: -122.5,
-    summary: 'Один из крупнейших подводных каньонов у тихоокеанского побережья Северной Америки.',
-    story: 'Каньон начинается рядом с побережьем Калифорнии. Исследователи MBARI наблюдают, как по его склонам движутся плотные потоки воды и осадка. Они способны переносить большие объёмы песка и менять рельеф дна.',
-    source: 'https://www.mbari.org/'
+const byId = id => document.getElementById(id);
+const canvas = byId('board');
+const ctx = canvas.getContext('2d');
+const slots = byId('slots');
+const instructions = byId('instructions');
+const dropButton = byId('drop');
+const storageKey = 'plinko-save-v1';
+const number = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const costs = [10, 25, 50];
+const rowCounts = [8, 12, 16];
+const profiles = {
+  calm: { label: 'Низкий', values: [0.7, 0.9, 1, 1.2, 1.5, 2, 3, 5, 8] },
+  swing: { label: 'Средний', values: [0.4, 0.7, 1.1, 1.4, 2, 4, 7, 14, 25] },
+  bold: { label: 'Высокий', values: [0.1, 0.4, 0.8, 1.4, 2.5, 5, 12, 30, 60] }
+};
+
+function load() {
+  try {
+    return JSON.parse(localStorage.getItem(storageKey)) || {};
+  } catch {
+    return {};
   }
-];
-
-const plot = document.querySelector('#plot');
-const detail = document.querySelector('#detail');
-const dialog = document.querySelector('#story');
-const canvas = document.querySelector('#world');
-
-function project(longitude, latitude) {
-  return [(longitude + 180) / 360, (83 - latitude) / 157];
 }
 
-function drawMap() {
-  const { width, height } = plot.getBoundingClientRect();
-  if (!width || !height) return;
-  const scale = window.devicePixelRatio || 1;
-  canvas.width = Math.round(width * scale);
-  canvas.height = Math.round(height * scale);
-  const ctx = canvas.getContext('2d');
-  ctx.scale(canvas.width / width, canvas.height / height);
+const saved = load();
+let balance = Number.isFinite(saved.balance) && saved.balance >= 0 ? saved.balance : 1000;
+let history = Array.isArray(saved.history) ? saved.history.slice(0, 8) : [];
+let rows = rowCounts.includes(saved.rows) ? saved.rows : 12;
+let risk = Object.hasOwn(profiles, saved.risk) ? saved.risk : 'swing';
+let cost = costs.includes(saved.cost) ? saved.cost : 25;
+let sound = saved.sound === true;
+let animation = null;
+let highlighted = -1;
+let audio;
 
-  function coordinate(longitude, latitude) {
-    const [x, y] = project(longitude, latitude);
-    return [x * width, y * height];
+if (saved.pending && Number.isFinite(saved.pending.reward) && saved.pending.reward >= 0) {
+  balance += saved.pending.reward;
+  history = [saved.pending.multiplier, ...history].slice(0, 8);
+}
+
+function persist() {
+  const pending = animation && { reward: animation.reward, multiplier: animation.multiplier };
+  try {
+    localStorage.setItem(storageKey, JSON.stringify({ balance, history, rows, risk, cost, sound, pending }));
+  } catch {
+    // Play still works when browser storage is unavailable.
   }
+}
 
-  ctx.strokeStyle = '#24475788';
+function multiplierText(value) {
+  return '×' + number.format(value);
+}
+
+function multipliers() {
+  const half = rows / 2;
+  const values = profiles[risk].values;
+  return Array.from({ length: rows + 1 }, (_, index) => {
+    const distance = Math.abs(index - half);
+    return values[Math.round(distance * (values.length - 1) / half)];
+  });
+}
+
+function refreshSlots() {
+  slots.replaceChildren(...multipliers().map(multiplier => {
+    const slot = document.createElement('span');
+    slot.className = 'slot';
+    slot.textContent = multiplierText(multiplier);
+    slot.style.backgroundColor = multiplier >= 10 ? '#f6a2e3' :
+      multiplier >= 3 ? '#d5afff' :
+      multiplier >= 1 ? '#dcff64' : '#a395c1';
+    return slot;
+  }));
+  byId('row-label').textContent = rows === 8 ? '8 РЯДОВ' : rows === 12 ? '12 РЯДОВ' : '16 РЯДОВ';
+}
+
+function drawHistory() {
+  const container = byId('history');
+  if (!history.length) {
+    container.textContent = 'Пока пусто';
+    return;
+  }
+  container.replaceChildren(...history.map(value => {
+    const chip = document.createElement('span');
+    chip.textContent = multiplierText(value);
+    return chip;
+  }));
+}
+
+function optionGroup(id, entries, selected, change) {
+  for (const [value, caption] of entries) {
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = id;
+    input.value = value;
+    input.checked = value === selected;
+    input.addEventListener('change', () => {
+      change(value);
+      persist();
+      refreshControls();
+    });
+    const title = document.createElement('span');
+    title.textContent = caption;
+    label.append(input, title);
+    byId(id).append(label);
+  }
+}
+
+function refreshControls() {
+  byId('balance').textContent = number.format(balance);
+  dropButton.disabled = Boolean(animation) || balance < cost;
+  byId('reset').disabled = Boolean(animation);
+  for (const input of document.querySelectorAll('.options input')) input.disabled = Boolean(animation);
+  byId('sound').setAttribute('aria-pressed', sound);
+}
+
+function chooseBoard() {
+  highlighted = -1;
+  refreshSlots();
+  draw();
+}
+
+optionGroup('costs', costs.map(value => [value, value]), cost, value => {
+  cost = value;
+  byId('status').textContent = balance < cost ? 'Недостаточно очков для этого броска.' : '';
+});
+optionGroup('risks', Object.entries(profiles).map(([key, profile]) => [key, profile.label]), risk, value => {
+  risk = value;
+  chooseBoard();
+});
+optionGroup('rows', rowCounts.map(value => [value, value]), rows, value => {
+  rows = value;
+  chooseBoard();
+});
+
+function center(index) {
+  const width = canvas.clientWidth;
+  const gap = 3;
+  return (index * (width + gap) / (rows + 1) + (width - gap * rows) / (rows + 1) / 2) * 640 / width;
+}
+
+function rowY(index) {
+  return 47 + index * 299 / (rows - 1);
+}
+
+function pinX(row, column) {
+  return center(rows / 2 + column - row / 2);
+}
+
+function dot(x, y, radius, color) {
   ctx.beginPath();
-  for (let longitude = -150; longitude < 180; longitude += 30) {
-    const [x] = coordinate(longitude, 0);
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, height);
-  }
-  for (let latitude = -60; latitude <= 60; latitude += 30) {
-    const [, y] = coordinate(0, latitude);
-    ctx.moveTo(0, y);
-    ctx.lineTo(width, y);
-  }
-  ctx.stroke();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
 
-  ctx.strokeStyle = '#427183';
-  ctx.fillStyle = '#1d4050';
-  for (const feature of land) {
-    const { type, coordinates } = feature.geometry;
-    const polygons = type === 'Polygon' ? [coordinates] : coordinates;
-    for (const polygon of polygons) {
-      ctx.beginPath();
-      for (const ring of polygon) {
-        ring.forEach(([longitude, latitude], index) => {
-          const [x, y] = coordinate(longitude, latitude);
-          if (index === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        });
-        ctx.closePath();
-      }
-      ctx.fill('evenodd');
-      ctx.stroke();
+function draw(ball) {
+  if (!canvas.clientWidth) return;
+  ctx.setTransform(canvas.width / 640, 0, 0, canvas.height / 385, 0, 0);
+  ctx.clearRect(0, 0, 640, 385);
+  ctx.strokeStyle = '#74589750';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(320, 19);
+  ctx.lineTo(center(0), 365);
+  ctx.lineTo(center(rows), 365);
+  ctx.closePath();
+  ctx.stroke();
+  const radius = rows === 16 ? 3.3 : 4.3;
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column <= row; column++) {
+      const x = pinX(row, column);
+      const y = rowY(row);
+      dot(x, y, radius + 2.2, '#a77bd42d');
+      dot(x, y, radius, '#e7d1ff');
     }
   }
+  ctx.shadowColor = '#ddff66';
+  ctx.shadowBlur = 16;
+  if (ball) dot(ball.x, ball.y, 8, '#dcff64');
+  else dot(320, 22, 7, '#dcff64');
+  ctx.shadowBlur = 0;
 }
 
-function openStory(site) {
-  document.querySelector('#story-ocean').textContent = site.ocean.toUpperCase();
-  document.querySelector('#story-title').textContent = site.name;
-  document.querySelector('#story-description').textContent = site.story;
-  document.querySelector('#story-source').href = site.source;
-  dialog.showModal();
+function resize() {
+  const width = canvas.clientWidth;
+  const ratio = devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(width * ratio));
+  canvas.height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+  draw();
 }
 
-function storyButton(site) {
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'text-button';
-  button.textContent = 'Читать историю ↗';
-  button.addEventListener('click', () => openStory(site));
-  return button;
-}
-
-function showSite(index) {
-  const site = sites[index];
-  markers.forEach((marker, position) => marker.setAttribute('aria-pressed', position === index));
-  detail.innerHTML = '<p class="meta"></p><h3></h3><p class="depth"></p><p class="summary"></p>';
-  detail.querySelector('.meta').textContent = site.ocean.toUpperCase();
-  detail.querySelector('h3').textContent = site.name;
-  detail.querySelector('.depth').textContent = site.depth;
-  detail.querySelector('.summary').textContent = site.summary;
-  detail.append(storyButton(site));
-}
-
-const markers = sites.map((site, index) => {
-  const marker = document.createElement('button');
-  const [x, y] = project(site.longitude, site.latitude);
-  marker.type = 'button';
-  marker.className = 'marker';
-  marker.style.left = `${x * 100}%`;
-  marker.style.top = `${y * 100}%`;
-  marker.title = site.name;
-  marker.setAttribute('aria-label', site.name);
-  marker.addEventListener('click', () => showSite(index));
-  plot.append(marker);
-  return marker;
-});
-
-for (const site of sites.slice(0, 3)) {
-  const card = document.createElement('article');
-  card.className = 'expedition-card';
-  card.innerHTML = '<p class="meta"></p><h3></h3><p></p>';
-  card.querySelector('.meta').textContent = site.ocean.toUpperCase();
-  card.querySelector('h3').textContent = site.name;
-  card.querySelector('p:last-child').textContent = site.summary;
-  card.append(storyButton(site));
-  document.querySelector('#expedition-list').append(card);
-}
-
-document.querySelector('#reset').addEventListener('click', () => showSite(0));
-dialog.setAttribute('aria-labelledby', 'story-title');
-dialog.addEventListener('click', event => {
-  if (event.target === dialog) dialog.close();
-});
-
-const links = [...document.querySelectorAll('nav a')];
-function updateNavigation() {
-  const target = window.location.hash || '#top';
-  for (const link of links) {
-    const active = link.hash === target;
-    link.classList.toggle('active', active);
-    if (active) link.setAttribute('aria-current', 'location');
-    else link.removeAttribute('aria-current');
+function chime(frequency, duration) {
+  if (!sound) return;
+  try {
+    audio ||= new AudioContext();
+    if (audio.state !== 'running') void audio.resume().catch(() => {});
+    const tone = audio.createOscillator();
+    const volume = audio.createGain();
+    const now = audio.currentTime;
+    tone.type = 'sine';
+    tone.frequency.value = frequency;
+    volume.gain.setValueAtTime(0.06, now);
+    volume.gain.exponentialRampToValueAtTime(0.001, now + duration);
+    tone.connect(volume).connect(audio.destination);
+    tone.start(now);
+    tone.stop(now + duration);
+  } catch {
+    // Audio is optional.
   }
 }
 
-window.addEventListener('hashchange', updateNavigation);
-updateNavigation();
-showSite(0);
-new ResizeObserver(drawMap).observe(plot);
+function finish() {
+  const { index, multiplier, reward } = animation;
+  animation = null;
+  highlighted = index;
+  slots.children[highlighted].classList.add('active');
+  balance = Math.round((balance + reward) * 10) / 10;
+  history = [multiplier, ...history].slice(0, 8);
+  byId('status').textContent = multiplierText(multiplier) + ' · +' + number.format(reward) + ' очков';
+  chime(multiplier >= 1 ? 680 : 410, 0.25);
+  persist();
+  drawHistory();
+  refreshControls();
+  draw();
+}
+
+function animate(time) {
+  const { path, start } = animation;
+  const position = (time - start) / 105;
+  const step = Math.max(0, Math.floor(position));
+  if (step >= path.length - 1) {
+    finish();
+    return;
+  }
+  const fraction = Math.max(0, position - step);
+  const from = path[step];
+  const to = path[step + 1];
+  if (step && step !== animation.lastStep) chime(290 + step * 18, 0.065);
+  animation.lastStep = step;
+  draw({
+    x: center(from.column + (to.column - from.column) * fraction),
+    y: from.y + (to.y - from.y) * fraction ** 1.35 - Math.sin(Math.PI * fraction) * (step ? 7 : 0)
+  });
+  requestAnimationFrame(animate);
+}
+
+function drop() {
+  if (animation || balance < cost) return;
+  slots.children[highlighted]?.classList.remove('active');
+  highlighted = -1;
+  const path = [{ column: rows / 2, y: 22 }];
+  let index = 0;
+  for (let row = 0; row < rows; row++) {
+    path.push({ column: rows / 2 + index - row / 2, y: rowY(row) - 8 });
+    index += Math.random() < 0.5 ? 0 : 1;
+  }
+  path.push({ column: index, y: 380 });
+  const multiplier = multipliers()[index];
+  balance -= cost;
+  animation = { path, index, multiplier, reward: Math.round(cost * multiplier * 10) / 10, start: performance.now() };
+  byId('status').textContent = 'Шарик в игре…';
+  persist();
+  refreshControls();
+  chime(340, 0.15);
+  if (reducedMotion.matches) finish();
+  else requestAnimationFrame(animate);
+}
+
+dropButton.addEventListener('click', drop);
+byId('reset').addEventListener('click', () => {
+  if (animation) return;
+  balance = 1000;
+  history = [];
+  byId('status').textContent = 'Новая игра';
+  chooseBoard();
+  drawHistory();
+  refreshControls();
+  persist();
+});
+byId('help').addEventListener('click', () => instructions.showModal());
+byId('sound').addEventListener('click', () => {
+  sound = !sound;
+  if (sound) chime(520, 0.16);
+  refreshControls();
+  persist();
+});
+window.addEventListener('keydown', event => {
+  if (event.code !== 'Space' || event.repeat || instructions.open ||
+      event.target.closest('button, a, input, textarea, select, [contenteditable]')) return;
+  event.preventDefault();
+  drop();
+});
+refreshSlots();
+drawHistory();
+refreshControls();
+persist();
+new ResizeObserver(resize).observe(canvas);
