@@ -2,64 +2,105 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#15121f">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101015">
   <title>КАЗИК — игровой зал</title>
   <link rel="stylesheet" href="style.css">
   <script defer src="app.js"></script>
 </head>
 <body>
+  <div class="phone">
   <header class="topbar">
-    <a class="brand" href="./" aria-label="Казик, главная"><span class="brand-icon" aria-hidden="true">✳</span> КАЗИК<span>.</span></a>
-    <div class="top-actions">
-      <button id="help" class="quiet" type="button">Правила</button>
-      <button id="sound" class="icon-button" type="button" aria-pressed="false" aria-label="Звук" title="Звук"><span aria-hidden="true">♪</span></button>
-      <button id="profile" class="profile-button" type="button"><span id="avatar" aria-hidden="true">И</span><span>Профиль</span></button>
-    </div>
+    <a class="brand" href="#games" aria-label="Казик, список игр"><span class="brand-icon" aria-hidden="true">✳</span> КАЗИК<span class="brand-period">.</span></a>
+    <a class="wallet" href="#profile" aria-label="Баланс, открыть профиль"><span aria-hidden="true">◈</span> <strong id="balance">1 000</strong></a>
   </header>
   <main class="shell">
-    <div class="heading">
-      <div><h1>Игровой зал<span>.</span></h1><p>Выбери игру и ставку в виртуальных очках.</p></div>
-      <div class="balance"><span>Баланс</span><strong id="balance">1 000</strong><span>очков</span></div>
-    </div>
-    <nav class="game-nav" aria-label="Игры">
-      <button type="button" data-game="plinko" aria-pressed="true"><span aria-hidden="true">⠿</span><strong>Плинко</strong></button>
-      <button type="button" data-game="dice" aria-pressed="false"><span aria-hidden="true">⚄</span><strong>Кости</strong></button>
-      <button type="button" data-game="coin" aria-pressed="false"><span aria-hidden="true">◉</span><strong>Орёл и решка</strong></button>
-    </nav>
-    <div class="game">
-      <section class="field" aria-labelledby="game-name">
-        <div class="field-top"><span><i></i> <span id="game-name">Плинко</span></span><span id="row-label">12 РЯДОВ</span></div>
-        <div class="board" id="plinko-board">
-          <canvas id="board" aria-hidden="true"></canvas>
-          <div class="slots" id="slots" aria-label="Множители"></div>
-        </div>
-        <div class="chance-board" id="chance-board" hidden>
-          <div id="chance-piece" aria-hidden="true"></div>
-          <p id="chance-caption"></p>
-        </div>
-        <div class="results">
-          <span class="micro">ПОСЛЕДНИЕ РАУНДЫ</span>
-          <div id="history" class="history"></div>
-        </div>
+    <section id="games-screen" aria-labelledby="games-title">
+      <div class="heading"><h1 id="games-title" tabindex="-1">Игровой зал</h1><p>Выбери мини-игру</p></div>
+      <div class="game-cards">
+        <a class="game-card card-plinko" href="#plinko">
+          <span class="card-copy"><strong>Плинко</strong><small>Шарик и множители</small></span><span class="card-arrow" aria-hidden="true"></span>
+        </a>
+        <a class="game-card card-dice" href="#dice">
+          <span class="card-copy"><strong>Кости</strong><small>Угадай диапазон</small></span><span class="card-arrow" aria-hidden="true"></span>
+        </a>
+        <a class="game-card card-coin" href="#coin">
+          <span class="card-copy"><strong>Орёл и решка</strong><small>Выбери сторону</small></span><span class="card-arrow" aria-hidden="true"></span>
+        </a>
+      </div>
+      <p class="screen-note">Игры на виртуальные очки</p>
+    </section>
+    <section id="play-screen" hidden aria-labelledby="play-title">
+      <div class="play-heading">
+        <a class="back" href="#games" aria-label="К списку игр"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7"/></svg></a>
+        <h1 id="play-title" tabindex="-1"></h1>
+        <button id="game-help" class="quiet" type="button">Правила</button>
+      </div>
+      <div class="game">
+        <section class="field" aria-labelledby="game-name">
+          <div class="field-top"><span><i></i> <span id="game-name">Плинко</span></span><span id="row-label">12 РЯДОВ</span></div>
+          <div class="board" id="plinko-board">
+            <canvas id="board" aria-hidden="true"></canvas>
+            <div class="slots" id="slots" aria-label="Множители"></div>
+          </div>
+          <div class="chance-board" id="chance-board" hidden>
+            <div id="chance-piece" aria-hidden="true"></div>
+            <p id="chance-caption"></p>
+          </div>
+          <div class="results">
+            <span class="micro">ПОСЛЕДНИЕ РАУНДЫ</span>
+            <div id="history" class="history"></div>
+          </div>
+        </section>
+        <aside class="controls" aria-label="Настройки раунда">
+          <h2>Ставка</h2>
+          <fieldset><legend>Виртуальные очки</legend><div class="options" id="costs"></div></fieldset>
+          <div id="plinko-options" class="game-options">
+            <fieldset><legend>Разброс множителей</legend><div class="options" id="risks"></div></fieldset>
+            <fieldset><legend>Ряды</legend><div class="options" id="rows"></div></fieldset>
+          </div>
+          <fieldset id="dice-options" hidden><legend>Какое число выпадет?</legend><div class="options binary" id="dice-picks"></div></fieldset>
+          <fieldset id="coin-options" hidden><legend>Какая сторона выпадет?</legend><div class="options binary" id="coin-picks"></div></fieldset>
+          <button type="button" id="drop" class="drop">↓ Бросить шарик</button>
+          <p class="status" id="status" role="status"></p>
+          <p class="status" id="funds" hidden>Баланс меньше выбранной ставки.</p>
+        </aside>
+      </div>
+    </section>
+    <section id="profile-screen" hidden aria-labelledby="profile-title">
+      <div class="heading"><h1 id="profile-title" tabindex="-1">Профиль</h1></div>
+      <div class="identity">
+        <span id="avatar" aria-hidden="true">И</span>
+        <strong id="profile-name">Игрок</strong>
+      </div>
+      <div class="profile-wallet">
+        <span>Баланс</span>
+        <strong id="profile-balance">1 000</strong>
+        <small>Виртуальные очки</small>
+      </div>
+      <dl class="profile-stats">
+        <div><dt>Сыграно раундов</dt><dd id="profile-rounds"></dd></div>
+        <div><dt>Лучшая выплата</dt><dd id="profile-best"></dd></div>
+      </dl>
+      <section class="settings" aria-labelledby="settings-title">
+        <h2 id="settings-title">Настройки</h2>
+        <button type="button" id="edit-profile">Изменить имя <span aria-hidden="true">›</span></button>
+        <button type="button" id="sound" role="switch" aria-checked="false">Звук <span class="toggle" aria-hidden="true"></span></button>
+        <button type="button" id="profile-help">Правила игр <span aria-hidden="true">›</span></button>
       </section>
-      <aside class="controls" aria-label="Настройки раунда">
-        <h2>Ставка</h2>
-        <fieldset><legend>Виртуальные очки</legend><div class="options" id="costs"></div></fieldset>
-        <div id="plinko-options" class="game-options">
-          <fieldset><legend>Разброс множителей</legend><div class="options" id="risks"></div></fieldset>
-          <fieldset><legend>Ряды</legend><div class="options" id="rows"></div></fieldset>
-        </div>
-        <fieldset id="dice-options" hidden><legend>Какое число выпадет?</legend><div class="options binary" id="dice-picks"></div></fieldset>
-        <fieldset id="coin-options" hidden><legend>Какая сторона выпадет?</legend><div class="options binary" id="coin-picks"></div></fieldset>
-        <button type="button" id="drop" class="drop">↓ Бросить шарик</button>
-        <p class="shortcut"><kbd>Space</kbd> быстрый ход</p>
-        <p class="status" id="status" role="status"></p>
-        <p class="status" id="funds" hidden>Баланс меньше выбранной ставки.</p>
-      </aside>
-    </div>
-    <footer>Виртуальные очки · без денежных операций</footer>
+    </section>
   </main>
+  <nav class="bottom-nav" aria-label="Основное меню">
+    <a id="nav-games" href="#games" aria-current="page">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
+      Игры
+    </a>
+    <a id="nav-profile" href="#profile">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 21v-2a5 5 0 0 1 5-5h5a5 5 0 0 1 5 5v2"/></svg>
+      Профиль
+    </a>
+  </nav>
+  </div>
   <dialog id="instructions" aria-labelledby="help-title">
     <form method="dialog">
       <h2 id="help-title">Правила</h2>
@@ -69,18 +110,15 @@
       <button class="drop">Понятно</button>
     </form>
   </dialog>
-  <dialog id="profile-dialog" aria-labelledby="profile-title">
+  <dialog id="profile-dialog" aria-labelledby="edit-title">
     <form id="profile-form" method="dialog">
-      <h2 id="profile-title">Профиль</h2>
-      <p>Профиль и баланс сохраняются в этом браузере.</p>
+      <h2 id="edit-title">Изменить имя</h2>
       <label class="name-label" for="nickname">Имя игрока</label>
-      <input id="nickname" maxlength="24" required autocomplete="off">
-      <dl class="profile-stats">
-        <div><dt>Баланс</dt><dd id="profile-balance"></dd></div>
-        <div><dt>Сыграно раундов</dt><dd id="profile-rounds"></dd></div>
-        <div><dt>Лучшая выплата</dt><dd id="profile-best"></dd></div>
-      </dl>
-      <button class="drop">Сохранить имя</button>
+      <input id="nickname" maxlength="24" required autocomplete="off" autofocus>
+      <div class="dialog-actions">
+        <button class="quiet" type="button" id="cancel-name">Отмена</button>
+        <button class="drop">Сохранить</button>
+      </div>
     </form>
   </dialog>
 </body>

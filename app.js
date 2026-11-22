@@ -13,7 +13,7 @@ const games = {
   dice: { label: 'Кости', action: 'Бросить кубик', rule: 'Выплата ×1,9' },
   coin: { label: 'Орёл и решка', action: 'Подбросить монету', rule: 'Выплата ×2' }
 };
-const dieFaces = ['⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
+const dieFaces = [[4], [0, 8], [0, 4, 8], [0, 2, 6, 8], [0, 2, 4, 6, 8], [0, 2, 3, 5, 6, 8]];
 const coinSides = ['Орёл', 'Решка'];
 const rowCounts = [8, 12, 16];
 const profiles = {
@@ -36,7 +36,8 @@ const recent = Object.fromEntries(Object.keys(games).map(key => {
   const previous = saved.recent?.[key] ?? (key === 'plinko' ? saved.history : undefined);
   return [key, Array.isArray(previous) ? previous.filter(Number.isFinite).slice(0, 8) : []];
 }));
-let game = Object.hasOwn(games, saved.game) ? saved.game : 'plinko';
+let game;
+let deferredRoute = false;
 let nickname = typeof saved.nickname === 'string' && saved.nickname.trim() ? saved.nickname : 'Игрок';
 let rounds = Number.isSafeInteger(saved.rounds) ? saved.rounds : 0;
 let best = Number.isFinite(saved.best) ? saved.best : 0;
@@ -136,10 +137,11 @@ function refreshControls() {
   byId('balance').textContent = number.format(balance);
   dropButton.disabled = Boolean(animation) || balance < cost;
   byId('funds').hidden = balance >= cost;
-  byId('profile').disabled = Boolean(animation);
-  for (const button of document.querySelectorAll('[data-game]')) button.disabled = Boolean(animation);
+  byId('profile-balance').textContent = number.format(balance);
+  byId('profile-rounds').textContent = number.format(rounds);
+  byId('profile-best').textContent = number.format(best);
   for (const input of document.querySelectorAll('.options input')) input.disabled = Boolean(animation);
-  byId('sound').setAttribute('aria-pressed', sound);
+  byId('sound').setAttribute('aria-checked', sound);
 }
 
 function chooseBoard() {
@@ -241,6 +243,22 @@ function chime(frequency, duration) {
   }
 }
 
+function drawChancePiece(index) {
+  const piece = byId('chance-piece');
+  if (game === 'coin') {
+    piece.textContent = index === undefined ? '◈' : coinSides[index][0];
+    return;
+  }
+  const face = document.createElement('span');
+  face.className = 'die-pips';
+  for (let cell = 0; cell < 9; cell++) {
+    const pip = document.createElement('i');
+    pip.classList.toggle('pip', dieFaces[index ?? 4].includes(cell));
+    face.append(pip);
+  }
+  piece.replaceChildren(face);
+}
+
 function finish() {
   const round = animation;
   animation = null;
@@ -251,7 +269,7 @@ function finish() {
     draw();
   } else {
     byId('chance-piece').classList.remove('rolling');
-    byId('chance-piece').textContent = game === 'dice' ? dieFaces[round.index] : coinSides[round.index][0];
+    drawChancePiece(round.index);
     byId('chance-caption').textContent = game === 'dice' ? 'Выпало: ' + (round.index + 1) : coinSides[round.index];
   }
   byId('status').textContent = multiplierText(round.multiplier) + ' · +' + number.format(round.reward) + ' очков';
@@ -259,6 +277,7 @@ function finish() {
   persist();
   drawHistory();
   refreshControls();
+  if (deferredRoute) renderRoute(true);
 }
 
 function animate(time) {
@@ -274,7 +293,7 @@ function animate(time) {
   const to = path[step + 1];
   if (step && step !== animation.lastStep) chime(290 + step * 18, 0.065);
   animation.lastStep = step;
-  draw({
+  if (canvas.clientWidth) draw({
     x: center(from.column + (to.column - from.column) * fraction),
     y: from.y + (to.y - from.y) * fraction ** 1.35 - Math.sin(Math.PI * fraction) * (step ? 7 : 0)
   });
@@ -324,14 +343,12 @@ function selectGame(key) {
   game = key;
   const plinko = game === 'plinko';
   const details = games[game];
-  for (const button of document.querySelectorAll('[data-game]')) {
-    button.setAttribute('aria-pressed', button.dataset.game === game);
-  }
   byId('plinko-board').hidden = !plinko;
   byId('plinko-options').hidden = !plinko;
   byId('chance-board').hidden = plinko;
   byId('dice-options').hidden = game !== 'dice';
   byId('coin-options').hidden = game !== 'coin';
+  byId('play-title').textContent = details.label;
   byId('game-name').textContent = details.label;
   dropButton.textContent = details.action;
   byId('status').textContent = '';
@@ -341,24 +358,42 @@ function selectGame(key) {
   } else {
     byId('row-label').textContent = details.rule;
     byId('chance-piece').classList.toggle('coin', game === 'coin');
-    byId('chance-piece').textContent = game === 'dice' ? dieFaces[4] : '◈';
+    drawChancePiece();
     byId('chance-caption').textContent = 'Выбери прогноз и начни раунд.';
   }
   drawHistory();
   persist();
 }
 
-function updateAvatar() {
-  byId('avatar').textContent = Array.from(nickname)[0].toUpperCase();
+function renderRoute(moveFocus = false) {
+  const route = location.hash.slice(1);
+  const playsGame = Object.hasOwn(games, route);
+  const profile = route === 'profile';
+  deferredRoute = Boolean(playsGame && animation && route !== game);
+  if (deferredRoute) return;
+  byId('games-screen').hidden = playsGame || profile;
+  byId('play-screen').hidden = !playsGame;
+  byId('profile-screen').hidden = !profile;
+  byId('nav-games').toggleAttribute('aria-current', !profile);
+  byId('nav-profile').toggleAttribute('aria-current', profile);
+  byId(profile ? 'nav-profile' : 'nav-games').setAttribute('aria-current', 'page');
+  if (playsGame && route !== game) selectGame(route);
+  if (moveFocus) {
+    byId(profile ? 'profile-title' : playsGame ? 'play-title' : 'games-title').focus({ preventScroll: true });
+    window.scrollTo(0, 0);
+  }
 }
 
-byId('profile').addEventListener('click', () => {
+function updateAvatar() {
+  byId('avatar').textContent = Array.from(nickname)[0].toUpperCase();
+  byId('profile-name').textContent = nickname;
+}
+
+byId('edit-profile').addEventListener('click', () => {
   byId('nickname').value = nickname;
-  byId('profile-balance').textContent = number.format(balance);
-  byId('profile-rounds').textContent = number.format(rounds);
-  byId('profile-best').textContent = number.format(best);
   byId('profile-dialog').showModal();
 });
+byId('cancel-name').addEventListener('click', () => byId('profile-dialog').close());
 byId('profile-form').addEventListener('submit', event => {
   const name = byId('nickname').value.trim();
   if (!name) {
@@ -371,11 +406,11 @@ byId('profile-form').addEventListener('submit', event => {
   updateAvatar();
   persist();
 });
-for (const button of document.querySelectorAll('[data-game]')) {
-  button.addEventListener('click', () => selectGame(button.dataset.game));
-}
+window.addEventListener('hashchange', () => renderRoute(true));
 dropButton.addEventListener('click', play);
-byId('help').addEventListener('click', () => instructions.showModal());
+for (const id of ['game-help', 'profile-help']) {
+  byId(id).addEventListener('click', () => instructions.showModal());
+}
 byId('sound').addEventListener('click', () => {
   sound = !sound;
   if (sound) chime(520, 0.16);
@@ -383,12 +418,13 @@ byId('sound').addEventListener('click', () => {
   persist();
 });
 window.addEventListener('keydown', event => {
-  if (event.code !== 'Space' || event.repeat || (instructions.open || byId('profile-dialog').open) ||
+  if (byId('play-screen').hidden || event.code !== 'Space' || event.repeat || (instructions.open || byId('profile-dialog').open) ||
       event.target.closest('button, a, input, textarea, select, [contenteditable]')) return;
   event.preventDefault();
   play();
 });
 updateAvatar();
-selectGame(game);
+renderRoute();
 refreshControls();
+persist();
 new ResizeObserver(resize).observe(canvas);
