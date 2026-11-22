@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#050e19">
+<meta name="description" content="Интерактивный атлас океанских глубин. Исследуйте Марианскую впадину, гидротермальные источники и подводные каньоны.">
+<title>БАТИСКАФ — Атлас глубин</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700;800;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script defer src="assets/land.js"></script>
+<script defer src="app.js"></script>
+</head>
+<body>
+<header class="header">
+  <div class="wrap navbar">
+    <a class="brand" href="#top" aria-label="Батискаф, на главную"><span class="sonar" aria-hidden="true"></span><span>БАТИСКАФ<small>АТЛАС ГЛУБИН</small></span></a>
+    <nav aria-label="Основная навигация"><a href="#top" class="active">Главная</a><a href="#atlas">Атлас</a><a href="#expeditions">Экспедиции</a></nav>
+    <a class="header-link" href="#atlas">К КАРТЕ <span aria-hidden="true">↗</span></a>
+  </div>
+</header>
+<main id="top">
+<section class="hero" aria-labelledby="hero-title">
+  <div class="wrap hero-inner">
+    <div class="hero-copy">
+      <p class="eyebrow"><span class="signal"></span> ИНТЕРАКТИВНЫЙ АТЛАС ОКЕАНА</p>
+      <h1 id="hero-title">На глубине<span>мирового океана</span></h1>
+      <p class="intro">От залитых солнцем вод до вечной темноты океанских желобов. Погрузитесь туда, где поверхность становится далёким воспоминанием.</p>
+      <a class="primary" href="#atlas"><span aria-hidden="true">↓</span> Начать погружение</a>
+    </div>
+    <div class="hero-foot"><a href="#atlas"><span aria-hidden="true">↓</span> ПРОКРУТИТЕ ДЛЯ ПОГРУЖЕНИЯ</a><span>71% ПОВЕРХНОСТИ ЗЕМЛИ <i></i> 5 ОКЕАНОВ</span></div>
+  </div>
+  <div class="depth-ruler" aria-hidden="true"><span>0 м</span><span>200 м</span><span>1 000 м</span><span>4 000 м</span><span>6 000 м</span></div>
+</section>
+<section class="wrap atlas" id="atlas" aria-labelledby="atlas-title">
+  <div class="section-heading"><div><p class="eyebrow"><span class="signal"></span> МИРОВОЙ ОКЕАН</p><h2 id="atlas-title">Карта глубин</h2></div><p>Выберите точку на карте, чтобы узнать, что скрывается под поверхностью.</p></div>
+  <div class="map-layout">
+    <div class="map" id="map">
+      <div class="map-top"><span><i></i> ТОЧКИ ПОГРУЖЕНИЯ</span><button id="reset" type="button" title="Вернуться к первой точке" aria-label="Вернуться к первой точке">⌖</button></div>
+      <div class="plot" id="plot"><canvas id="world" aria-hidden="true"></canvas></div>
+      <div class="map-bottom"><span>180° З. Д.</span><span>0°</span><span>180° В. Д.</span></div>
+    </div>
+    <article class="detail" id="detail" aria-live="polite"></article>
+  </div>
+</section>
+<section class="wrap expedition" id="expeditions" aria-labelledby="expedition-title">
+  <p class="eyebrow"><span class="signal"></span> ПОЛЕВОЙ ЖУРНАЛ</p>
+  <h2 id="expedition-title">Экспедиции</h2>
+  <div class="expedition-grid" id="expedition-list"></div>
+</section>
+</main>
+<footer><div class="wrap footer-inner"><a class="brand" href="#top"><span class="sonar" aria-hidden="true"></span>БАТИСКАФ</a><span>Интерактивный атлас Мирового океана</span><a href="#top">Наверх ↑</a></div></footer>
+<dialog id="story"><div class="story-inner"><form method="dialog"><button aria-label="Закрыть">×</button></form><p class="eyebrow" id="story-ocean"></p><h2 id="story-title"></h2><p id="story-description"></p><a id="story-source" target="_blank" rel="noopener noreferrer">Источник ↗</a></div></dialog>
+</body>
+</html>
