@@ -4,54 +4,83 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#15121f">
-  <title>Плинко — мини-игра</title>
+  <title>КАЗИК — игровой зал</title>
   <link rel="stylesheet" href="style.css">
   <script defer src="app.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="./" aria-label="Плинко, главная"><span class="brand-icon" aria-hidden="true">⠿</span> ПЛИНКО<span>.</span></a>
+    <a class="brand" href="./" aria-label="Казик, главная"><span class="brand-icon" aria-hidden="true">✳</span> КАЗИК<span>.</span></a>
     <div class="top-actions">
-      <button id="help" class="quiet" type="button">Как играть</button>
+      <button id="help" class="quiet" type="button">Правила</button>
       <button id="sound" class="icon-button" type="button" aria-pressed="false" aria-label="Звук" title="Звук"><span aria-hidden="true">♪</span></button>
+      <button id="profile" class="profile-button" type="button"><span id="avatar" aria-hidden="true">И</span><span>Профиль</span></button>
     </div>
   </header>
   <main class="shell">
     <div class="heading">
-      <div><h1>Плинко<span>.</span></h1><p>Запускай шарики и набирай очки.</p></div>
+      <div><h1>Игровой зал<span>.</span></h1><p>Выбери игру и ставку в виртуальных очках.</p></div>
       <div class="balance"><span>Баланс</span><strong id="balance">1 000</strong><span>очков</span></div>
     </div>
+    <nav class="game-nav" aria-label="Игры">
+      <button type="button" data-game="plinko" aria-pressed="true"><span aria-hidden="true">⠿</span><strong>Плинко</strong></button>
+      <button type="button" data-game="dice" aria-pressed="false"><span aria-hidden="true">⚄</span><strong>Кости</strong></button>
+      <button type="button" data-game="coin" aria-pressed="false"><span aria-hidden="true">◉</span><strong>Орёл и решка</strong></button>
+    </nav>
     <div class="game">
-      <section class="field" aria-label="Игровое поле">
-        <div class="field-top"><span><i></i> ИГРОВОЕ ПОЛЕ</span><span id="row-label">12 РЯДОВ</span></div>
-        <div class="board">
+      <section class="field" aria-labelledby="game-name">
+        <div class="field-top"><span><i></i> <span id="game-name">Плинко</span></span><span id="row-label">12 РЯДОВ</span></div>
+        <div class="board" id="plinko-board">
           <canvas id="board" aria-hidden="true"></canvas>
           <div class="slots" id="slots" aria-label="Множители"></div>
         </div>
+        <div class="chance-board" id="chance-board" hidden>
+          <div id="chance-piece" aria-hidden="true"></div>
+          <p id="chance-caption"></p>
+        </div>
         <div class="results">
-          <span class="micro">ПОСЛЕДНИЕ БРОСКИ</span>
+          <span class="micro">ПОСЛЕДНИЕ РАУНДЫ</span>
           <div id="history" class="history"></div>
         </div>
       </section>
-      <aside class="controls" aria-label="Настройки броска">
-        <h2>Настройки</h2>
-        <fieldset><legend>Очки за бросок</legend><div class="options" id="costs"></div></fieldset>
-        <fieldset><legend>Разброс множителей</legend><div class="options" id="risks"></div></fieldset>
-        <fieldset><legend>Ряды</legend><div class="options" id="rows"></div></fieldset>
-        <button type="button" id="drop" class="drop"><span aria-hidden="true">↓</span> Бросить шарик</button>
-        <p class="shortcut"><kbd>Space</kbd> быстрый бросок</p>
+      <aside class="controls" aria-label="Настройки раунда">
+        <h2>Ставка</h2>
+        <fieldset><legend>Виртуальные очки</legend><div class="options" id="costs"></div></fieldset>
+        <div id="plinko-options" class="game-options">
+          <fieldset><legend>Разброс множителей</legend><div class="options" id="risks"></div></fieldset>
+          <fieldset><legend>Ряды</legend><div class="options" id="rows"></div></fieldset>
+        </div>
+        <fieldset id="dice-options" hidden><legend>Какое число выпадет?</legend><div class="options binary" id="dice-picks"></div></fieldset>
+        <fieldset id="coin-options" hidden><legend>Какая сторона выпадет?</legend><div class="options binary" id="coin-picks"></div></fieldset>
+        <button type="button" id="drop" class="drop">↓ Бросить шарик</button>
+        <p class="shortcut"><kbd>Space</kbd> быстрый ход</p>
         <p class="status" id="status" role="status"></p>
-        <button type="button" id="reset" class="quiet reset">Начать заново</button>
+        <p class="status" id="funds" hidden>Баланс меньше выбранной ставки.</p>
       </aside>
     </div>
-    <footer>Игра на виртуальные очки</footer>
+    <footer>Виртуальные очки · без денежных операций</footer>
   </main>
   <dialog id="instructions" aria-labelledby="help-title">
     <form method="dialog">
-      <h2 id="help-title">Как играть</h2>
-      <p>Выбери стоимость броска и нажми «Бросить шарик». Шарик отклоняется влево или вправо у каждого ряда и в конце попадает в одну из ячеек.</p>
-      <p>Номер в ячейке умножает стоимость броска. Например, бросок за 25 очков и ячейка ×2 дадут 50 очков. Чем выше разброс множителей, тем сильнее отличаются награды в центре и по краям.</p>
+      <h2 id="help-title">Правила</h2>
+      <p><strong>Плинко.</strong> Шарик случайно отклоняется влево или вправо у каждого ряда. Ячейка, в которую он попадает, определяет множитель выплаты.</p>
+      <p><strong>Кости.</strong> Угадай диапазон от 1 до 3 или от 4 до 6. Верный прогноз возвращает ставку с множителем ×1,9.</p>
+      <p><strong>Орёл и решка.</strong> Угадай сторону монеты. Верный выбор возвращает удвоенную ставку.</p>
       <button class="drop">Понятно</button>
+    </form>
+  </dialog>
+  <dialog id="profile-dialog" aria-labelledby="profile-title">
+    <form id="profile-form" method="dialog">
+      <h2 id="profile-title">Профиль</h2>
+      <p>Профиль и баланс сохраняются в этом браузере.</p>
+      <label class="name-label" for="nickname">Имя игрока</label>
+      <input id="nickname" maxlength="24" required autocomplete="off">
+      <dl class="profile-stats">
+        <div><dt>Баланс</dt><dd id="profile-balance"></dd></div>
+        <div><dt>Сыграно раундов</dt><dd id="profile-rounds"></dd></div>
+        <div><dt>Лучшая выплата</dt><dd id="profile-best"></dd></div>
+      </dl>
+      <button class="drop">Сохранить имя</button>
     </form>
   </dialog>
 </body>

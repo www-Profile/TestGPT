@@ -8,6 +8,13 @@ const storageKey = 'plinko-save-v1';
 const number = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const costs = [10, 25, 50];
+const games = {
+  plinko: { label: 'Плинко', action: '↓ Бросить шарик' },
+  dice: { label: 'Кости', action: 'Бросить кубик', rule: 'Выплата ×1,9' },
+  coin: { label: 'Орёл и решка', action: 'Подбросить монету', rule: 'Выплата ×2' }
+};
+const dieFaces = ['⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
+const coinSides = ['Орёл', 'Решка'];
 const rowCounts = [8, 12, 16];
 const profiles = {
   calm: { label: 'Низкий', values: [0.7, 0.9, 1, 1.2, 1.5, 2, 3, 5, 8] },
@@ -25,7 +32,16 @@ function load() {
 
 const saved = load();
 let balance = Number.isFinite(saved.balance) && saved.balance >= 0 ? saved.balance : 1000;
-let history = Array.isArray(saved.history) ? saved.history.slice(0, 8) : [];
+const recent = Object.fromEntries(Object.keys(games).map(key => {
+  const previous = saved.recent?.[key] ?? (key === 'plinko' ? saved.history : undefined);
+  return [key, Array.isArray(previous) ? previous.filter(Number.isFinite).slice(0, 8) : []];
+}));
+let game = Object.hasOwn(games, saved.game) ? saved.game : 'plinko';
+let nickname = typeof saved.nickname === 'string' && saved.nickname.trim() ? saved.nickname : 'Игрок';
+let rounds = Number.isSafeInteger(saved.rounds) ? saved.rounds : 0;
+let best = Number.isFinite(saved.best) ? saved.best : 0;
+let dicePick = 0;
+let coinPick = 0;
 let rows = rowCounts.includes(saved.rows) ? saved.rows : 12;
 let risk = Object.hasOwn(profiles, saved.risk) ? saved.risk : 'swing';
 let cost = costs.includes(saved.cost) ? saved.cost : 25;
@@ -34,15 +50,23 @@ let animation = null;
 let highlighted = -1;
 let audio;
 
-if (saved.pending && Number.isFinite(saved.pending.reward) && saved.pending.reward >= 0) {
-  balance += saved.pending.reward;
-  history = [saved.pending.multiplier, ...history].slice(0, 8);
+function credit(round) {
+  const key = Object.hasOwn(games, round.game) ? round.game : 'plinko';
+  balance = Math.round((balance + round.reward) * 10) / 10;
+  recent[key] = [round.multiplier, ...recent[key]].slice(0, 8);
+  rounds += 1;
+  best = Math.max(best, round.reward);
 }
 
+if (saved.pending && Number.isFinite(saved.pending.reward) && saved.pending.reward >= 0 &&
+    Number.isFinite(saved.pending.multiplier)) credit(saved.pending);
+
 function persist() {
-  const pending = animation && { reward: animation.reward, multiplier: animation.multiplier };
+  const pending = animation && { game, reward: animation.reward, multiplier: animation.multiplier };
   try {
-    localStorage.setItem(storageKey, JSON.stringify({ balance, history, rows, risk, cost, sound, pending }));
+    localStorage.setItem(storageKey, JSON.stringify({
+      balance, recent, rows, risk, cost, sound, pending, game, nickname, rounds, best
+    }));
   } catch {
     // Play still works when browser storage is unavailable.
   }
@@ -76,6 +100,7 @@ function refreshSlots() {
 
 function drawHistory() {
   const container = byId('history');
+  const history = recent[game];
   if (!history.length) {
     container.textContent = 'Пока пусто';
     return;
@@ -110,7 +135,9 @@ function optionGroup(id, entries, selected, change) {
 function refreshControls() {
   byId('balance').textContent = number.format(balance);
   dropButton.disabled = Boolean(animation) || balance < cost;
-  byId('reset').disabled = Boolean(animation);
+  byId('funds').hidden = balance >= cost;
+  byId('profile').disabled = Boolean(animation);
+  for (const button of document.querySelectorAll('[data-game]')) button.disabled = Boolean(animation);
   for (const input of document.querySelectorAll('.options input')) input.disabled = Boolean(animation);
   byId('sound').setAttribute('aria-pressed', sound);
 }
@@ -123,7 +150,7 @@ function chooseBoard() {
 
 optionGroup('costs', costs.map(value => [value, value]), cost, value => {
   cost = value;
-  byId('status').textContent = balance < cost ? 'Недостаточно очков для этого броска.' : '';
+  byId('status').textContent = '';
 });
 optionGroup('risks', Object.entries(profiles).map(([key, profile]) => [key, profile.label]), risk, value => {
   risk = value;
@@ -133,6 +160,9 @@ optionGroup('rows', rowCounts.map(value => [value, value]), rows, value => {
   rows = value;
   chooseBoard();
 });
+
+optionGroup('dice-picks', [[0, '1–3'], [1, '4–6']], dicePick, value => { dicePick = value; });
+optionGroup('coin-picks', [[0, 'Орёл'], [1, 'Решка']], coinPick, value => { coinPick = value; });
 
 function center(index) {
   const width = canvas.clientWidth;
@@ -212,18 +242,23 @@ function chime(frequency, duration) {
 }
 
 function finish() {
-  const { index, multiplier, reward } = animation;
+  const round = animation;
   animation = null;
-  highlighted = index;
-  slots.children[highlighted].classList.add('active');
-  balance = Math.round((balance + reward) * 10) / 10;
-  history = [multiplier, ...history].slice(0, 8);
-  byId('status').textContent = multiplierText(multiplier) + ' · +' + number.format(reward) + ' очков';
-  chime(multiplier >= 1 ? 680 : 410, 0.25);
+  credit({ ...round, game });
+  if (game === 'plinko') {
+    highlighted = round.index;
+    slots.children[highlighted].classList.add('active');
+    draw();
+  } else {
+    byId('chance-piece').classList.remove('rolling');
+    byId('chance-piece').textContent = game === 'dice' ? dieFaces[round.index] : coinSides[round.index][0];
+    byId('chance-caption').textContent = game === 'dice' ? 'Выпало: ' + (round.index + 1) : coinSides[round.index];
+  }
+  byId('status').textContent = multiplierText(round.multiplier) + ' · +' + number.format(round.reward) + ' очков';
+  chime(round.multiplier >= 1 ? 680 : 410, 0.25);
   persist();
   drawHistory();
   refreshControls();
-  draw();
 }
 
 function animate(time) {
@@ -246,8 +281,7 @@ function animate(time) {
   requestAnimationFrame(animate);
 }
 
-function drop() {
-  if (animation || balance < cost) return;
+function plinkoRound() {
   slots.children[highlighted]?.classList.remove('active');
   highlighted = -1;
   const path = [{ column: rows / 2, y: 22 }];
@@ -258,27 +292,89 @@ function drop() {
   }
   path.push({ column: index, y: 380 });
   const multiplier = multipliers()[index];
-  balance -= cost;
-  animation = { path, index, multiplier, reward: Math.round(cost * multiplier * 10) / 10, start: performance.now() };
-  byId('status').textContent = 'Шарик в игре…';
+  return { path, index, multiplier };
+}
+
+function chanceRound() {
+  const dice = game === 'dice';
+  const index = Math.floor(Math.random() * (dice ? 6 : 2));
+  const correct = dice ? Math.floor(index / 3) === dicePick : index === coinPick;
+  return { index, multiplier: correct ? (dice ? 1.9 : 2) : 0 };
+}
+
+function play() {
+  if (animation || balance < cost) return;
+  const round = game === 'plinko' ? plinkoRound() : chanceRound();
+  balance = Math.round((balance - cost) * 10) / 10;
+  animation = { ...round, reward: Math.round(cost * round.multiplier * 10) / 10, start: performance.now() };
+  byId('status').textContent = 'Раунд в игре…';
   persist();
   refreshControls();
   chime(340, 0.15);
   if (reducedMotion.matches) finish();
-  else requestAnimationFrame(animate);
+  else if (game === 'plinko') requestAnimationFrame(animate);
+  else {
+    byId('chance-piece').classList.add('rolling');
+    setTimeout(finish, 550);
+  }
 }
 
-dropButton.addEventListener('click', drop);
-byId('reset').addEventListener('click', () => {
+function selectGame(key) {
   if (animation) return;
-  balance = 1000;
-  history = [];
-  byId('status').textContent = 'Новая игра';
-  chooseBoard();
+  game = key;
+  const plinko = game === 'plinko';
+  const details = games[game];
+  for (const button of document.querySelectorAll('[data-game]')) {
+    button.setAttribute('aria-pressed', button.dataset.game === game);
+  }
+  byId('plinko-board').hidden = !plinko;
+  byId('plinko-options').hidden = !plinko;
+  byId('chance-board').hidden = plinko;
+  byId('dice-options').hidden = game !== 'dice';
+  byId('coin-options').hidden = game !== 'coin';
+  byId('game-name').textContent = details.label;
+  dropButton.textContent = details.action;
+  byId('status').textContent = '';
+  if (plinko) {
+    chooseBoard();
+    resize();
+  } else {
+    byId('row-label').textContent = details.rule;
+    byId('chance-piece').classList.toggle('coin', game === 'coin');
+    byId('chance-piece').textContent = game === 'dice' ? dieFaces[4] : '◈';
+    byId('chance-caption').textContent = 'Выбери прогноз и начни раунд.';
+  }
   drawHistory();
-  refreshControls();
+  persist();
+}
+
+function updateAvatar() {
+  byId('avatar').textContent = Array.from(nickname)[0].toUpperCase();
+}
+
+byId('profile').addEventListener('click', () => {
+  byId('nickname').value = nickname;
+  byId('profile-balance').textContent = number.format(balance);
+  byId('profile-rounds').textContent = number.format(rounds);
+  byId('profile-best').textContent = number.format(best);
+  byId('profile-dialog').showModal();
+});
+byId('profile-form').addEventListener('submit', event => {
+  const name = byId('nickname').value.trim();
+  if (!name) {
+    event.preventDefault();
+    byId('nickname').value = '';
+    byId('nickname').reportValidity();
+    return;
+  }
+  nickname = name;
+  updateAvatar();
   persist();
 });
+for (const button of document.querySelectorAll('[data-game]')) {
+  button.addEventListener('click', () => selectGame(button.dataset.game));
+}
+dropButton.addEventListener('click', play);
 byId('help').addEventListener('click', () => instructions.showModal());
 byId('sound').addEventListener('click', () => {
   sound = !sound;
@@ -287,13 +383,12 @@ byId('sound').addEventListener('click', () => {
   persist();
 });
 window.addEventListener('keydown', event => {
-  if (event.code !== 'Space' || event.repeat || instructions.open ||
+  if (event.code !== 'Space' || event.repeat || (instructions.open || byId('profile-dialog').open) ||
       event.target.closest('button, a, input, textarea, select, [contenteditable]')) return;
   event.preventDefault();
-  drop();
+  play();
 });
-refreshSlots();
-drawHistory();
+updateAvatar();
+selectGame(game);
 refreshControls();
-persist();
 new ResizeObserver(resize).observe(canvas);
