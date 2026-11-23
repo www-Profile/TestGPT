@@ -1,0 +1,26750 @@
+// =================== УПРАВЛЕНИЕ ЛОГАМИ ===================
+// DEBUG_LOGS = false → все console.log заглушены, ошибки и предупреждения видны
+// DEBUG_LOGS = true  → показывать все логи (для отладки)
+const DEBUG_LOGS = true;
+
+(function setupQuietLogging() {
+    if (DEBUG_LOGS) return;
+
+    const originalLog = console.log.bind(console);
+
+    // Заменяем console.log на «тихий»
+    console.log = function () {
+        // Всё молчит
+    };
+
+    // console.warn и console.error не трогаем — они показывают реальные проблемы
+})();
+
+// =================== КЭШ FIRESTORE ===================
+// Единая точка кэширования. Все функции чтения/записи проходят через него.
+const Cache = {
+    profiles:   new Map(),
+    workouts:   new Map(),
+    aggregates: new Map(),
+    local:      new Map(),
+
+    // ★ ДЕДУПЛИКАЦИЯ ЗАПРОСОВ «В ПОЛЁТЕ»
+    inflightProfiles: new Map(),
+    inflightWorkouts: new Map(),
+
+    TTL: {
+        profile:   60_000,
+        workouts:  30_000,
+        aggregate: 5 * 60_000,
+        local:     2_000
+    },
+
+    _get(map, key, ttl) {
+        const e = map.get(key);
+        if (!e) return null;
+        if (Date.now() - e.ts > ttl) { map.delete(key); return null; }
+        return e.data;
+    },
+    _set(map, key, data) {
+        map.set(key, { data, ts: Date.now() });
+    },
+
+    getProfile(id)    { return this._get(this.profiles,   id, this.TTL.profile); },
+    setProfile(id, d) { this._set(this.profiles,   id, d); },
+    clearProfile(id)  { this.profiles.delete(id); },
+
+    getWorkouts(id)    { return this._get(this.workouts, id, this.TTL.workouts); },
+    setWorkouts(id, d) { this._set(this.workouts, id, d); },
+    clearWorkouts(id)  { this.workouts.delete(id); },
+
+    getAggregate(k)    { return this._get(this.aggregates, k, this.TTL.aggregate); },
+    setAggregate(k, d) { this._set(this.aggregates, k, d); },
+
+    getLocal(k)    { return this._get(this.local, k, this.TTL.local); },
+    setLocal(k, d) { this._set(this.local, k, d); },
+    clearLocal(k)  { this.local.delete(k); },
+
+    clearAll() {
+        this.profiles.clear();
+        this.workouts.clear();
+        this.aggregates.clear();
+        this.local.clear();
+        this.inflightProfiles.clear();
+        this.inflightWorkouts.clear();
+    },
+
+    stats() {
+        return {
+            profiles:   this.profiles.size,
+            workouts:   this.workouts.size,
+            aggregates: this.aggregates.size,
+            local:      this.local.size
+        };
+    }
+};
+
+window.Cache = Cache; // для отладки из консоли
+
+// =================== МАППИНГ ИКОНОК В КАТЕГОРИИ ДЛЯ СТАТИСТИКИ ===================
+const ICON_TO_CATEGORY = {
+    'bodybuilding': 'Руки',
+    'shoulder': 'Плечи',
+    'press': 'Пресс',
+    'breast': 'Грудь',
+    'back': 'Спина',
+    'legs': 'Ноги',
+    'WholeBody': 'Всё тело',
+    'cardio': 'Кардио',
+    'stretching': 'Гибкость',
+    'charging': 'Зарядка',
+    'Pilates': 'Всё тело',
+    'crossfit': 'Всё тело',
+    'men': 'Ягодицы',
+    'woman': 'Ягодицы'
+};
+
+const DISPLAY_CATEGORIES = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+
+// =================== ПОЛУЧЕНИЕ ИКОНКИ ТРЕНИРОВКИ ===================
+function getWorkoutIcon(workout) {
+    // Если у тренировки есть icon — возвращаем его
+    if (workout.icon) return workout.icon;
+    
+    // Если нет — возвращаем null (ничего не показываем)
+    return null;
+}
+
+// ===================ЕДИНАЯ СИСТЕМА УПРАВЛЕНИЯ ВКЛАДКАМИ ===================
+const TabManager = {
+    // Ключ для localStorage
+    STORAGE_KEY: 'sportapp_tabs',
+    
+    // Состояние
+    state: {
+        stats: 'personal',
+        workouts: 'ready',
+        profile: 'my'
+    },
+    
+    // Загрузить состояние из localStorage
+    load() {
+        const saved = localStorage.getItem(this.STORAGE_KEY);
+        if (saved) {
+            try {
+                const parsed = JSON.parse(saved);
+                this.state = { ...this.state, ...parsed };
+            } catch (e) {
+                console.warn('Ошибка загрузки вкладок:', e);
+            }
+        }
+        return this.state;
+    },
+    
+    // Сохранить состояние
+    save() {
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.state));
+    },
+    
+    // Переключить вкладку статистики
+stats(tab) {
+    this.state.stats = tab;
+    activeStatsTab = tab;
+        // Обновляем UI
+        document.querySelectorAll('#page-stats .tab-btn').forEach(btn => {
+            btn.classList.toggle('tab-btn-active', btn.dataset.tab === tab);
+        });
+        document.querySelectorAll('#page-stats .stats-tab-content').forEach(content => {
+            content.classList.remove('stats-tab-content-active');
+        });
+        const target = document.getElementById('stats-' + tab);
+        if (target) target.classList.add('stats-tab-content-active');
+        this.save();
+    },
+    
+    // Переключить вкладку тренировок
+workouts(tab) {
+    this.state.workouts = tab;
+    activeWorkoutsTab = tab;
+        // Обновляем UI
+        document.querySelectorAll('#page-workouts .tab-btn').forEach(btn => {
+            btn.classList.toggle('tab-btn-active', btn.dataset.tab === tab);
+        });
+        document.querySelectorAll('#page-workouts .tab-content').forEach(content => {
+            content.classList.remove('tab-content-active');
+        });
+        document.getElementById('tab-' + tab).classList.add('tab-content-active');
+        
+        const resetBtn = document.getElementById('resetWorkoutsBtn');
+        if (resetBtn) {
+            const pagesEnabled = localStorage.getItem(EDIT_PAGES_KEY) !== 'false';
+            resetBtn.style.display = (tab === 'ready' && pagesEnabled) ? 'block' : 'none';
+        }
+        this.save();
+    },
+    
+    // Переключить вкладку профиля
+profile(tab) {
+    this.state.profile = tab;
+    activeProfileTab = tab;
+
+    const profileTabs = document.querySelectorAll('.profile-tab-btn');
+    profileTabs.forEach(btn => {
+        btn.classList.toggle('tab-btn-active', btn.dataset.tab === tab);
+    });
+    const contents = document.querySelectorAll('.profile-tab-content');
+    contents.forEach(content => {
+        content.classList.remove('profile-tab-content-active');
+    });
+    const target = document.getElementById('profileTab-' + tab);
+    if (target) {
+        target.classList.add('profile-tab-content-active');
+    }
+    if (tab === 'friends') {
+        setTimeout(() => renderFriendsInProfile(), 100);
+
+        // ★★★ ДОБАВЬ ЭТИ 3 СТРОКИ ★★★
+        if (typeof startChallengesListener === 'function') {
+            startChallengesListener();
+        }
+    }
+    this.save();
+    },
+    
+    // Применить все сохранённые вкладки
+    applyAll() {
+        this.stats(this.state.stats);
+        this.workouts(this.state.workouts);
+        this.profile(this.state.profile);
+        console.log('✅ Вкладки восстановлены:', this.state);
+    }
+};
+
+// Загружаем состояние при инициализации
+TabManager.load();
+
+// =================== ЗВУКИ ===================
+const soundCountdown = new Audio('sounds/3-2-1.mp3');
+const soundTimerFinish = new Audio('sounds/timer-finisf.mp3');
+const soundSms = new Audio('sounds/sms.mp3');
+soundCountdown.preload = 'auto';
+soundTimerFinish.preload = 'auto';
+soundSms.preload = 'auto';
+soundCountdown.volume = 0.5;
+soundTimerFinish.volume = 0.5;
+soundSms.volume = 0.5;
+
+// ★★★ История тренировок: кэш и фильтры ★★★
+let _historyAllWorkouts = [];       // все тренировки (уже отфильтрованные от зарядки)
+let _historySearchQuery = '';       // текущий поисковый запрос
+let _historyCategory = 'all';       // текущая категория
+let _historyPeriod = 'all';         // текущий период
+
+// ===================СОВМЕСТНЫЕ ТРЕНИРОВКИ ===================
+let currentSessionId = null;
+let isHost = false;
+let sessionListener = null;
+let inviteListener = null;
+let coopExercises = [];
+let sessionData = null;
+let coopStarted = false;
+let finishPageShown = false;
+
+// app.js - в самом начале, после объявления констант
+const DAILY_PROGRESS_KEY = 'sportapp_daily_progress';
+
+// =================== ПРОГРЕСС ПРОГРАММ ===================
+const PROGRAM_PROGRESS_KEY = 'sportapp_program_progress';
+let _pendingProgramDay = null;   // { programId, day, category }
+let _lastCompletedProgramDay = null;
+let _activeProgramDetailId = null;
+let _programDetailReturnTab = 'ready';
+
+function getAllProgramProgress() {
+    try {
+        return JSON.parse(localStorage.getItem(PROGRAM_PROGRESS_KEY) || '{}');
+    } catch (e) {
+        return {};
+    }
+}
+
+function getProgramProgress(programId) {
+    const all = getAllProgramProgress();
+    return all[programId] || { completedDays: [], startedAt: null };
+}
+
+function saveProgramProgress(programId, progress) {
+    const all = getAllProgramProgress();
+    all[programId] = progress;
+    localStorage.setItem(PROGRAM_PROGRESS_KEY, JSON.stringify(all));
+    syncSaveToFirestore('programProgress', all);
+}
+
+function completeProgramDay(programId, day) {
+    const progress = getProgramProgress(programId);
+    progress.completedDays = progress.completedDays || [];
+    if (!progress.completedDays.includes(day)) {
+        progress.completedDays.push(day);
+        progress.completedDays.sort((a, b) => a - b);
+        if (!progress.startedAt) progress.startedAt = new Date().toISOString();
+        saveProgramProgress(programId, progress);
+        showToast(`✅ День ${day} программы выполнен!`);
+    }
+}
+
+// =================== СЧЁТЧИК ТРЕНИРОВОК ДЛЯ PREMIUM ===================
+const WORKOUTS_COUNT_KEY = 'sportapp_workouts_count';
+const PREMIUM_OFFER_SHOWN_KEY = 'sportapp_premium_offer_shown';
+
+/**
+ * Увеличивает счётчик завершённых тренировок и возвращает новое значение
+ */
+function incrementWorkoutsCount() {
+    const current = parseInt(localStorage.getItem(WORKOUTS_COUNT_KEY) || '0');
+    const newCount = current + 1;
+    localStorage.setItem(WORKOUTS_COUNT_KEY, String(newCount));
+    console.log(`📊 Счётчик тренировок: ${newCount}`);
+    return newCount;
+}
+
+/**
+ * Проверяет, нужно ли показать предложение PREMIUM
+ * Показываем каждую 3-ю тренировку, если нет PREMIUM
+ */
+function shouldShowPremiumOffer() {
+    // Если уже есть PREMIUM — не показываем
+    if (hasPremium()) {
+        return false;
+    }
+    
+    const count = parseInt(localStorage.getItem(WORKOUTS_COUNT_KEY) || '0');
+    
+    // Показываем каждую 3-ю тренировку (3, 6, 9, 12...)
+    if (count > 0 && count % 3 === 0) {
+        // Проверяем, не показывали ли уже для этого значения
+        const shownFor = localStorage.getItem(PREMIUM_OFFER_SHOWN_KEY);
+        if (shownFor === String(count)) {
+            return false;
+        }
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Помечает, что предложение PREMIUM было показано для текущего счётчика
+ */
+function markPremiumOfferShown() {
+    const count = parseInt(localStorage.getItem(WORKOUTS_COUNT_KEY) || '0');
+    localStorage.setItem(PREMIUM_OFFER_SHOWN_KEY, String(count));
+}
+// ===================СОВМЕСТНЫЕ ТРЕНИРОВКИ ===================
+const SESSION_MAX_AGE_HOURS = 6; // Максимальное время жизни сессии в часах
+const SESSION_MAX_AGE_MS = SESSION_MAX_AGE_HOURS * 60 * 60 * 1000; // в миллисекундах
+
+// =================== ЛОГИРОВАНИЕ ДЛЯ СОВМЕСТНЫХ ТРЕНИРОВОК ===================
+function logCoopState(label) {
+    console.log(`%c📊 [${label}] СОСТОЯНИЕ СОВМЕСТНОЙ ТРЕНИРОВКИ`, 'font-weight:bold; font-size:14px;');
+    const user = firebase.auth().currentUser;
+    const currentUserId = user ? user.uid : null;
+    console.log('  👤 Текущий пользователь:', currentUserId);
+    console.log('  🆔 Session ID:', currentSessionId);
+    console.log('  🏷️  Статус сессии:', sessionData?.status || 'нет данных');
+    console.log('  📝 Всего упражнений:', coopExercises.length);
+    console.log('  ✅ Выполнено упражнений (sessionCompleted.size):', sessionCompleted.size);
+    console.log('  ⏱️  Время (сек):', sessionSeconds);
+    console.log('  📦 sessionCompletedSets:', JSON.stringify(sessionCompletedSets));
+    if (sessionData && sessionData.participants) {
+        console.log('  👥 Участники:');
+        sessionData.participants.forEach(p => {
+            const isMe = p.id === currentUserId;
+            const progress = sessionData.participantProgress?.[p.id] || 0;
+            const finished = sessionData.participantFinished?.[p.id] || false;
+            const time = sessionData.participantFinishedSeconds?.[p.id] || 0;
+            const xp = sessionData.participantXp?.[p.id] || 0;
+            const ready = sessionData.participantReady?.[p.id] || false;
+            console.log(`    ${isMe ? '👉' : '   '} ${p.name} (${p.id}): progress=${progress}/${coopExercises.length}, finished=${finished}, time=${time}s, xp=${xp.toFixed(1)}, ready=${ready}`);
+        });
+    } else {
+        console.warn('  ⚠️ sessionData.participants отсутствует');
+    }
+    const allFinished = sessionData?.participants?.every(p => sessionData.participantFinished?.[p.id] === true) || false;
+    console.log('  🏁 Все завершили?', allFinished);
+    console.log('--------------------------------------------------');
+}
+
+// =================== ПРОВЕРКА ВРЕМЕНИ СЕССИИ ===================
+function isSessionExpired(createdAt) {
+    if (!createdAt) return false;
+    const createdTime = createdAt.seconds ? createdAt.seconds * 1000 : new Date(createdAt).getTime();
+    const now = Date.now();
+    const age = now - createdTime;
+    const expired = age > SESSION_MAX_AGE_MS;
+    if (expired) {
+        console.log('⏰ Сессия старше ' + SESSION_MAX_AGE_HOURS + ' часов, удаляем');
+    }
+    return expired;
+}
+
+async function deleteSessionIfExpired(sessionId, docData) {
+    if (!sessionId) return false;
+    if (isSessionExpired(docData?.createdAt)) {
+        try {
+            await firebase.firestore()
+                .collection('trainingSessions')
+                .doc(sessionId)
+                .delete();
+            console.log('🗑️ Сессия ' + sessionId + ' удалена (истекло время)');
+            
+            // Удаляем уведомления
+            const snapshot = await firebase.firestore()
+                .collection('notifications')
+                .where('sessionId', '==', sessionId)
+                .get();
+            const batch = firebase.firestore().batch();
+            snapshot.forEach(doc => batch.delete(doc.ref));
+            await batch.commit();
+            
+            return true;
+        } catch (error) {
+            console.error('❌ Ошибка удаления просроченной сессии:', error);
+            return false;
+        }
+    }
+    return false;
+}
+
+// =================== ФУНКЦИИ ДЛЯ СОВМЕСТНЫХ ТРЕНИРОВОК ===================
+window.cancelInvite = async function() {
+    if (!currentSessionId) return;
+    try {
+        await firebase.firestore()
+            .collection('trainingSessions')
+            .doc(currentSessionId)
+            .delete();
+
+        const snapshot = await firebase.firestore()
+            .collection('notifications')
+            .where('sessionId', '==', currentSessionId)
+            .where('type', '==', 'train_invite')
+            .get();
+        const batch = firebase.firestore().batch();
+        snapshot.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+
+        if (sessionListener) {
+            sessionListener();
+            sessionListener = null;
+        }
+        currentSessionId = null;
+        isHost = false;
+        showToast('❌ Приглашение отменено');
+        window.navigateTo('workouts');
+        document.getElementById('bottomNav').style.display = 'block';
+    } catch (error) {
+        showToast('❌ Не удалось отменить приглашение');
+    }
+}
+
+function setupInviteListener(user) {
+    if (inviteListener) inviteListener();
+    inviteListener = null;
+    if (!user) return;
+
+    const db = firebase.firestore();
+    const modalId = 'incomingWorkoutModal';
+    let modal = document.getElementById(modalId);
+
+    // Берём оформление прямо из существующей модалки вызова.
+    if (!modal) {
+        const original = document.getElementById('incomingChallengeModal');
+        modal = original.cloneNode(true);
+        modal.id = modalId;
+
+        modal.querySelectorAll('[id]').forEach(el => {
+            el.id = el.id.replace('incomingChallenge', 'incomingWorkout');
+        });
+        modal.querySelectorAll('[onclick]').forEach(el => {
+            el.removeAttribute('onclick');
+        });
+
+        modal.classList.remove('modal-overlay-visible', 'modal-overlay-closing');
+        modal.style.display = 'none';
+        modal.querySelector('.modal-title').textContent = 'Приглашение на тренировку';
+        modal.querySelector('.item-icon span').textContent = '🏋️';
+        original.after(modal);
+    }
+
+    const yes = modal.querySelector('.btn-primary');
+    const no = modal.querySelector('.btn-secondary');
+    let pending = [];
+    let active = null;
+    let timer;
+    let stopped = false;
+
+    function dismiss() {
+        if (active?.shown) closeModal(modalId);
+        active = null;
+    }
+
+    async function showNext() {
+        clearTimeout(timer);
+        if (stopped || active || !pending.length) return;
+
+        // Если открыт вызов или идёт тренировка, приглашение ждёт своей очереди.
+        if (!Challenges._canShowChallengeModal()) {
+            timer = setTimeout(showNext, 1000);
+            return;
+        }
+
+        const note = pending[0];
+        const data = note.data();
+        const item = { id: note.id, shown: false, busy: false };
+        active = item;
+
+        try {
+            const ref = data.sessionId && db.collection('trainingSessions').doc(data.sessionId);
+            const snap = ref ? await ref.get() : null;
+            if (active !== item) return;
+
+            const session = snap?.data();
+            if (!workoutInviteIsValid(session)) {
+                if (!snap?.metadata.fromCache) {
+                    const batch = db.batch();
+                    batch.delete(note.ref);
+                    if (session && isSessionExpired(session.createdAt)) batch.delete(ref);
+                    await batch.commit();
+                }
+            } else if (Challenges._canShowChallengeModal()) {
+                const count = session.totalExercises || session.exercises?.length;
+
+                modal.querySelector('#incomingWorkoutText').textContent =
+                    `${data.fromName || 'Пользователь'} приглашает вас на совместную тренировку!`;
+                modal.querySelector('.item-title').textContent =
+                    session.workoutTitle || data.workoutTitle || 'Совместная тренировка';
+                modal.querySelector('.item-desc').textContent = count
+                    ? `${count} ${declOfNum(count, ['упражнение', 'упражнения', 'упражнений'])}`
+                    : 'Тренировка с другом';
+
+                yes.disabled = no.disabled = false;
+                yes.onclick = () => respond(true);
+                no.onclick = () => respond(false);
+                item.shown = true;
+                openModal(modalId);
+                return;
+            }
+        } catch (error) {
+            console.warn('Не удалось загрузить приглашение', error);
+        }
+
+        if (active === item) {
+            active = null;
+            timer = setTimeout(showNext, 1500);
+        }
+
+        async function respond(accept) {
+            if (active !== item || item.busy) return;
+            item.busy = true;
+            yes.disabled = no.disabled = true;
+
+            try {
+                const joined = await answerWorkoutInvite(user, note, accept);
+                if (stopped || firebase.auth().currentUser?.uid !== user.uid) return;
+
+                pending = pending.filter(doc => doc.id !== note.id);
+                dismiss();
+
+                if (joined) {
+                    currentSessionId = data.sessionId;
+                    isHost = false;
+                    coopStarted = false;
+                    finishPageShown = false;
+                    sessionData = joined;
+                    window.navigateTo('training-waiting');
+                    listenSession(data.sessionId);
+                    showToast('✅ Вы присоединились к тренировке');
+                } else if (accept) {
+                    showToast('Приглашение больше не действует');
+                }
+            } catch (error) {
+                if (active !== item) return;
+                item.busy = false;
+                yes.disabled = no.disabled = false;
+                showToast('Не удалось ответить. Попробуйте ещё раз.');
+                if (!pending.some(doc => doc.id === note.id)) dismiss();
+            }
+
+            showNext();
+        }
+    }
+
+    const unsubscribe = db.collection('notifications')
+        .where('to', '==', user.uid)
+        .where('type', '==', 'train_invite')
+        .where('read', '==', false)
+        .onSnapshot(snapshot => {
+            if (stopped) return;
+            pending = snapshot.docs;
+
+            // Отправитель отменил приглашение или пользователь ответил с другого устройства.
+            if (active && !active.busy && !pending.some(doc => doc.id === active.id)) {
+                dismiss();
+            }
+            showNext();
+        });
+
+    inviteListener = () => {
+        stopped = true;
+        unsubscribe();
+        clearTimeout(timer);
+        dismiss();
+    };
+}
+
+function workoutInviteIsValid(session) {
+    return session && !isSessionExpired(session.createdAt) &&
+        !['completed', 'cancelled'].includes(session.status) &&
+        (session.participants || []).some(p => !session.participantFinished?.[p.id]);
+}
+
+async function answerWorkoutInvite(user, note, accept) {
+    const db = firebase.firestore();
+    const ref = db.collection('trainingSessions').doc(note.data().sessionId);
+
+    return db.runTransaction(async tx => {
+        const invite = (await tx.get(note.ref)).data();
+        if (!invite || invite.read || invite.to !== user.uid || invite.sessionId !== ref.id) {
+            return null;
+        }
+
+        const session = (await tx.get(ref)).data();
+        tx.update(note.ref, { read: true });
+        if (!workoutInviteIsValid(session)) return null;
+
+        const members = session.participants || [];
+
+        if (!accept) {
+            const rest = members.filter(p => p.id !== user.uid);
+            if (rest.length === members.length) return null;
+
+            const update = {
+                participants: rest,
+                participantIds: rest.map(p => p.id)
+            };
+            if (rest.every(p => p.id === session.hostId)) update.status = 'cancelled';
+            tx.update(ref, update);
+            return null;
+        }
+
+        const me = { id: user.uid, name: user.displayName || 'Пользователь' };
+        const participants = members.some(p => p.id === me.id)
+            ? members.map(p => p.id === me.id ? { ...p, name: me.name } : p)
+            : [...members, me];
+
+        tx.update(ref, {
+            participants,
+            participantIds: firebase.firestore.FieldValue.arrayUnion(user.uid),
+            [`participantReady.${user.uid}`]: true,
+            [`participantProgress.${user.uid}`]: session.participantProgress?.[user.uid] ?? 0,
+            [`participantFinished.${user.uid}`]: session.participantFinished?.[user.uid] ?? false,
+            [`participantFinishedSeconds.${user.uid}`]: session.participantFinishedSeconds?.[user.uid] ?? null,
+            [`participantXp.${user.uid}`]: session.participantXp?.[user.uid] ?? 0
+        });
+
+        return { ...session, participants };
+    });
+}
+
+// =================== ИСПРАВЛЕННАЯ ФУНКЦИЯ СЛУШАТЕЛЯ СЕССИИ ===================
+function listenSession(sessionId) {
+    if (sessionListener) {
+        sessionListener();
+        sessionListener = null;
+    }
+    
+    firebase.firestore()
+        .collection('trainingSessions')
+        .doc(sessionId)
+        .get()
+        .then((doc) => {
+            if (!doc.exists) return;
+            sessionListener = firebase.firestore()
+                .collection('trainingSessions')
+                .doc(sessionId)
+                .onSnapshot(
+                    { includeMetadataChanges: true },
+                    (doc) => handleSessionSnapshot(doc),
+                    (error) => {
+                        if (error.code === 'unavailable' || error.code === 'deadline-exceeded') {
+                            setTimeout(() => {
+                                if (currentSessionId) listenSession(currentSessionId);
+                            }, 2000);
+                        }
+                    }
+                );
+        })
+        .catch(() => {});
+}
+
+function handleSessionSnapshot(doc) {
+    console.log('🔥 [handleSessionSnapshot] ПОЛУЧЕН СНАПШОТ');
+    if (!doc.exists) {
+        console.warn('⚠️ Документ сессии не существует');
+        if (sessionListener) {
+            sessionListener();
+            sessionListener = null;
+        }
+        const coopFinishPage = document.getElementById('page-coop-finish');
+        if (coopFinishPage && coopFinishPage.classList.contains('page-active')) {
+            window.navigateTo('workouts');
+            document.getElementById('bottomNav').style.display = 'block';
+        }
+        return;
+    }
+    
+    const data = doc.data();
+    if (data.status === 'cancelled' && doc.id === currentSessionId) {
+    if (sessionListener) sessionListener();
+    sessionListener = null;
+
+    if (isHost) doc.ref.delete().catch(console.warn);
+
+    currentSessionId = null;
+    sessionData = null;
+    isHost = false;
+    window.navigateTo('workouts');
+    showToast('Приглашение на тренировку отклонено');
+    return;
+}
+    console.log('📄 Данные из Firestore:', JSON.stringify(data, null, 2));
+    
+    if (isSessionExpired(data.createdAt)) {
+        console.warn('⏰ Сессия истекла');
+        deleteSessionIfExpired(currentSessionId, data);
+        const isOnTrainingPage = document.getElementById('page-training-session').classList.contains('page-active');
+        const isOnWaitingPage = document.getElementById('page-training-waiting').classList.contains('page-active');
+        const isOnFinishPage = document.getElementById('page-coop-finish').classList.contains('page-active');
+        if (isOnTrainingPage || isOnWaitingPage || isOnFinishPage) {
+            showToast('⏰ Время сессии истекло');
+            window.navigateTo('workouts');
+            document.getElementById('bottomNav').style.display = 'block';
+        }
+        return;
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ ЛОКАЛЬНЫЕ ДАННЫЕ ★★★
+    if (!sessionData) {
+        sessionData = {
+            hostId: data.hostId,
+            workoutTitle: data.workoutTitle,
+            exercises: data.exercises || [],
+            totalExercises: data.totalExercises || 0,
+            participants: data.participants || [],
+            participantProgress: data.participantProgress || {},
+            participantFinished: data.participantFinished || {},
+            participantFinishedSeconds: data.participantFinishedSeconds || {},
+            participantXp: data.participantXp || {},
+            participantReady: data.participantReady || {},
+            status: data.status || 'waiting'
+        };
+    } else {
+        sessionData.participants = data.participants || [];
+        sessionData.participantProgress = data.participantProgress || {};
+        sessionData.participantFinished = data.participantFinished || {};
+        sessionData.participantFinishedSeconds = data.participantFinishedSeconds || {};
+        sessionData.participantXp = data.participantXp || {};
+        sessionData.participantReady = data.participantReady || {};
+        sessionData.status = data.status || sessionData.status;
+    }
+    
+    if (data.exercises && data.exercises.length > 0) {
+        coopExercises = data.exercises;
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ UI ★★★
+    updateCoopUI();
+    logCoopState('handleSessionSnapshot (после обновления)');
+    
+    // ★★★ ЕСЛИ МЫ НА СТРАНИЦЕ ОЖИДАНИЯ — ОБНОВЛЯЕМ СТАТУСЫ ДРУЗЕЙ ★★★
+    const isWaitingPageActive = document.getElementById('page-coop-waiting')?.classList.contains('page-active');
+    if (isWaitingPageActive) {
+        renderCoopFriendsStatus();
+        console.log('🔄 Обновлены статусы друзей на странице ожидания');
+    }
+    
+    // ★★★ ПРОВЕРЯЕМ, ВСЕ ЛИ УЧАСТНИКИ ЗАВЕРШИЛИ ★★★
+    const participants = sessionData.participants || [];
+    const participantFinished = sessionData.participantFinished || {};
+    const allFinished = participants.length > 0 && participants.every(p => participantFinished[p.id] === true);
+    
+    if (allFinished) {
+        console.log('🎉 [handleSessionSnapshot] ВСЕ УЧАСТНИКИ ЗАВЕРШИЛИ!');
+        stopSessionTimer();
+        
+        // ★★★ ВСЕГДА ОБНОВЛЯЕМ ДАННЫЕ НА СТРАНИЦЕ ФИНИША ★★★
+        renderFinishPageData(sessionData);
+        
+        // ★★★ ПОКАЗЫВАЕМ СТРАНИЦУ ФИНИША, ЕСЛИ ОНА ЕЩЁ НЕ ПОКАЗАНА ★★★
+        if (!finishPageShown) {
+            finishPageShown = true;
+            document.querySelectorAll('.page').forEach(p => {
+                p.classList.remove('page-active');
+                p.style.display = 'none';
+            });
+            const target = document.getElementById('page-coop-finish');
+            if (target) {
+                target.classList.add('page-active');
+                target.style.display = 'block';
+            }
+            document.getElementById('bottomNav').style.display = 'none';
+        }
+        return;
+    }
+    
+    // ★★★ ПРОВЕРЯЕМ, НЕ ЗАПУЩЕНА ЛИ ТРЕНИРОВКА ★★★
+    const participantReady = data.participantReady || {};
+    const allReady = participants.every(p => participantReady[p.id] === true);
+    
+    if (data.status === 'waiting' && allReady && !coopStarted) {
+        console.log('🚀 Все готовы, запускаем тренировку');
+        firebase.firestore()
+            .collection('trainingSessions')
+            .doc(currentSessionId)
+            .update({
+                status: 'active',
+                startedAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+        coopStarted = true;
+        finishPageShown = false;
+        startCoopTraining(data);
+        return;
+    }
+    
+    if (data.status === 'active' && !coopStarted) {
+        console.log('🚀 Тренировка активна, запускаем');
+        coopStarted = true;
+        finishPageShown = false;
+        startCoopTraining(data);
+        return;
+    }
+}
+
+// =================== ИСПРАВЛЕННАЯ ФУНКЦИЯ СТАРТА ТРЕНИРОВКИ ===================
+function startCoopTraining(data) {
+    console.log('🔥🔥🔥 [startCoopTraining] НАЧАЛО');
+    finishPageShown = false;
+    coopStarted = true;
+
+        // ★★★ ОБНОВЛЯЕМ ВИД ПЛАШКИ ★★★
+    updateMusclesHintState();
+    
+    const user = firebase.auth().currentUser;
+    const currentUserId = user ? user.uid : null;
+    
+    coopExercises = data.exercises || [];
+    console.log('📊 Используем базовые упражнения для всех');
+    
+    sessionData = data;
+    sessionData.participants = data.participants || [];
+    sessionData.participantProgress = data.participantProgress || {};
+    sessionData.participantFinished = data.participantFinished || {};
+    sessionData.participantFinishedSeconds = data.participantFinishedSeconds || {};
+    sessionData.participantXp = data.participantXp || {};
+    sessionData.status = data.status || 'waiting';
+
+    const title = data.workoutTitle || 'Совместная тренировка';
+    const category = 'Совместная';
+
+    const myProgress = currentUserId ? (data.participantProgress[currentUserId] || 0) : 0;
+
+    const exercises = coopExercises.map((ex, index) => ({
+        ...ex,
+        completed: index < myProgress
+    }));
+
+    sessionExercises = exercises.map(ex => ({
+        ...ex,
+        icon: ex.icon || getExerciseIcon(ex.name)
+    }));
+    sessionCurrentIndex = myProgress;
+    sessionCompleted = new Set();
+    sessionSkipped = new Set();
+    sessionCompletedSets = {};
+    for (let i = 0; i < myProgress; i++) {
+        sessionCompleted.add(i);
+    }
+    sessionSeconds = 0;
+    sessionWorkoutTitle = title + ' (совместно)';
+    sessionCategory = category;
+    sessionWorkoutIcon = null;
+
+    closeModal('sessionExitModal');
+    window.navigateTo('training-session');
+
+    renderSessionExercise();
+    renderSessionProgress();
+    updateSessionButtons();
+    startSessionTimer();
+
+    logCoopState('startCoopTraining');
+    setTimeout(updateCoopUI, 500);
+}
+
+// =================== ИСПРАВЛЕННАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ UI ===================
+function updateCoopUI() {
+    const total = coopExercises.length || 0;
+    const participants = sessionData?.participants || [];
+    const participantProgress = sessionData?.participantProgress || {};
+    const participantFinished = sessionData?.participantFinished || {};
+    const participantFinishedSeconds = sessionData?.participantFinishedSeconds || {};
+    const participantXp = sessionData?.participantXp || {};
+    
+    const existingContainer = document.getElementById('participantsContainer');
+    if (existingContainer) existingContainer.remove();
+    
+    const progressRow = document.querySelector('.session-progress-row');
+    if (!progressRow) return;
+    
+    const container = document.createElement('div');
+    container.id = 'participantsContainer';
+    container.style.cssText = `
+        display: flex;
+        flex-direction: column;
+        gap: 0.3rem;
+        margin-top: 0.3rem;
+        width: 100%;
+    `;
+    
+    const user = firebase.auth().currentUser;
+    const currentUserId = user ? user.uid : null;
+    const otherParticipants = participants.filter(p => p.id !== currentUserId);
+    
+    otherParticipants.sort((a, b) => {
+        const aFinished = participantFinished[a.id] || false;
+        const bFinished = participantFinished[b.id] || false;
+        if (aFinished && !bFinished) return -1;
+        if (!aFinished && bFinished) return 1;
+        const aProg = participantProgress[a.id] || 0;
+        const bProg = participantProgress[b.id] || 0;
+        return bProg - aProg;
+    });
+    
+function formatTime(seconds) {
+    if (!seconds) return '00:00';
+    const mins = String(Math.floor(seconds / 60)).padStart(2, '0');
+    const secs = String(seconds % 60).padStart(2, '0');
+    return `${mins}:${secs}`;
+}
+    
+    otherParticipants.forEach(p => {
+        const progress = participantProgress[p.id] || 0;
+        const isComplete = participantFinished[p.id] || false;
+        const timeText = isComplete && participantFinishedSeconds[p.id] ? formatTime(participantFinishedSeconds[p.id]) : null;
+        const progressText = `${progress}/${total}`;
+        
+        const item = document.createElement('div');
+        item.className = 'coop-participant-item';
+        
+        const leftPart = document.createElement('span');
+        leftPart.style.cssText = 'display: flex; align-items: center; gap: 0.3rem;';
+        let leftHtml = `
+            <span style="font-size: 0.9rem;">👤</span>
+            <span style="font-weight: 500; color: var(--slate);">${p.name}</span>
+        `;
+        if (timeText) {
+            leftHtml += `
+                <span style="color: var(--slate);">·</span>
+                <span style="font-weight: 500; color: var(--slate);">${timeText}</span>
+            `;
+        }
+        leftPart.innerHTML = leftHtml;
+        item.appendChild(leftPart);
+        
+        const rightPart = document.createElement('span');
+        rightPart.style.cssText = `font-weight: 600; color: var(--slate);`;
+        rightPart.textContent = progressText;
+        item.appendChild(rightPart);
+        
+        container.appendChild(item);
+    });
+    
+    progressRow.appendChild(container);
+}
+
+function showCoopFinishPage() {
+    console.log('🔥🔥🔥 [showCoopFinishPage] НАЧАЛО');
+    
+    // ★★★ ВСЕГДА ОБНОВЛЯЕМ ДАННЫЕ ★★★
+    if (sessionData) {
+        console.log('📊 [showCoopFinishPage] Вызываем renderFinishPageData с sessionData');
+        renderFinishPageData(sessionData);
+    } else {
+        console.warn('⚠️ [showCoopFinishPage] sessionData пуст');
+    }
+    
+    // ★★★ ПОКАЗЫВАЕМ СТРАНИЦУ, ЕСЛИ ОНА ЕЩЁ НЕ ПОКАЗАНА ★★★
+    if (!finishPageShown) {
+        finishPageShown = true;
+        document.querySelectorAll('.page').forEach(p => {
+            p.classList.remove('page-active');
+            p.style.display = 'none';
+        });
+        
+        const target = document.getElementById('page-coop-finish');
+        if (target) {
+            target.classList.add('page-active');
+            target.style.display = 'block';
+        }
+        document.getElementById('bottomNav').style.display = 'none';
+    }
+    
+    console.log('✅ [showCoopFinishPage] ЗАВЕРШЕНА');
+    
+    // ★★★ ПРОВЕРЯЕМ ЕЖЕДНЕВНЫЕ ЗАДАНИЯ (СОВМЕСТНАЯ ТРЕНИРОВКА) ★★★
+    if (sessionData && sessionData.exercises) {
+        const completedCount = sessionCompleted ? sessionCompleted.size : 0;
+        if (completedCount > 0) {
+            const workoutData = {
+                exercises: sessionData.exercises.map((ex, index) => ({
+                    ...ex,
+                    completed: sessionCompleted ? sessionCompleted.has(index) : false
+                })),
+                durationSeconds: sessionSeconds || 0,
+                category: sessionCategory || 'Совместная'
+            };
+            checkDailyTasksAfterCoopWorkout(workoutData);
+        }
+    }
+}
+
+function renderFinishPageData(data) {
+    console.log('🔥🔥🔥 [renderFinishPageData] НАЧАЛО');
+    logCoopState('renderFinishPageData (перед рендером)');
+    
+    // ★★★ ПРОВЕРКА НА НАЛИЧИЕ ДАННЫХ ★★★
+    if (!data || Object.keys(data).length === 0) {
+        console.warn('⚠️ [renderFinishPageData] data пустая, используем sessionData');
+        data = sessionData;
+        if (!data) {
+            console.error('❌ [renderFinishPageData] Нет данных для отображения!');
+            const container = document.getElementById('coopAllParticipants');
+            if (container) {
+                container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:1rem;">Нет данных для отображения</div>';
+            }
+            return;
+        }
+    }
+
+    const total = data?.totalExercises || 0;
+    const participants = data?.participants || [];
+    
+    // ★★★ ПРОВЕРКА НА УЧАСТНИКОВ ★★★
+    if (!participants || participants.length === 0) {
+        console.warn('⚠️ [renderFinishPageData] Нет участников!');
+        const container = document.getElementById('coopAllParticipants');
+        if (container) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:1rem;">Нет участников в тренировке</div>';
+        }
+        return;
+    }
+    
+    const participantProgress = data?.participantProgress || {};
+    const participantFinished = data?.participantFinished || {};
+    const participantFinishedSeconds = data?.participantFinishedSeconds || {};
+    const participantXp = data?.participantXp || {};
+
+    const user = firebase.auth().currentUser;
+    const currentUserId = user ? user.uid : null;
+
+    const sortedParticipants = [...participants].sort((a, b) => {
+        if (a.id === currentUserId) return -1;
+        if (b.id === currentUserId) return 1;
+        return 0;
+    });
+
+    // ★★★ ПОЛУЧАЕМ ИЛИ СОЗДАЁМ КОНТЕЙНЕР (ТОЛЬКО ОДИН РАЗ) ★★★
+    let container = document.getElementById('coopAllParticipants');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'coopAllParticipants';
+        container.style.cssText = 'width:100%; display:flex; flex-direction:column; gap:0.5rem;';
+const finishContent = document.querySelector('.finish-content');
+if (finishContent) {
+    const btnWrapper = document.getElementById('coopFinishButtons');
+    if (btnWrapper) {
+        finishContent.insertBefore(container, btnWrapper);
+    } else {
+        finishContent.appendChild(container);
+    }
+} else {
+            console.error('❌ [renderFinishPageData] Не найден контейнер .finish-content');
+            return;
+        }
+    } else {
+        // ★★★ ОЧИЩАЕМ СОДЕРЖИМОЕ, НО НЕ УДАЛЯЕМ САМ КОНТЕЙНЕР ★★★
+        container.innerHTML = '';
+    }
+
+    let html = '';
+    sortedParticipants.forEach((p) => {
+        const isMe = p.id === currentUserId;
+        const progress = participantProgress[p.id] || 0;
+        const time = participantFinishedSeconds[p.id] || 0;
+        const xp = participantXp[p.id] || 0;
+        const name = p.name || 'Пользователь';
+        const icon = isMe ? 'fa-solid fa-user' : 'fa-solid fa-user';
+        const xpDisplay = (isNaN(xp) ? 0 : xp).toFixed(1);
+        
+        console.log(`📊 Участник ${name}: progress=${progress}/${total}, time=${time}s, xp=${xpDisplay}`);
+
+html += `
+    <div style="width:100%;">
+        <div class="item-title" style="color:var(--slate); margin-left: 1rem; margin-bottom: 0.5rem;">
+            <i class="${icon}"></i> ${isMe ? 'Вы' : name}
+        </div>
+        <div class="finish-stats" style="margin-bottom: 0rem;">
+            <div class="finish-stat-item">
+                <span class="finish-stat-label">Время</span>
+                <span class="finish-stat-value">${formatTime(time)}</span>
+            </div>
+            <div class="finish-stat-item">
+                <span class="finish-stat-label">Упражнений</span>
+                <span class="finish-stat-value">${progress}/${total}</span>
+            </div>
+            <div class="finish-stat-item">
+                <span class="finish-stat-label">XP</span>
+                <span class="finish-stat-value">+${xpDisplay}</span>
+            </div>
+        </div>
+    </div>
+`;
+    });
+
+    container.innerHTML = html;
+    console.log('✅ [renderFinishPageData] Все участники отрендерены');
+}
+
+// Вспомогательная функция для форматирования времени
+function formatTime(seconds) {
+    const mins = String(Math.floor(seconds / 60)).padStart(2, '0');
+    const secs = String(seconds % 60).padStart(2, '0');
+    return `${mins}:${secs}`;
+}
+
+// =================== ИСПРАВЛЕННЫЙ markCurrentComplete ===================
+markCurrentComplete = function() {
+    const currentEx = sessionExercises[sessionCurrentIndex];
+    const repsStr = String(currentEx?.reps || '');
+    const isTimed = isTimeBased(repsStr);
+    const key = sessionCurrentIndex;
+    
+    if (isTimed) {
+        const completedSets = sessionCompletedSets[key] || 0;
+        const totalSets = parseInt(currentEx?.sets) || 0;
+        
+        if (completedSets === 0) {
+            showToast('⏱️ Нажмите СТАРТ, чтобы начать упражнение');
+            return;
+        }
+        
+        if (completedSets < totalSets) {
+            showToast(`⏱️ Выполнено ${completedSets} из ${totalSets} подходов. Завершите все подходы.`);
+            return;
+        }
+        
+        sessionCompleted.add(sessionCurrentIndex);
+        renderSessionProgress();   // ★ обновляем полоски СРАЗУ
+        if (currentSessionId && sessionData) {
+            updateCoopProgress(sessionCompleted.size, false);
+        }
+        logCoopState('markCurrentComplete (после завершения упражнения)');
+        
+        const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+        if (isLast) {
+            finishTrainingSession();
+        } else {
+            startRest();
+        }
+        return;
+    }
+    
+    const completedSets = sessionCompletedSets[key] || 0;
+    const totalSets = parseInt(currentEx?.sets) || 0;
+    
+    if (completedSets > 0 && completedSets < totalSets) {
+        showConfirmModal(
+            'Упражнение не завершено',
+            `Вы выполнили ${completedSets} из ${totalSets} подходов. Засчитать как выполненное?`,
+            function() {
+                sessionCompletedSets[key] = totalSets;
+                sessionCompleted.add(sessionCurrentIndex);
+                renderSessionProgress();   // ← ДОБАВИЛИ
+                if (currentSessionId && sessionData) {
+                    updateCoopProgress(sessionCompleted.size, false);
+                }
+                logCoopState('markCurrentComplete (после подтверждения)');
+                const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+                if (isLast) {
+                    finishTrainingSession();
+                } else {
+                    startRest();
+                }
+            },
+            'Засчитать'
+        );
+        return;
+    }
+    
+    if (sessionCompletedSets[key] === undefined || sessionCompletedSets[key] === 0) {
+        sessionCompletedSets[key] = totalSets;
+    }
+    sessionCompleted.add(sessionCurrentIndex);
+    renderSessionProgress();   // ← ДОБАВИЛИ
+    if (currentSessionId && sessionData) {
+        updateCoopProgress(sessionCompleted.size, false);
+    }
+    logCoopState('markCurrentComplete (после завершения упражнения)');
+    
+    const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+    if (isLast) {
+        finishTrainingSession();
+    } else {
+        startRest();
+    }
+};
+
+async function updateCoopProgress(completedCount, isFinishing = false) {
+    console.log('🔥🔥🔥 [updateCoopProgress] НАЧАЛО');
+    if (!currentSessionId) return;
+
+    try {
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+        const userId = user.uid;
+        const total = coopExercises.length || 0;
+        const currentTime = sessionSeconds;
+
+        console.log(`📤 Отправка прогресса: пользователь ${userId}, выполнено ${completedCount}/${total}, завершение=${isFinishing}`);
+
+        // ★★★ XP ВЫЧИСЛЯЕМ ПРАВИЛЬНО ★★★
+        const xpEarned = calculateWorkoutXp(coopExercises, sessionCompletedSets);
+        console.log('📊 XP за тренировку (правильный):', xpEarned);
+
+        const update = {};
+        update[`participantProgress.${userId}`] = completedCount;
+        
+        // ★★★ XP ОБНОВЛЯЕМ ВСЕГДА ★★★
+        update[`participantXp.${userId}`] = xpEarned;
+
+        if (isFinishing || completedCount >= total) {
+            update[`participantFinished.${userId}`] = true;
+            update[`participantFinishedSeconds.${userId}`] = currentTime;
+        }
+
+        await firebase.firestore()
+            .collection('trainingSessions')
+            .doc(currentSessionId)
+            .update(update);
+
+        console.log('✅ Прогресс успешно обновлён в Firestore');
+
+        // ★★★ ЛОКАЛЬНЫЕ ДАННЫЕ ОБНОВЛЯЕМ ВСЕГДА ★★★
+        if (sessionData) {
+            sessionData.participantProgress[userId] = completedCount;
+            sessionData.participantXp[userId] = xpEarned;
+            if (isFinishing || completedCount >= total) {
+                sessionData.participantFinished[userId] = true;
+                sessionData.participantFinishedSeconds[userId] = currentTime;
+            }
+        }
+
+        updateCoopUI();
+        logCoopState('updateCoopProgress (после обновления)');
+
+    } catch (error) {
+        console.error('❌ [updateCoopProgress] ОШИБКА:', error);
+        showToast('❌ Ошибка сохранения прогресса');
+    }
+}
+
+function showFriendSelectModal(friends) {
+    const oldModal = document.getElementById('friendSelectModal');
+    if (oldModal) oldModal.remove();
+    
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'friendSelectModal';
+overlay.innerHTML = `
+        <div class="modal-content" style="max-width: 400px;">
+                <div class="modal-title">Выберите друга</div>
+                <div class="scroll-wrapper-modal" style=" margin-bottom: 0.5rem;">
+${friends.map(f => {
+    const level = getCurrentLevel(f.totalXp || 0).id;
+    const xp = Math.round(f.totalXp || 0); // ← ИСПРАВЛЕНО: используем f.totalXp
+    return `
+<div class="friend-itemMOD" data-friend-id="${f.id}" onclick="selectFriendForCoop('${f.id}')">
+    <div class="friend-avatar">${(f.displayName || 'П')[0].toUpperCase()}</div>
+    <div class="friend-info">
+        <strong>${f.displayName || 'Пользователь'}</strong>
+        <span>Уровень ${level} · ${xp} XP</span>
+    </div>
+    <span class="challenge-friend-mark">
+        <i class="fa-solid fa-check"></i>
+    </span>
+</div>
+    `;
+}).join('')}
+                </div>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-secondary" onclick="closeModal('friendSelectModal')" style="flex: 1;">Закрыть</button>
+                    <button class="btn btn-primary" id="sendInviteBtn" style="flex: 1;">Отправить</button>
+                </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+    
+    // Массив выбранных друзей
+    window._selectedFriends = [];
+    
+document.getElementById('sendInviteBtn').addEventListener('click', function() {
+    const selectedFriends = window._selectedFriends || [];
+    const count = selectedFriends.length;
+
+    if (count === 0) {
+        showToast('⚠️ Выберите друга');
+        return;
+    }
+
+    if (count === 1) {
+        const friendId = selectedFriends[0];
+        closeModal('friendSelectModal');
+        getUserProfile(friendId).then(result => {
+            if (result.success) {
+                const friendName = result.data.displayName || 'Пользователь';
+                sendCoopInvite(friendId, friendName);
+            } else {
+                showToast('❌ Не удалось загрузить данные друга');
+            }
+        });
+        return;
+    }
+
+    if (count >= 2) {
+        if (hasPremium()) {
+            if (count <= 3) {
+                closeModal('friendSelectModal');
+                const friendId = selectedFriends[0];
+                getUserProfile(friendId).then(result => {
+                    if (result.success) {
+                        const friendName = result.data.displayName || 'Пользователь';
+                        sendCoopInvite(friendId, friendName);
+                    } else {
+                        showToast('❌ Не удалось загрузить данные друга');
+                    }
+                });
+            } else {
+                showToast(`⚠️ Можно выбрать не более 3 друзей`);
+            }
+        } else {
+            closeModal('friendSelectModal');
+            openModal('premiumModal');
+        }
+    }
+});
+}
+
+window.selectFriendForCoop = function(friendId) {
+    console.log('🔵 Клик по другу:', friendId);
+
+    if (!window._selectedFriends) window._selectedFriends = [];
+
+    const currentSelected = window._selectedFriends;
+    const index = currentSelected.indexOf(friendId);
+
+    // ★★★ ИЩЕМ ТОЛЬКО ВНУТРИ НУЖНОЙ МОДАЛКИ ★★★
+    const el = document.querySelector(`#friendSelectModal .friend-itemMOD[data-friend-id="${friendId}"]`);
+    console.log('  element:', el ? 'найден' : 'НЕ найден');
+
+    if (index !== -1) {
+        currentSelected.splice(index, 1);
+        if (el) el.classList.remove('selected');
+        console.log('  снято выделение');
+    } else {
+        currentSelected.push(friendId);
+        if (el) el.classList.add('selected');
+        console.log('  выделено');
+    }
+
+    window._selectedFriends = currentSelected;
+    console.log('  выбрано:', currentSelected);
+};
+
+async function sendCoopInvite(friendId, friendName) {
+    console.log('🔥🔥🔥 [sendCoopInvite] НАЧАЛО');
+    const workoutData = window._currentWorkoutForInvite;
+    if (!workoutData || !workoutData.exercises || workoutData.exercises.length === 0) {
+        showToast('❌ Сначала выберите тренировку');
+        return;
+    }
+    try {
+        const user = await getFirebaseUser();
+        if (!user) {
+            showToast('❌ Вы не авторизованы');
+            return;
+        }
+        
+        const selectedFriends = window._selectedFriends || [];
+        console.log('🔥 Выбрано друзей:', selectedFriends.length);
+        
+        const maxFriends = hasPremium() ? 3 : 1;
+        if (selectedFriends.length > maxFriends) {
+            if (!hasPremium()) {
+                showToast('⚠️ Без Premium можно пригласить только 1 друга');
+                openModal('premiumModal');
+                return;
+            } else {
+                showToast(`⚠️ Можно пригласить не более ${maxFriends} друзей`);
+                return;
+            }
+        }
+        
+        const friendsWithNames = [];
+        for (const id of selectedFriends) {
+            const result = await getUserProfile(id);
+            const name = result.success ? result.data.displayName : 'Пользователь';
+            friendsWithNames.push({ id, name });
+        }
+        
+        // Формируем участников: хост + все друзья
+        const allParticipants = [
+            { id: user.uid, name: user.displayName || 'Пользователь' },
+            ...friendsWithNames
+        ];
+        
+        // ★★★ СОЗДАЁМ ОБЪЕКТЫ ДЛЯ ВСЕХ УЧАСТНИКОВ ★★★
+        const progressMap = {};
+        const finishedMap = {};
+        const secondsMap = {};
+        const xpMap = {};
+        const readyMap = {};
+        
+        allParticipants.forEach(p => {
+            progressMap[p.id] = 0;
+            finishedMap[p.id] = false;
+            secondsMap[p.id] = null;
+            xpMap[p.id] = 0;
+            readyMap[p.id] = false;
+        });
+        
+        // Хост готов сразу
+        readyMap[user.uid] = true;
+        
+        // Создаём сессию
+const sessionRef = await firebase.firestore().collection('trainingSessions').add({
+    hostId: user.uid,
+    workoutTitle: workoutData.title,
+    exercises: workoutData.exercises.map(ex => ({ ...ex, completed: false })),
+    status: 'waiting',
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    totalExercises: workoutData.exercises.length,
+    participants: allParticipants,
+    participantIds: allParticipants.map(p => p.id),   // ★★★ НОВОЕ ПОЛЕ ★★★
+    participantProgress: progressMap,
+    participantFinished: finishedMap,
+    participantFinishedSeconds: secondsMap,
+    participantXp: xpMap,
+    participantReady: readyMap,
+    closedFinish: {}
+});
+        
+        currentSessionId = sessionRef.id;
+        isHost = true;
+        
+        // ★★★ ОБНОВЛЯЕМ ЛОКАЛЬНЫЕ ДАННЫЕ ★★★
+        sessionData = {
+            hostId: user.uid,
+            workoutTitle: workoutData.title,
+            exercises: workoutData.exercises,
+            totalExercises: workoutData.exercises.length,
+            participants: allParticipants,
+            participantProgress: progressMap,
+            participantFinished: finishedMap,
+            participantFinishedSeconds: secondsMap,
+            participantXp: xpMap,
+            participantReady: readyMap
+        };
+        
+        coopExercises = workoutData.exercises;
+        finishPageShown = false;
+        
+        // Отправляем приглашения
+        for (const friend of friendsWithNames) {
+            await firebase.firestore().collection('notifications').add({
+                to: friend.id,
+                from: user.uid,
+                fromName: user.displayName || 'Пользователь',
+                type: 'train_invite',
+                sessionId: sessionRef.id,
+                workoutTitle: workoutData.title,
+                message: `${user.displayName || 'Пользователь'} приглашает вас на совместную тренировку!`,
+                createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+                read: false
+            });
+        }
+        
+        showToast(`✅ Приглашения отправлены ${friendsWithNames.length} друзьям`);
+        
+        window.navigateTo('training-waiting');
+        document.getElementById('bottomNav').style.display = 'none';
+        
+        setTimeout(() => {
+            listenSession(currentSessionId);
+        }, 500);
+        
+    } catch (error) {
+        console.error('❌ [sendCoopInvite] ОШИБКА:', error);
+        showToast('❌ Не удалось отправить приглашение');
+    }
+}
+
+finishTrainingSession = async function() {
+    soundTimerFinish.currentTime = 0;
+    soundTimerFinish.play().catch(() => {});
+    
+    if (isResting) {
+        if (restTimerInterval) {
+            clearInterval(restTimerInterval);
+            restTimerInterval = null;
+        }
+        isResting = false;
+    }
+   
+    console.log('🔥🔥🔥 [finishTrainingSession] НАЧАЛО');
+    
+    // ЛОГ: проверяем все ключевые переменные
+    console.log('📊 [finishTrainingSession] ПРОВЕРКА ПЕРЕМЕННЫХ:');
+    console.log('  - currentSessionId:', currentSessionId);
+    console.log('  - sessionData существует?', !!sessionData);
+    console.log('  - sessionExercises.length:', sessionExercises.length);
+    console.log('  - sessionCompleted.size:', sessionCompleted.size);
+    console.log('  - sessionSeconds:', sessionSeconds);
+    console.log('  - isHost:', isHost);
+    console.log('  - sessionWorkoutTitle:', sessionWorkoutTitle);
+    console.log('  - sessionCategory:', sessionCategory);
+
+    // Если нет совместной сессии — обрабатываем как обычную тренировку
+    if (!currentSessionId || !sessionData) {
+        console.log('📌 [finishTrainingSession] Обычная тренировка (нет совместной сессии)');
+        stopSessionTimer();
+        const total = sessionExercises.length;
+        const completed = sessionCompleted.size;
+        const completedExercises = sessionExercises.filter((_, index) => sessionCompleted.has(index));
+        const xpEarned = calculateWorkoutXp(sessionExercises, sessionCompletedSets);
+        console.log('📊 [finishTrainingSession] Обычная тренировка: total=' + total + ', completed=' + completed + ', xp=' + xpEarned);
+
+        // ★★★ ВСЕГДА ПОКАЗЫВАЕМ СТРАНИЦУ ФИНИША, ДАЖЕ ПРИ 0 УПРАЖНЕНИЙ ★★★
+        clearStoredPersonalTraining();
+        showFinishPage(total, completed, sessionSeconds, xpEarned);
+        console.log('✅ [finishTrainingSession] Обычная тренировка завершена');
+
+        refreshFriendsHistory()
+        
+        // ЗАДАНИЕ 1: ПЕРВЫЙ ШАГ
+        if (completed > 0 && !tasks[1]) {
+            tasks[1] = true;
+            saveTasks();
+            updateTasksUI();
+            showToast('✅ Задание "Первый шаг" выполнено!');
+            addTaskXp();
+        }
+        
+        // ПРОВЕРЯЕМ ЕЖЕДНЕВНЫЕ ЗАДАНИЯ
+        if (completed > 0) {
+            const workoutData = {
+                exercises: sessionExercises.map((ex, index) => ({
+                    ...ex,
+                    completed: sessionCompleted.has(index)
+                })),
+                durationSeconds: sessionSeconds,
+                category: sessionCategory || ''
+            };
+            checkDailyTasksAfterWorkout(workoutData);
+        }
+
+        // ★★★ ТРИГГЕР ПЕРЕСЧЁТА ВЫЗОВОВ ★★★
+        if (completed > 0) {
+            const user = await getFirebaseUser();
+            if (user && typeof Challenges !== 'undefined') {
+                await Challenges.onWorkoutFinished(user.uid);
+            }
+        }
+        
+        return;
+    }
+
+    // Совместная тренировка
+    console.log('📌 [finishTrainingSession] СОВМЕСТНАЯ тренировка');
+    
+    const completedCount = sessionCompleted.size;
+    const total = sessionData.totalExercises || coopExercises.length || 0;
+    
+    console.log('📊 [finishTrainingSession] ДАННЫЕ СОВМЕСТНОЙ ТРЕНИРОВКИ:');
+    console.log('  - completedCount (sessionCompleted.size):', completedCount);
+    console.log('  - total (sessionData.totalExercises || coopExercises.length):', total);
+    console.log('  - sessionData.totalExercises:', sessionData.totalExercises);
+    console.log('  - coopExercises.length:', coopExercises.length);
+    console.log('  - sessionData.participants:', JSON.stringify(sessionData.participants));
+    console.log('  - sessionData.participantProgress:', JSON.stringify(sessionData.participantProgress));
+    console.log('  - sessionData.participantFinished:', JSON.stringify(sessionData.participantFinished));
+
+    // ★★★ ВЫЧИСЛЯЕМ XP ПРАВИЛЬНО ★★★
+    const xpEarned = calculateWorkoutXp(coopExercises, sessionCompletedSets);
+    console.log('📊 XP за тренировку (правильный):', xpEarned);
+
+    // ОБНОВЛЯЕМ ПРОГРЕСС
+    console.log('🔄 [finishTrainingSession] Вызов updateCoopProgress(' + completedCount + ', true)');
+    await updateCoopProgress(completedCount, true);
+    console.log('✅ [finishTrainingSession] updateCoopProgress выполнен');
+
+    // ПРИНУДИТЕЛЬНО ОБНОВЛЯЕМ ЛОКАЛЬНЫЕ ДАННЫЕ
+    const user = firebase.auth().currentUser;
+    console.log('👤 [finishTrainingSession] Текущий пользователь:', user ? user.uid : 'null');
+    
+    if (user) {
+        const userId = user.uid;
+        console.log('🔄 [finishTrainingSession] Обновляем локальный sessionData для пользователя:', userId);
+        if (sessionData) {
+            sessionData.participantProgress[userId] = completedCount;
+            sessionData.participantFinished[userId] = true;
+            sessionData.participantFinishedSeconds[userId] = sessionSeconds;
+            // ★★★ СОХРАНЯЕМ ПРАВИЛЬНЫЙ XP ★★★
+            sessionData.participantXp[userId] = xpEarned;
+        }
+    }
+
+    // ПРОВЕРЯЕМ, ВСЕ ЛИ ЗАВЕРШИЛИ
+    const participants = sessionData.participants || [];
+    const participantFinished = sessionData.participantFinished || {};
+    
+    console.log('📊 [finishTrainingSession] ПРОВЕРКА ЗАВЕРШЕНИЯ:');
+    console.log('  - Всего участников:', participants.length);
+    participants.forEach(p => {
+        console.log('  - Участник ' + p.name + ' (' + p.id + '): finished=' + participantFinished[p.id]);
+    });
+    
+    const allFinished = participants.every(p => participantFinished[p.id] === true);
+    console.log('  - allFinished:', allFinished);
+
+    if (!allFinished) {
+        console.log('⏳ [finishTrainingSession] Не все завершили, показываем страницу ожидания...');
+        stopSessionTimer();
+        showCoopWaitingPage();
+        console.log('✅ [finishTrainingSession] Страница ожидания показана');
+        return;
+    }
+
+    console.log('🎉 [finishTrainingSession] Все участники завершили!');
+    console.log('🔄 [finishTrainingSession] Вызов stopSessionTimer()');
+    stopSessionTimer();
+    console.log('🔄 [finishTrainingSession] Вызов showCoopFinishPage()');
+    showCoopFinishPage();
+    console.log('✅ [finishTrainingSession] ЗАВЕРШЕНА');
+
+    refreshFriendsHistory()
+
+    // ЗАДАНИЕ 1: ПЕРВЫЙ ШАГ
+    if (completedCount > 0 && !tasks[1]) {
+        tasks[1] = true;
+        saveTasks();
+        updateTasksUI();
+        showToast('✅ Задание "Первый шаг" выполнено!');
+        addTaskXp();
+    }
+
+    // ПРОВЕРЯЕМ ЕЖЕДНЕВНЫЕ ЗАДАНИЯ (СОВМЕСТНАЯ)
+    if (completedCount > 0) {
+        const workoutData = {
+            exercises: coopExercises.map((ex, index) => ({
+                ...ex,
+                completed: index < completedCount
+            })),
+            durationSeconds: sessionSeconds,
+            category: sessionCategory || ''
+        };
+        checkDailyTasksAfterCoopWorkout(workoutData);
+    }
+};
+
+// =================== СТРАНИЦА ОЖИДАНИЯ ОСТАЛЬНЫХ ===================
+function showCoopWaitingPage() {
+    console.log('🔥🔥🔥 [showCoopWaitingPage] НАЧАЛО');
+    logCoopState('showCoopWaitingPage (перед отображением)');
+    
+    const total = coopExercises.length || 0;
+    const myExercises = sessionCompleted.size;
+    
+    // ★★★ ВЫЧИСЛЯЕМ XP ПРАВИЛЬНО ★★★
+    const user = firebase.auth().currentUser;
+    const userId = user ? user.uid : null;
+    let myXpValue = 0;
+    
+    // Сначала проверяем sessionData
+    if (sessionData && userId && sessionData.participantXp && sessionData.participantXp[userId] !== undefined) {
+        myXpValue = sessionData.participantXp[userId];
+        console.log(`📊 XP из sessionData: ${myXpValue}`);
+    } else {
+        // Вычисляем XP на основе выполненных упражнений и подходов
+        myXpValue = calculateWorkoutXp(coopExercises, sessionCompletedSets);
+        console.log(`📊 XP вычислен локально: ${myXpValue}`);
+        // Обновляем sessionData, чтобы следующие вызовы использовали его
+        if (sessionData && userId) {
+            sessionData.participantXp[userId] = myXpValue;
+        }
+    }
+    const myTime = sessionSeconds;
+    
+    document.getElementById('coopMyExercises').textContent = `${myExercises}/${total}`;
+    document.getElementById('coopMyTime').textContent = formatTime(myTime);
+    document.getElementById('coopMyXp').textContent = `+${(isNaN(myXpValue) ? 0 : myXpValue).toFixed(1)}`;
+    
+    renderCoopFriendsStatus();
+    
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = 'none';
+    });
+    const target = document.getElementById('page-coop-waiting');
+    if (target) {
+        target.classList.add('page-active');
+        target.style.display = 'block';
+    }
+    document.getElementById('bottomNav').style.display = 'none';
+    
+    console.log('✅ Страница ожидания показана');
+}
+
+function renderCoopFriendsStatus() {
+    console.log('🔥 [renderCoopFriendsStatus] НАЧАЛО');
+    const container = document.getElementById('coopFriendsStatus');
+    if (!container) {
+        console.error('❌ [renderCoopFriendsStatus] Контейнер coopFriendsStatus не найден');
+        return;
+    }
+    
+    const participants = sessionData?.participants || [];
+    const participantProgress = sessionData?.participantProgress || {};
+    const total = coopExercises.length || 0;
+    
+    const user = firebase.auth().currentUser;
+    const currentUserId = user ? user.uid : null;
+    
+    const friends = participants.filter(p => p.id !== currentUserId);
+    
+    if (friends.length === 0) {
+        container.innerHTML = `<div style="text-align:center;color:var(--slate);padding:1rem;">Нет других участников</div>`;
+        return;
+    }
+    
+    let html = '';
+    friends.forEach(p => {
+        const progress = participantProgress[p.id] || 0;
+        const name = p.name || 'Пользователь';
+        html += `
+            <div class="coop-friend-status-item">
+                <span class="coop-friend-status-name">
+                    👤 ${name}
+                </span>
+                <span class="coop-friend-status-progress">
+                    ${progress}/${total}
+                </span>
+            </div>
+        `;
+    });
+    
+    container.innerHTML = html;
+}
+
+document.getElementById('coopFinishShareBtn')?.addEventListener('click', function() {
+    // Кликаем по кнопке «Закончить» — она сохраняет и переходит в ленту.
+    // Но нам нужно открыть модалку поста. Поэтому делаем то же самое, но
+    // с флагом _openCreatePostAfterSave = true.
+
+    if (!preventDoubleClick('coopFinishShareBtn', 3000)) {
+        showToast('⏳ Подождите, тренировка уже сохраняется...');
+        return;
+    }
+
+    window._openCreatePostAfterSave = true;
+
+    // Программно кликаем по «Закончить»
+    document.getElementById('coopFinishDoneBtn')?.click();
+});
+document.getElementById('coopFinishDoneBtn')?.addEventListener('click', async function() {
+    console.log('🔥🔥🔥 [coopFinishDoneBtn] НАЖАТА КНОПКА');
+    console.log('🔥 [coopFinishDoneBtn] currentSessionId:', currentSessionId);
+    console.log('🔥 [coopFinishDoneBtn] isHost:', isHost);
+    console.log('🔥 [coopFinishDoneBtn] sessionCompleted.size:', sessionCompleted.size);
+    console.log('🔥 [coopFinishDoneBtn] sessionSeconds:', sessionSeconds);
+
+    if (!preventDoubleClick('coopFinishDoneBtn', 3000)) {
+        console.log('⏳ [coopFinishDoneBtn] Защита от двойного клика');
+        showToast('⏳ Подождите, тренировка уже сохраняется...');
+        return;
+    }
+
+    const btn = this;
+    btn.disabled = true;
+    console.log('📝 [coopFinishDoneBtn] Кнопка заблокирована');
+
+    try {
+        // 1. Подготовка данных тренировки из глобальных переменных
+        console.log('📝 [coopFinishDoneBtn] Подготовка данных тренировки');
+        const workoutExercises = sessionExercises.map((ex, index) => ({
+            ...ex,
+            icon: ex.icon || null,
+            completed: sessionCompleted.has(index)
+        }));
+        console.log('🔥 [coopFinishDoneBtn] workoutExercises.length:', workoutExercises.length);
+
+        const workoutIcon = sessionWorkoutIcon || null;
+        const finalCategory = sessionCategory || 'Без категории';
+        const xpEarned = calculateWorkoutXp(workoutExercises.filter((_, index) => sessionCompleted.has(index)));
+        console.log('🔥 [coopFinishDoneBtn] workoutIcon:', workoutIcon);
+        console.log('🔥 [coopFinishDoneBtn] finalCategory:', finalCategory);
+        console.log('🔥 [coopFinishDoneBtn] xpEarned:', xpEarned);
+
+        const workoutData = {
+            title: sessionWorkoutTitle || 'Совместная тренировка',
+            date: new Date().toISOString(),
+            durationSeconds: sessionSeconds,
+            exercises: workoutExercises,
+            xpEarned: xpEarned,
+            category: finalCategory,
+            icon: workoutIcon
+        };
+        console.log('🔥 [coopFinishDoneBtn] workoutData:', workoutData);
+
+        const user = await getFirebaseUser();
+        console.log('🔥 [coopFinishDoneBtn] user:', user ? user.uid : 'null');
+
+        // 2. Сохранение тренировки (в Firestore или локально)
+        if (user) {
+            console.log('📤 [coopFinishDoneBtn] Сохраняем тренировку в Firestore');
+            const result = await saveWorkoutToFirestore(user.uid, workoutData);
+            console.log('🔥 [coopFinishDoneBtn] result.success:', result.success);
+            if (result.success) {
+                const profileResult = await getUserProfile(user.uid);
+                if (profileResult.success) {
+                    const currentXp = profileResult.data.totalXp || 0;
+                    console.log('🔥 [coopFinishDoneBtn] currentXp:', currentXp);
+                    await updateUserProfile(user.uid, { totalXp: currentXp + xpEarned });
+                    if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel(); // ★
+                    console.log('✅ [coopFinishDoneBtn] Профиль обновлён, XP добавлен');
+                }
+                showToast('💾 Тренировка сохранена');
+                // После сохранения или добавления в офлайн-очередь
+                await updateAchievementsAfterWorkout();
+            } else {
+                addPendingWorkout(workoutData);
+                showToast('⚠️ Тренировка сохранена локально, синхронизация позже');
+            }
+        } else {
+            addPendingWorkout(workoutData);
+            showToast('⚠️ Тренировка сохранена локально');
+        }
+
+        // 3. Помечаем, что этот участник закрыл страницу финиша
+        if (currentSessionId) {
+            const user = firebase.auth().currentUser;
+            if (user) {
+                await firebase.firestore()
+                    .collection('trainingSessions')
+                    .doc(currentSessionId)
+                    .update({
+                        [`closedFinish.${user.uid}`]: true
+                    });
+
+                // 4. Проверяем, все ли закрыли финиш → удаляем сессию
+                const doc = await firebase.firestore()
+                    .collection('trainingSessions')
+                    .doc(currentSessionId)
+                    .get();
+                if (doc.exists) {
+                    const data = doc.data();
+                    const participants = data.participants || [];
+                    const closedFinish = data.closedFinish || {};
+                    const allClosed = participants.every(p => closedFinish[p.id] === true);
+                    if (allClosed) {
+                        await firebase.firestore()
+                            .collection('trainingSessions')
+                            .doc(currentSessionId)
+                            .delete();
+                        console.log('🗑️ Сессия удалена (все закрыли финиш)');
+                    } else {
+                        console.log('👀 Ожидаем закрытия финиша другими участниками');
+                    }
+                }
+            }
+        }
+
+ // 5. Сбрасываем все глобальные переменные
+    console.log('🔄 [coopFinishDoneBtn] Сбрасываем все флаги');
+    sessionExercises = [];
+    sessionCompleted = new Set();
+    sessionSkipped = new Set();
+    sessionCompletedSets = {}; // ★★★ СБРАСЫВАЕМ ★★★
+    sessionSeconds = 0;
+    sessionWorkoutTitle = '';
+    sessionCategory = '';
+    sessionWorkoutIcon = null;
+    currentSessionId = null;
+    isHost = false;
+    sessionData = null;
+    coopExercises = [];
+    coopStarted = false;
+    finishPageShown = false;
+    console.log('✅ [coopFinishDoneBtn] Все флаги сброшены');
+
+        // 6. Отключаем слушатель, если есть
+        if (sessionListener) {
+            console.log('🔄 [coopFinishDoneBtn] Отключаем слушатель');
+            sessionListener();
+            sessionListener = null;
+            console.log('✅ [coopFinishDoneBtn] Слушатель отключен');
+        }
+
+        // 7. Переход: либо в ленту с открытой модалкой поста (если нажали «Поделиться»),
+        //    либо на страницу тренировок (обычное «Закончить»)
+        if (window._openCreatePostAfterSave) {
+            window._openCreatePostAfterSave = false;
+            console.log('📍 [coopFinishDoneBtn] Переход в ленту с открытием модалки поста');
+            window.navigateTo('feed');
+            document.getElementById('bottomNav').style.display = 'block';
+
+            setTimeout(() => {
+                setFeedFilter('my');
+                openCreatePostModal({ autoSelectLatest: true });
+            }, 500);
+        } else {
+            console.log('📍 [coopFinishDoneBtn] Переход на workouts');
+            window.navigateTo('workouts');
+            document.getElementById('bottomNav').style.display = 'block';
+        }
+
+        // ★★★ УВЕЛИЧИВАЕМ СЧЁТЧИК ТРЕНИРОВОК ★★★
+        incrementWorkoutsCount();
+        const showPremiumCoop = shouldShowPremiumOffer();
+
+        // ★★★ ПОКАЗЫВАЕМ PREMIUM ЧЕРЕЗ НЕКОТОРОЕ ВРЕМЯ ★★★
+    if (showPremiumCoop) {
+        markPremiumOfferShown();
+        setTimeout(() => {
+            enqueueModal({ type: 'premium' });
+        }, 800);
+    }
+
+        } catch (error) {
+            console.error('❌ [coopFinishDoneBtn] ОШИБКА:', error);
+            console.error('❌ [coopFinishDoneBtn] stack:', error.stack);
+            showToast('❌ Ошибка сохранения тренировки');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Закончить';
+            console.log('✅ [coopFinishDoneBtn] Кнопка разблокирована');
+        }
+        console.log('✅ [coopFinishDoneBtn] ЗАВЕРШЕНА');
+    });
+
+// Создаём глобальные переменные для совместимости со старым кодом
+let activeStatsTab = TabManager.state.stats;
+let activeWorkoutsTab = TabManager.state.workouts;
+let activeProfileTab = TabManager.state.profile;
+
+// Обёртки для совместимости
+function applyStatsTab(tab) { TabManager.stats(tab); activeStatsTab = tab; }
+function applyWorkoutsTab(tab) { TabManager.workouts(tab); activeWorkoutsTab = tab; }
+function switchProfileTab(tab) {
+    TabManager.profile(tab);
+    activeProfileTab = tab;
+    
+    // Обновляем UI
+    const profileTabs = document.querySelectorAll('.profile-tab-btn');
+    profileTabs.forEach(btn => {
+        btn.classList.toggle('tab-btn-active', btn.dataset.tab === tab);
+    });
+    const contents = document.querySelectorAll('.profile-tab-content');
+    contents.forEach(content => {
+        content.classList.remove('profile-tab-content-active');
+    });
+    const target = document.getElementById('profileTab-' + tab);
+    if (target) {
+        target.classList.add('profile-tab-content-active');
+    }
+if (tab === 'friends') {
+    setTimeout(() => {
+        renderFriendsInProfile();
+        setTimeout(() => renderFriendsHistory(), 300);
+    }, 100);
+}
+    
+    // ★★★ ОБНОВЛЯЕМ ВИДИМОСТЬ КНОПКИ РЕДАКТИРОВАНИЯ ДРУЗЕЙ ★★★
+    updateFriendsEditButtonVisibility();
+    
+    TabManager.save();
+}
+function loadTabsState() { TabManager.load(); }
+function saveTabsState() { TabManager.save(); }
+
+// ===================ЗАЩИТА ОТ СПАМА КНОПОК ===================
+const buttonCooldowns = new Map();
+
+function preventDoubleClick(buttonId, cooldownMs = 2000) {
+    const now = Date.now();
+    const lastClick = buttonCooldowns.get(buttonId) || 0;
+    if (now - lastClick < cooldownMs) {
+        console.warn(`Кнопка ${buttonId} заблокирована (${cooldownMs}мс)`);
+        return false;
+    }
+    buttonCooldowns.set(buttonId, now);
+    return true;
+}
+
+function getButtonCooldown(buttonId) {
+    const now = Date.now();
+    const lastClick = buttonCooldowns.get(buttonId) || 0;
+    return Math.max(0, 2000 - (now - lastClick));
+}
+
+// ===================ФОРМАТИРОВАНИЕ ПОВТОРЕНИЙ ===================
+function formatSets(sets, short = false) {
+    const num = parseInt(sets) || 0;
+    if (short) return `${num} под`;
+    return `${num} ${declOfNum(num, ['подход', 'подхода', 'подходов'])}`;
+}
+
+function formatReps(reps, short = false) {
+    const repsStr = String(reps || '');
+    if (repsStr.includes('сек') || repsStr.includes('с') || repsStr.includes('Секунд')) {
+        const num = parseInt(repsStr.replace(/[^0-9.]/g, '')) || 0;
+        if (short) return `${num} сек`;
+        return `${num} ${declOfNum(num, ['секунда', 'секунды', 'секунд'])}`;
+    }
+    const num = parseInt(repsStr) || 0;
+    if (short) return `${num} пов`;
+    return `${num} ${declOfNum(num, ['повторение', 'повторения', 'повторений'])}`;
+}
+
+// ===================МАКСИМАЛЬНОЕ КОЛИЧЕСТВО УПРАЖНЕНИЙ ===================
+function getMaxExercisesForLevel(level, isCustom) {
+    if (isCustom) return 20;
+    const maxMap = { '1 LVL': 10, '2 LVL': 15, '3 LVL': 20 };
+    return maxMap[level] || 20;
+}
+
+// ===================СОХРАНЕНИЕ ДАННЫХ В localStorage ===================
+const exercisesDataDefault = JSON.parse(JSON.stringify(exercisesData));
+const STORAGE_KEY = 'sportapp_exercisesData';
+
+function loadExercisesData() {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+        try {
+            const parsed = JSON.parse(saved);
+            for (const category in parsed) {
+                if (exercisesData[category]) {
+                    for (const level in parsed[category]) {
+                        exercisesData[category][level] = parsed[category][level];
+                    }
+                } else {
+                    exercisesData[category] = parsed[category];
+                }
+            }
+        } catch (e) {
+            console.warn('Ошибка загрузки данных тренировок:', e);
+        }
+    }
+}
+
+function saveExercisesData() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(exercisesData));
+}
+
+loadExercisesData();
+
+// ===================ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===================
+let currentMonth = new Date().getMonth();
+let currentYear = new Date().getFullYear();
+let isOfflineModalShown = false;
+let isLoggingIn = false;
+let isDataLoaded = false;
+
+window._monthOffset = 0;
+
+let editIsCustom = false;
+let editWorkoutId = null;
+let editExercises = [];
+let editCategory = '';
+let editingExerciseIndex = null;
+let editLevel = '1 LVL';
+
+window.statsEditor = null;
+window.workoutsEditor = null;
+window.worldStatsEditor = null;
+
+let isEditingWorkout = false;
+let isEditingProfile = false;
+
+let dailyTasksList = [];
+let dailyTasksCompleted = {};
+let dailyTasksDate = '';
+
+// Время отдыха по умолчанию (в секундах)
+let sessionRestSeconds = 30;
+
+// ===== ПЕРЕМЕННЫЕ ДЛЯ ТАЙМЕРА УПРАЖНЕНИЯ =====
+let exerciseTimerInterval = null;
+let exerciseTimeLeft = 0;
+let exerciseTotalTime = 0;
+let isExerciseTimerRunning = false;
+let exerciseCurrentSet = 0;
+let exerciseTotalSets = 0;
+let isTimedExercise = false;
+// Хранит количество выполненных подходов для каждого упражнения
+let sessionCompletedSets = {};
+
+let taskSessionData = null;
+let taskSessionSeconds = 0;
+let taskTimerInterval = null;
+let taskExerciseTimerInterval = null;
+
+// ===================СИСТЕМА УВЕДОМЛЕНИЙ ===================
+const NOTIFICATIONS_KEY = 'notificationsSeen';
+const LAST_VISIT_KEY = 'lastVisitDate';
+const LAST_WORLD_RANK_KEY = 'lastWorldRank';
+const LAST_FRIENDS_RANK_KEY = 'lastFriendsRank';
+
+let notificationQueue = [];
+let isNotificationShowing = false;
+const shownThisSession = new Set();
+
+const notificationContainer = document.getElementById('notificationContainer');
+const notificationCard = document.getElementById('notificationCard');
+const notificationIcon = document.getElementById('notificationIcon');
+const notificationText = document.getElementById('notificationText');
+const notificationOkBtn = document.getElementById('notificationOkBtn');
+
+notificationContainer.style.display = 'block';
+
+function showNotification(icon, text, actionCallback, autoClose = true, okAction = null) {
+    // ★★★ НЕ ПОКАЗЫВАЕМ УВЕДОМЛЕНИЯ НА ЭКРАНАХ АВТОРИЗАЦИИ ★★★
+    const forbiddenPages = [
+        'page-hero',
+        'page-loading',
+        'page-login',
+        'page-login-password',
+        'page-register',
+        'page-register-email',
+        'page-register-password',
+        'page-register-verify',
+        'page-register-gender',
+        'page-register-body',
+        'page-inventory'
+    ];
+    for (const id of forbiddenPages) {
+        const el = document.getElementById(id);
+        if (el && el.classList.contains('page-active')) {
+            console.log('🔇 Уведомление подавлено на экране ' + id + ':', text);
+            return;
+        }
+    }
+
+    // ★★★ ЗВУК SMS ДЛЯ ЛЮБОГО УВЕДОМЛЕНИЯ ★★★
+    soundSms.currentTime = 0;
+    soundSms.play().catch(() => {});
+    
+    const isInvite = text.includes('приглашает') || text.includes('пригласил');
+    const isFriendRequest = text.includes('заявка в друзья');
+    const isFriendAccepted = text.includes('новый друг');
+    
+    // ★★★ ЕСЛИ ЭТО УВЕДОМЛЕНИЕ ОТ ДРУГОГО ПОЛЬЗОВАТЕЛЯ — ПОКАЗЫВАЕМ ВСЕГДА ★★★
+if (isInvite || isFriendRequest || isFriendAccepted) {
+    const uniqueId = 'user_action_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    notificationQueue.push({ 
+        icon, 
+        text, 
+        actionCallback, 
+        id: uniqueId, 
+        isInvite: true,
+        isFriendRequest: isFriendRequest,
+        isFriendAccepted: isFriendAccepted,
+        autoClose: true,          // ← ИЗМЕНЕНО: теперь авто-скрытие работает
+        autoCloseDelay: 5000,     // ← 5 СЕКУНД
+        okAction: okAction,
+        forceShow: true
+    });
+    if (!isNotificationShowing) {
+        processNotificationQueue();
+    }
+    return;
+}
+    
+    // ★★★ ОБЫЧНЫЕ УВЕДОМЛЕНИЯ (СИСТЕМНЫЕ) — ПРОВЕРЯЕМ НА ПОВТОР ★★★
+    const notificationId = text + icon;
+    const seen = JSON.parse(localStorage.getItem(NOTIFICATIONS_KEY) || '[]');
+    if (seen.includes(notificationId)) {
+        console.log('Уведомление уже показано:', text);
+        return;
+    }
+    
+    notificationQueue.push({ 
+        icon, 
+        text, 
+        actionCallback, 
+        id: notificationId,
+        autoClose: autoClose,
+        okAction: okAction,
+        forceShow: false
+    });
+    if (!isNotificationShowing) {
+        processNotificationQueue();
+    }
+}
+
+function processNotificationQueue() {
+    console.log('🔵 processNotificationQueue вызвана');
+    console.log('📊 Очередь:', notificationQueue.length);
+    console.log('📊 isNotificationShowing:', isNotificationShowing);
+    
+    if (notificationQueue.length === 0 || isNotificationShowing) {
+        console.log('⏭️ Очередь пуста или уведомление уже показывается');
+        return;
+    }
+    
+    isNotificationShowing = true;
+    const notification = notificationQueue.shift();
+    console.log('📄 Уведомление:', notification);
+    
+    notificationIcon.textContent = notification.icon;
+    notificationText.textContent = notification.text;
+    
+    const okBtn = document.getElementById('notificationOkBtn');
+    console.log('🔍 Кнопка notificationOkBtn найдена?', okBtn ? 'Да' : 'Нет');
+    
+if (notification.actionCallback) {
+    console.log('🔵 Есть actionCallback, ставим кнопку "Принять"');
+    okBtn.textContent = 'Принять';
+    okBtn.onclick = function(e) {
+        console.log('🔵 КНОПКА "ПРИНЯТЬ" НАЖАТА!');
+        if (notification.actionCallback) {
+            console.log('🔵 Вызываем actionCallback');
+            try {
+                notification.actionCallback();
+                console.log('✅ actionCallback выполнен');
+            } catch (error) {
+                console.error('❌ Ошибка в actionCallback:', error);
+            }
+        }
+        hideNotification();
+        
+        if (!notification.forceShow && !notification.isInvite && notification.id) {
+            markNotificationSeen(notification.id);
+        }
+    };
+    
+    // ★★★ АВТО-ЗАКРЫТИЕ — 5 СЕКУНД ★★★
+    if (notification.autoClose !== false) {
+        const delay = notification.autoCloseDelay || 5000;
+        console.log(`⏰ Уведомление с "Принять" закроется через ${delay / 1000} секунд`);
+        setTimeout(() => {
+            if (isNotificationShowing) {
+                console.log('⏰ Авто-закрытие уведомления с "Принять"');
+                hideNotification();
+                
+                if (!notification.forceShow && !notification.isInvite && notification.id) {
+                    markNotificationSeen(notification.id);
+                }
+            }
+        }, delay);
+    }
+    
+} else {
+    console.log('🔵 Нет actionCallback, ставим кнопку "ОК"');
+    okBtn.textContent = 'ОК';
+    okBtn.onclick = function() {
+        console.log('🔵 Кнопка "ОК" нажата');
+        
+        if (notification.okAction) {
+            try {
+                notification.okAction();
+                console.log('✅ okAction выполнен');
+            } catch (error) {
+                console.error('❌ Ошибка в okAction:', error);
+            }
+        }
+        
+        hideNotification();
+        
+        if (notification.isFriendRequest && notification.requestId) {
+            const shownRequests = JSON.parse(localStorage.getItem('shownFriendRequests') || '[]');
+            if (!shownRequests.includes(notification.requestId)) {
+                shownRequests.push(notification.requestId);
+                localStorage.setItem('shownFriendRequests', JSON.stringify(shownRequests));
+            }
+            shownThisSession.delete(notification.requestId);
+        }
+        
+        if (!notification.forceShow && !notification.isInvite && notification.id) {
+            markNotificationSeen(notification.id);
+        }
+    };
+    
+    // ★★★ АВТО-ЗАКРЫТИЕ — 5 СЕКУНД ★★★
+    if (notification.autoClose !== false) {
+        const delay = notification.autoCloseDelay || 5000;
+        console.log(`⏰ Уведомление с "ОК" закроется через ${delay / 1000} секунд`);
+        setTimeout(() => {
+            if (isNotificationShowing) {
+                console.log('⏰ Авто-закрытие уведомления с "ОК"');
+                hideNotification();
+                
+                if (notification.isFriendRequest && notification.requestId) {
+                    const shownRequests = JSON.parse(localStorage.getItem('shownFriendRequests') || '[]');
+                    if (!shownRequests.includes(notification.requestId)) {
+                        shownRequests.push(notification.requestId);
+                        localStorage.setItem('shownFriendRequests', JSON.stringify(shownRequests));
+                    }
+                    shownThisSession.delete(notification.requestId);
+                }
+                
+                if (!notification.forceShow && !notification.isInvite && notification.id) {
+                    markNotificationSeen(notification.id);
+                }
+            }
+        }, delay);
+    }
+}
+    
+    notificationCard.classList.remove('show');
+    notificationCard.style.transform = 'translateY(-120px)';
+    notificationCard.style.opacity = '0';
+    
+    setTimeout(() => {
+        notificationCard.classList.add('show');
+        notificationCard.style.transform = '';
+        notificationCard.style.opacity = '';
+        console.log('✅ Уведомление показано');
+        
+        // ★★★ АВТО-ЗАКРЫТИЕ ДЛЯ "ОК" — 5 СЕКУНД ★★★
+        if (!notification.actionCallback && notification.autoClose !== false) {
+            console.log('⏰ Уведомление закроется через 5 секунд');
+            setTimeout(() => {
+                if (isNotificationShowing) {
+                    console.log('⏰ Авто-закрытие уведомления');
+                    hideNotification();
+                    
+                    if (!notification.forceShow && !notification.isInvite && notification.id) {
+                        markNotificationSeen(notification.id);
+                    }
+                }
+            }, 5000);  // ← 5 СЕКУНД
+        }
+    }, 100);
+}
+
+function hideNotification() {
+    console.log('🔵 hideNotification вызвана');
+    notificationCard.classList.remove('show');
+    isNotificationShowing = false;
+    notificationOkBtn.onclick = null;
+    
+    setTimeout(() => {
+        if (notificationQueue.length > 0) {
+            console.log('🔄 Показываем следующее уведомление');
+            processNotificationQueue();
+        }
+    }, 400);
+}
+
+function showFriendRequestNotification(icon, text, requestId) {
+    const shownRequests = JSON.parse(localStorage.getItem('shownFriendRequests') || '[]');
+    if (shownRequests.includes(requestId) || shownThisSession.has(requestId)) {
+        console.log('⚠️ Уведомление для заявки уже было показано:', requestId);
+        return;
+    }
+    
+    shownThisSession.add(requestId);
+    
+    notificationQueue.push({ 
+        icon, 
+        text, 
+        actionCallback: null,
+        okAction: function() {
+            TabManager.profile('friends');
+            window.navigateTo('profile');
+            setTimeout(() => renderFriendsInProfile(), 300);
+        },
+        id: null, 
+        isFriendRequest: true,
+        requestId: requestId,
+        autoClose: true
+    });
+    
+    if (!isNotificationShowing) {
+        processNotificationQueue();
+    }
+}
+
+function markNotificationSeen(id) {
+    const seen = JSON.parse(localStorage.getItem(NOTIFICATIONS_KEY) || '[]');
+    if (!seen.includes(id)) {
+        seen.push(id);
+        localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(seen));
+    }
+}
+
+function isNotificationSeen(id) {
+    const seen = JSON.parse(localStorage.getItem(NOTIFICATIONS_KEY) || '[]');
+    return seen.includes(id);
+}
+
+function clearSeenNotifications() {
+    localStorage.removeItem(NOTIFICATIONS_KEY);
+    localStorage.removeItem('shownFriendRequests');
+    console.log('✅ История уведомлений очищена');
+}
+
+// ===================ДЕФОЛТНЫЕ ЛЕЙАУТЫ ===================
+function getDefaultStatsLayout() {
+    return {
+        statsSummary: ['minutes', 'workouts', 'exercises'],
+statsBlocksContainer: ['muscles', 'categories', 'calendar', 'weekly-load', 'body-progress', 'history', 'monthly-badges', 'world-leaderboard', 'friends-leaderboard'],        exerciseMuscleStats: ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы'],
+        categoriesStats: ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'],
+        globalStatsContainer: ['minutes', 'workouts', 'exercises'],  // ★ ДОБАВИЛИ
+        worldStatsBlocksContainer: ['community-achievements', 'world-leaderboard', 'friends-leaderboard']
+    };
+}
+
+function getDefaultWorkoutsLayout() {
+    return {
+        workoutsBlocksContainer: ['strength', 'fitness', 'premium'],
+        catalogGridStrength: ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Всё тело'],
+        catalogGridFitness: ['Зарядка', 'Растяжка', 'Растяжка позвоночника', 'Кардио', 'Пилатес'],
+        catalogGridPremium: ['Кроссфит', 'Мужская сила', 'Женское счастье', 'ГТО'],
+        myWorkoutsList: []
+    };
+}
+
+function saveStatsLayout(layout) {
+    localStorage.setItem('statsLayout', JSON.stringify(layout));
+}
+
+function saveWorkoutsLayout(layout) {
+    localStorage.setItem('workoutsLayout', JSON.stringify(layout));
+}
+
+function applySavedWorkoutsOrder() {
+    const layout = JSON.parse(localStorage.getItem('workoutsLayout'));
+    if (!layout) return;
+
+    const blocksContainer = document.getElementById('workoutsBlocksContainer');
+    if (blocksContainer && layout.workoutsBlocksContainer) {
+        const blockMap = {};
+        blocksContainer.querySelectorAll('.section-block').forEach(b => {
+            const id = b.dataset.blockId;
+            if (id) blockMap[id] = b;
+        });
+        layout.workoutsBlocksContainer.forEach(id => {
+            if (blockMap[id]) blocksContainer.appendChild(blockMap[id]);
+        });
+    }
+
+    const containers = [
+        { id: 'catalogGridStrength', dataAttr: 'category' },
+        { id: 'catalogGridFitness', dataAttr: 'category' },
+        { id: 'catalogGridPremium', dataAttr: 'category' },
+        { id: 'myWorkoutsList', dataAttr: 'workoutId' }
+    ];
+    containers.forEach(({ id, dataAttr }) => {
+        const list = document.getElementById(id);
+        if (!list) return;
+        const items = layout[id] || [];
+        if (items.length === 0) return;
+        const childMap = {};
+        list.querySelectorAll('.item-card').forEach(el => {
+            const key = el.dataset[dataAttr];
+            if (key) childMap[key] = el;
+        });
+        items.forEach(key => {
+            if (childMap[key]) list.appendChild(childMap[key]);
+        });
+    });
+}
+
+function applySavedStatsOrder() {
+    const layout = JSON.parse(localStorage.getItem('statsLayout'));
+    if (!layout) return;
+
+    // ★ Миграция: если body-progress ещё нет в layout — добавим его
+    if (layout.statsBlocksContainer && !layout.statsBlocksContainer.includes('body-progress')) {
+        const historyIdx = layout.statsBlocksContainer.indexOf('history');
+        if (historyIdx !== -1) {
+            // Вставляем сразу после 'history'
+            layout.statsBlocksContainer.splice(historyIdx + 1, 0, 'body-progress');
+        } else {
+            // Fallback — в конец
+            layout.statsBlocksContainer.push('body-progress');
+        }
+        // Сохраняем обновлённый layout обратно
+        localStorage.setItem('statsLayout', JSON.stringify(layout));
+        saveLayoutToFirestore('statsLayout', layout);
+        console.log('✅ body-progress добавлен в statsLayout');
+    }
+
+    const summary = document.getElementById('statsSummary');
+    if (summary && layout.statsSummary) {
+        const childMap = {};
+        summary.querySelectorAll('.stat-card').forEach(el => {
+            const id = el.dataset.statId;
+            if (id) childMap[id] = el;
+        });
+        layout.statsSummary.forEach(id => {
+            if (childMap[id]) summary.appendChild(childMap[id]);
+        });
+    }
+
+    const blocksContainer = document.getElementById('statsBlocksContainer');
+    if (blocksContainer && layout.statsBlocksContainer) {
+        const blockMap = {};
+        blocksContainer.querySelectorAll('.section-block').forEach(b => {
+            const id = b.dataset.blockId;
+            if (id) blockMap[id] = b;
+        });
+        layout.statsBlocksContainer.forEach(id => {
+            if (blockMap[id]) blocksContainer.appendChild(blockMap[id]);
+        });
+    }
+
+    const lists = [
+        { id: 'exerciseMuscleStats', dataAttr: 'muscleName' },
+        { id: 'categoriesStats', dataAttr: 'categoryName' }
+    ];
+    lists.forEach(({ id, dataAttr }) => {
+        const list = document.getElementById(id);
+        if (!list) return;
+        const items = layout[id] || [];
+        if (items.length === 0) return;
+        const childMap = {};
+        list.querySelectorAll('.stat-item').forEach(el => {
+            const name = el.querySelector('.stat-name')?.textContent;
+            if (name) childMap[name] = el;
+        });
+        items.forEach(name => {
+            if (childMap[name]) list.appendChild(childMap[name]);
+        });
+    });
+}
+
+function applySavedWorldStatsOrder() {
+    const layout = JSON.parse(localStorage.getItem('worldStatsLayout'));
+    if (!layout) return;
+
+    const container = document.getElementById('worldStatsBlocksContainer');
+    if (!container) return;
+
+    const items = layout['worldStatsBlocksContainer'] || [];
+    if (items.length === 0) return;
+
+    const childMap = {};
+    container.querySelectorAll('.section-block').forEach(el => {
+        const id = el.dataset.blockId;
+        if (id) childMap[id] = el;
+    });
+
+    items.forEach(id => {
+        if (childMap[id]) {
+            container.appendChild(childMap[id]);
+        }
+    });
+}
+
+// ===================ОФЛАЙН-ОЧЕРЕДЬ ===================
+const PENDING_KEY = 'pendingWorkouts';
+
+function getPendingWorkouts() {
+    return JSON.parse(localStorage.getItem(PENDING_KEY)) || [];
+}
+
+function savePendingWorkouts(workouts) {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(workouts));
+}
+
+function addPendingWorkout(workoutData) {
+    const pending = getPendingWorkouts();
+    workoutData._localId = Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    if (!workoutData.category) workoutData.category = 'Без категории';
+workoutData.icon = workoutData.icon || null;
+    pending.push(workoutData);
+    savePendingWorkouts(pending);
+}
+
+function removePendingWorkout(localId) {
+    let pending = getPendingWorkouts();
+    pending = pending.filter(w => w._localId !== localId);
+    savePendingWorkouts(pending);
+}
+
+async function syncPendingWorkouts() {
+    const pending = getPendingWorkouts();
+    if (pending.length === 0) return;
+    const user = await getFirebaseUser();
+    if (!user) {
+        console.warn('Пользователь не авторизован, синхронизация отложена');
+        return;
+    }
+    let syncedIds = [];
+    let failedIds = [];
+    for (const workout of pending) {
+        try {
+const result = await saveWorkoutToFirestore(user.uid, {
+    title: workout.title,
+    date: workout.date,
+    durationSeconds: workout.durationSeconds,
+    exercises: workout.exercises,
+    xpEarned: workout.xpEarned,
+    category: workout.category || 'Без категории',
+    icon: workout.icon || null
+});
+            if (result.success) {
+                const profileResult = await getUserProfile(user.uid);
+                if (profileResult.success) {
+                    const currentXp = profileResult.data.totalXp || 0;
+                    await updateUserProfile(user.uid, { totalXp: currentXp + workout.xpEarned });
+                }
+                syncedIds.push(workout._localId);
+            } else {
+                failedIds.push(workout._localId);
+                console.warn('Ошибка синхронизации тренировки:', result.error);
+            }
+        } catch (e) {
+            failedIds.push(workout._localId);
+            console.warn('Ошибка синхронизации, повторим позже:', e);
+        }
+    }
+    if (syncedIds.length > 0) {
+        let pendingAfter = getPendingWorkouts();
+        pendingAfter = pendingAfter.filter(w => !syncedIds.includes(w._localId));
+        savePendingWorkouts(pendingAfter);
+        showToast(`✅ Синхронизировано ${syncedIds.length} тренировок`);
+    }
+    if (failedIds.length > 0) {
+        console.log(`${failedIds.length} тренировок ожидают синхронизации`);
+    }
+}
+
+// ===================УРОВНИ (15 УРОВНЕЙ) ===================
+const levels = [
+    { id: 1, name: 'НОВИЧОК', minXp: 0, maxXp: 99 },
+    { id: 2, name: 'ЛЮБИТЕЛЬ', minXp: 100, maxXp: 249 },
+    { id: 3, name: 'УЧЕНИК', minXp: 250, maxXp: 449 },
+    { id: 4, name: 'ПРОДВИНУТЫЙ', minXp: 450, maxXp: 699 },
+    { id: 5, name: 'ЭКСПЕРТ', minXp: 700, maxXp: 999 },
+    { id: 6, name: 'ПРОФЕССИОНАЛ', minXp: 1000, maxXp: 1499 },
+    { id: 7, name: 'МАСТЕР', minXp: 1500, maxXp: 1999 },
+    { id: 8, name: 'ГРАНДМАСТЕР', minXp: 2000, maxXp: 2599 },
+    { id: 9, name: 'ЧЕМПИОН', minXp: 2600, maxXp: 3299 },
+    { id: 10, name: 'ЮНОШЕСКИЙ РАЗРЯД', minXp: 3300, maxXp: 4199 },
+    { id: 11, name: 'СПОРТИВНЫЙ РАЗРЯД', minXp: 4200, maxXp: 5299 },
+    { id: 12, name: 'КАНДИДАТ В МАСТЕРЫ СПОРТА', minXp: 5300, maxXp: 6599 },
+    { id: 13, name: 'МАСТЕР СПОРТА', minXp: 6600, maxXp: 8199 },
+    { id: 14, name: 'МЕЖДУНАРОДНЫЙ МАСТЕР СПОРТА', minXp: 8200, maxXp: 9999 },
+    { id: 15, name: 'ЗАСЛУЖЕННЫЙ МАСТЕР СПОРТА', minXp: 10000, maxXp: Infinity }
+];
+
+function getCurrentLevel(xp) {
+    let currentLevel = levels[0];
+    for (let i = levels.length - 1; i >= 0; i--) {
+        if (xp >= levels[i].minXp) {
+            currentLevel = levels[i];
+            break;
+        }
+    }
+    return currentLevel;
+}
+
+function getNextLevel(xp) {
+    for (let i = 0; i < levels.length; i++) {
+        if (xp < levels[i].minXp) {
+            return levels[i];
+        }
+    }
+    return null;
+}
+
+function getXpProgress(xp) {
+    const current = getCurrentLevel(xp);
+    const next = getNextLevel(xp);
+    if (!next) return 100;
+    const total = next.minXp - current.minXp;
+    const earned = xp - current.minXp;
+    return Math.min(100, Math.round((earned / total) * 100));
+}
+
+// =================== НОВАЯ СИСТЕМА РАСЧЁТА XP ===================
+// =================== ИСПРАВЛЕННАЯ СИСТЕМА РАСЧЁТА XP ===================
+
+function isTimeBased(reps) {
+    const repsStr = String(reps || '');
+    return repsStr.includes('сек') || repsStr.includes('с') || repsStr.includes('Секунд');
+}
+
+function hasWeight(exercise) {
+    if (!exercise) return false;
+    const weight = exercise.weight;
+    return weight !== undefined && weight !== null && !isNaN(parseFloat(weight)) && parseFloat(weight) > 0;
+}
+
+function getWeightValue(exercise) {
+    if (!hasWeight(exercise)) return 0;
+    return parseFloat(exercise.weight) || 0;
+}
+
+function getRepsValue(exercise) {
+    const repsStr = String(exercise?.reps || '');
+    return parseFloat(repsStr.replace(/[^0-9.]/g, '')) || 0;
+}
+
+function getSetsValue(exercise) {
+    return parseInt(exercise?.sets) || 0;
+}
+
+function calculateExerciseXP(exercise, completedSets) {
+    const sets = getSetsValue(exercise);
+    const repsStr = String(exercise?.reps || '');
+    const isTime = isTimeBased(repsStr);
+    const value = getRepsValue(exercise);
+    const weight = getWeightValue(exercise);
+    
+    // ★★★ ЕСЛИ НЕТ ВЫПОЛНЕННЫХ ПОДХОДОВ — XP = 0 ★★★
+    if (completedSets === undefined || completedSets === null || completedSets === 0) {
+        return 0;
+    }
+    
+    // ★★★ ИСПОЛЬЗУЕМ РЕАЛЬНОЕ КОЛИЧЕСТВО ВЫПОЛНЕННЫХ ПОДХОДОВ ★★★
+    const actualSets = Math.min(completedSets, sets);
+    
+    if (actualSets === 0 || value === 0) return 0;
+    
+    let xp = 0;
+    if (isTime) {
+        // ★★★ ФОРМУЛА ДЛЯ ВРЕМЕННЫХ УПРАЖНЕНИЙ ★★★
+        // XP = (подходы × секунды) / 20
+        xp = (actualSets * value) / 20;
+        
+        // ★★★ ДОБАВЛЯЕМ БОНУС ЗА ВЕС ★★★
+        if (weight > 0) {
+            xp = xp * (1 + weight / 20);
+        }
+    } else {
+        // Для упражнений с повторениями
+        xp = (actualSets * value) / 10;
+        if (weight > 0) {
+            xp = xp * (1 + weight / 20);
+        }
+    }
+    
+    // Округление до 0.1
+    return isNaN(xp) ? 0 : Math.round(xp * 10) / 10;
+}
+
+
+function calculateWorkoutXp(exercises, completedSetsMap) {
+    if (!exercises || !Array.isArray(exercises) || exercises.length === 0) return 0;
+    
+    let total = 0;
+    exercises.forEach((ex, index) => {
+        // ★★★ ПОЛУЧАЕМ КОЛИЧЕСТВО ВЫПОЛНЕННЫХ ПОДХОДОВ ★★★
+        let completedSets = 0;
+        if (completedSetsMap && completedSetsMap[index] !== undefined && completedSetsMap[index] > 0) {
+            completedSets = completedSetsMap[index];
+        } else {
+            // Если данных нет — значит упражнение НЕ выполнено
+            completedSets = 0;
+        }
+        
+        // ★★★ РАССЧИТЫВАЕМ XP ЗА УПРАЖНЕНИЕ ★★★
+        total += calculateExerciseXP(ex, completedSets);
+    });
+    
+    return isNaN(total) ? 0 : Math.round(total * 10) / 10;
+}
+
+function resolveWorkoutCategory(category, parentCategory, isPremium) {
+    if (!parentCategory) {
+        return 'Личные';
+    }
+
+// ДОБАВИТЬ:
+if (parentCategory === 'Особые') {
+    if (category === 'Мужская сила' || category === 'Женское счастье') {
+        return 'Ягодицы';
+    }
+    if (category === 'Кроссфит') {
+        return 'Всё тело';
+    }
+    if (category === 'ГТО') {
+        return 'Всё тело';  // ← ДОБАВИТЬ
+    }
+    return category;
+}
+
+if (parentCategory === 'Фитнес') {
+    if (category === 'Кардио') return 'Кардио';
+    if (category === 'Растяжка') return 'Гибкость';
+    if (category === 'Растяжка позвоночника') return 'Гибкость'; // ← ДОБАВИТЬ
+    if (category === 'Пилатес') return 'Всё тело';
+    if (category === 'Зарядка') return 'Зарядка';
+    return category;
+}
+
+if (parentCategory === 'PREMIUM') {
+    return category;
+}
+
+    if (parentCategory === 'Силовые') {
+        if (category === 'Всё тело') return 'Всё тело';
+        return category;
+    }
+
+    return category;
+}
+
+// ===================FIREBASE ===================
+function getFirebaseUser() {
+    return new Promise((resolve) => {
+        const unsubscribe = firebase.auth().onAuthStateChanged(user => {
+            unsubscribe();
+            resolve(user);
+        });
+    });
+}
+
+// =================== СИНХРОНИЗАЦИЯ С FIRESTORE ===================
+
+/**
+ * Универсальный хелпер: сохранить поле в users/{uid}
+ */
+async function syncSaveToFirestore(fieldName, value) {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    try {
+        await firebase.firestore().collection('users').doc(user.uid).update({
+            [fieldName]: value
+        });
+        console.log(`✅ ${fieldName} сохранено в Firestore`);
+    } catch (error) {
+        // Если документа нет — создаём его
+        if (error.code === 'not-found') {
+            await firebase.firestore().collection('users').doc(user.uid).set({
+                [fieldName]: value
+            }, { merge: true });
+        } else {
+            console.error(`❌ Ошибка сохранения ${fieldName}:`, error);
+        }
+    }
+}
+
+async function syncLoadFromFirestore(fieldName) {
+    const user = await getFirebaseUser();
+    if (!user) return null;
+
+    // ★ Сначала ищем в кэше профиля — если он уже загружен, читаем оттуда
+    const cached = Cache.getProfile(user.uid);
+    if (cached && cached[fieldName] !== undefined) {
+        return cached[fieldName];
+    }
+
+    try {
+        const doc = await firebase.firestore().collection('users').doc(user.uid).get();
+        if (doc.exists) {
+            const data = doc.data();
+            // ★ Кэшируем весь документ — следующие вызовы пойдут из памяти
+            Cache.setProfile(user.uid, data);
+            return data[fieldName] !== undefined ? data[fieldName] : null;
+        }
+        return null;
+    } catch (error) {
+        console.error(`❌ Ошибка загрузки ${fieldName}:`, error);
+        return null;
+    }
+}
+
+/**
+ * Универсальный хелпер: загрузить с fallback на localStorage
+ * @param {string} firestoreField — имя поля в Firestore
+ * @param {string} localStorageKey — ключ в localStorage
+ * @param {*} defaultValue — что вернуть, если нигде нет
+ */
+async function syncLoadWithFallback(firestoreField, localStorageKey, defaultValue = null) {
+    // 1. Пробуем из Firestore
+    const fromFirestore = await syncLoadFromFirestore(firestoreField);
+    if (fromFirestore !== null) {
+        // Обновляем localStorage как кэш
+        if (typeof fromFirestore === 'object') {
+            localStorage.setItem(localStorageKey, JSON.stringify(fromFirestore));
+        } else {
+            localStorage.setItem(localStorageKey, String(fromFirestore));
+        }
+        return fromFirestore;
+    }
+    
+    // 2. Fallback на localStorage
+    const fromLocal = localStorage.getItem(localStorageKey);
+    if (fromLocal !== null) {
+        // ★★★ ПЕРЕНОСИМ В FIRESTORE — но НЕ ЖДЁМ завершения ★★★
+        // Пожарная запись: главное — вернуть данные сейчас, синхронизация не критична
+        (async () => {
+            try {
+                let parsed = fromLocal;
+                if (fromLocal.startsWith('{') || fromLocal.startsWith('[')) {
+                    parsed = JSON.parse(fromLocal);
+                } else if (fromLocal === 'true' || fromLocal === 'false') {
+                    parsed = fromLocal === 'true';
+                }
+                await syncSaveToFirestore(firestoreField, parsed);
+                console.log(`📤 ${localStorageKey} перенесён в Firestore`);
+            } catch (e) {}
+        })();
+
+        return fromLocal;
+    }
+    
+    return defaultValue;
+}
+
+// ===================ПРОФИЛЬ ===================
+async function getUserProfile(userId, options = {}) {
+    // 1. Кэш
+    if (!options.force) {
+        const cached = Cache.getProfile(userId);
+        if (cached) return { success: true, data: cached };
+    }
+
+    // ★ ДЕДУПЛИКАЦИЯ: если запрос уже летит — ждём его
+    if (Cache.inflightProfiles.has(userId)) {
+        return Cache.inflightProfiles.get(userId);
+    }
+
+    const promise = (async () => {
+        try {
+            const doc = await firebase.firestore()
+                .collection('users').doc(userId).get();
+            if (doc.exists) {
+                const data = doc.data();
+                Cache.setProfile(userId, data);
+                return { success: true, data };
+            }
+            return { success: false, error: 'Профиль не найден' };
+        } catch (error) {
+            console.error('Ошибка получения профиля:', error);
+            showToast('❌ Не удалось загрузить профиль. Проверьте интернет.');
+            return { success: false, error: error.message };
+        } finally {
+            // ★ ВСЕГДА очищаем — даже при ошибке
+            Cache.inflightProfiles.delete(userId);
+        }
+    })();
+
+    Cache.inflightProfiles.set(userId, promise);
+    return promise;
+}
+
+async function getProfilesBatch(userIds) {
+    const result = {};
+    const missing = [];
+
+    for (const id of userIds) {
+        const cached = Cache.getProfile(id);
+        if (cached) result[id] = cached;
+        else missing.push(id);
+    }
+
+    if (missing.length === 0) return result;
+
+    try {
+        const db = firebase.firestore();
+        const CHUNK = 300; // мягкий лимит — 300 параллельных запросов
+
+        for (let i = 0; i < missing.length; i += CHUNK) {
+            const chunk = missing.slice(i, i + CHUNK);
+
+            // ★ Promise.all вместо getAll (работает во всех версиях SDK)
+            const snaps = await Promise.all(
+                chunk.map(id => db.collection('users').doc(id).get())
+            );
+
+            snaps.forEach(snap => {
+                if (snap.exists) {
+                    const data = snap.data();
+                    result[snap.id] = data;
+                    Cache.setProfile(snap.id, data);
+                }
+            });
+        }
+    } catch (e) {
+        console.warn('⚠️ getProfilesBatch:', e);
+    }
+
+    return result;
+}
+
+async function updateUserProfile(userId, updates) {
+    try {
+        await firebase.firestore()
+            .collection('users').doc(userId).update(updates);
+        Cache.clearProfile(userId);   // ← инвалидация
+        return { success: true };
+    } catch (error) {
+        console.error('Ошибка обновления профиля:', error);
+        showToast('❌ Не удалось обновить профиль. Попробуйте позже.');
+        return { success: false, error: error.message };
+    }
+}
+
+async function saveUserProfile(userId, data) {
+    try {
+        await firebase.firestore()
+            .collection('users').doc(userId).set(data, { merge: true });
+        Cache.clearProfile(userId);   // ← инвалидация
+        return { success: true };
+    } catch (error) {
+        console.error('Ошибка сохранения профиля:', error);
+        showToast('❌ Не удалось сохранить профиль. Попробуйте позже.');
+        return { success: false, error: error.message };
+    }
+}
+
+async function syncUserProfile() {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Пользователь не авторизован' };
+    const profileResult = await getUserProfile(user.uid);
+    if (!profileResult.success) {
+        const newProfile = {
+            displayName: user.displayName || user.email?.split('@')[0] || 'Пользователь',
+            avatar: 'bodybuilding',
+            level: 1,
+            totalXp: 0,
+            createdAt: new Date().toISOString(), // ← ЗАПЯТАЯ!
+            tutorialCompleted: false
+        };
+        await saveUserProfile(user.uid, newProfile);
+        return { success: true, data: newProfile, isNew: true };
+    }
+    return { success: true, data: profileResult.data, isNew: false };
+}
+
+// ===================ТРЕНИРОВКИ В FIRESTORE ===================
+async function saveWorkoutToFirestore(userId, workoutData) {
+    try {
+        const docRef = await firebase.firestore().collection('workouts').add({
+            userId,
+            title: workoutData.title,
+            date: workoutData.date || new Date().toISOString(),
+            durationSeconds: workoutData.durationSeconds || 0,
+            exercises: workoutData.exercises || [],
+            xpEarned: workoutData.xpEarned || 0,
+            category: workoutData.category || 'Без категории',
+            icon: workoutData.icon || null,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        Cache.clearWorkouts(userId);   // ← инвалидация
+        return { success: true, id: docRef.id };
+    } catch (error) {
+        console.error('Ошибка сохранения тренировки:', error);
+        showToast('❌ Не удалось сохранить тренировку. Проверьте интернет.');
+        return { success: false, error: error.message };
+    }
+}
+
+async function deleteWorkoutFromFirestore(workoutId) {
+    try {
+        await firebase.firestore().collection('workouts').doc(workoutId).delete();
+        // userId неизвестен — сбросим кэш для текущего пользователя
+        const user = await getFirebaseUser();
+        if (user) Cache.clearWorkouts(user.uid);
+        return { success: true };
+    } catch (error) {
+        console.error('Ошибка удаления тренировки:', error);
+        showToast('❌ Не удалось удалить тренировку. Попробуйте позже.');
+        return { success: false, error: error.message };
+    }
+}
+
+async function getUserWorkoutsFromFirestore(userId, options = {}) {
+    // 1. Кэш
+    if (!options.force) {
+        const cached = Cache.getWorkouts(userId);
+        if (cached) return { success: true, data: cached };
+    }
+
+    // ★ ДЕДУПЛИКАЦИЯ: если запрос уже летит — ждём его
+    if (Cache.inflightWorkouts.has(userId)) {
+        return Cache.inflightWorkouts.get(userId);
+    }
+
+    const promise = (async () => {
+        // 2. Сеть
+        try {
+            const snapshot = await firebase.firestore()
+                .collection('workouts')
+                .where('userId', '==', userId)
+                .orderBy('date', 'desc')
+                .get();
+
+            const workouts = [];
+            snapshot.forEach(doc => workouts.push({ id: doc.id, ...doc.data() }));
+            Cache.setWorkouts(userId, workouts);
+            return { success: true, data: workouts };
+
+        } catch (error) {
+            console.error('Ошибка получения тренировок:', error);
+
+            // Fallback — без orderBy (нет индекса)
+            if (error.code === 'failed-precondition' && error.message.includes('index')) {
+                console.warn('⚠️ Нет индекса — запрос без сортировки');
+                try {
+                    const snap = await firebase.firestore()
+                        .collection('workouts')
+                        .where('userId', '==', userId)
+                        .get();
+                    const arr = [];
+                    snap.forEach(doc => arr.push({ id: doc.id, ...doc.data() }));
+                    arr.sort((a, b) => new Date(b.date) - new Date(a.date));
+                    Cache.setWorkouts(userId, arr);
+                    return { success: true, data: arr };
+                } catch (e2) {
+                    console.error('❌ Fallback тоже упал:', e2);
+                    return { success: false, error: e2.message };
+                }
+            }
+
+            showToast('❌ Не удалось загрузить тренировки. Проверьте интернет.');
+            return { success: false, error: error.message };
+        } finally {
+            // ★ ВСЕГДА очищаем — даже при ошибке
+            Cache.inflightWorkouts.delete(userId);
+        }
+    })();
+
+    Cache.inflightWorkouts.set(userId, promise);
+    return promise;
+}
+
+// ===================УПРАВЛЕНИЕ ЦВЕТОМ ===================
+let tempColor = null;
+
+function selectColor(color) {
+    // ★★★ СОХРАНЯЕМ ТОЛЬКО В ВРЕМЕННУЮ ПЕРЕМЕННУЮ ★★★
+    tempColor = color;
+    
+    // ★★★ ПРИМЕНЯЕМ ВИЗУАЛЬНО (НО НЕ СОХРАНЯЕМ) ★★★
+    document.body.style.removeProperty('--accent');
+    document.body.style.removeProperty('--accent-dark');
+    document.body.style.removeProperty('--accent-light');
+    
+    const isDarkMode = document.body.classList.contains('theme-dark-mode') ||
+                      localStorage.getItem('appThemeMode') === 'dark' ||
+                      (localStorage.getItem('appThemeMode') === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    
+    document.body.className = 'theme-' + color;
+    if (isDarkMode) {
+        document.body.classList.add('theme-dark-mode');
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ АКТИВНУЮ КНОПКУ ★★★
+    document.querySelectorAll('.color-btn').forEach(btn => {
+        btn.classList.toggle('color-btn-active', btn.dataset.color === color);
+    });
+    
+    // ★★★ ОБНОВЛЯЕМ СТАТУС (НО НЕ СОХРАНЯЕМ) ★★★
+    updateColorStatus(color);
+}
+
+function applySelectedColor(color) {
+    // ★★★ УБИРАЕМ ВСЕ КАСТОМНЫЕ CSS-ПЕРЕМЕННЫЕ ★★★
+    document.body.style.removeProperty('--accent');
+    document.body.style.removeProperty('--accent-dark');
+    document.body.style.removeProperty('--accent-light');
+    
+    // ★★★ УДАЛЯЕМ ФЛАГ КАСТОМНОГО ЦВЕТА ★★★
+    localStorage.removeItem('themeColorCustom');
+    
+    // ★★★ ПРИМЕНЯЕМ СТАНДАРТНЫЙ ЦВЕТ ЧЕРЕЗ КЛАСС ★★★
+    const isDarkMode = document.body.classList.contains('theme-dark-mode') ||
+                      localStorage.getItem('appThemeMode') === 'dark' ||
+                      (localStorage.getItem('appThemeMode') === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    
+    document.body.className = 'theme-' + color;
+    if (isDarkMode) {
+        document.body.classList.add('theme-dark-mode');
+    }
+    
+    // ★★★ СОХРАНЯЕМ В localStorage ★★★
+    localStorage.setItem('themeColor', color);
+    
+    updateColorButtons(color);
+    updateColorStatus(color);
+}
+
+function applyColor() {
+    if (!tempColor) {
+        showToast('⚠️ Выберите цвет');
+        return;
+    }
+    
+    const currentColor = localStorage.getItem('themeColor') || 'red';
+    const isCustom = localStorage.getItem('themeColorCustom') === 'true';
+    
+    // ★★★ ПРОВЕРЯЕМ, ИЗМЕНИЛСЯ ЛИ ЦВЕТ ★★★
+    const colorChanged = tempColor !== currentColor || isCustom;
+    
+    if (colorChanged) {
+        // ★★★ ПРИМЕНЯЕМ ЦВЕТ ★★★
+        localStorage.setItem('themeColor', tempColor);
+        localStorage.removeItem('themeColorCustom');   // ← сбрасываем флаг кастома
+        
+        syncSaveToFirestore('settings', {
+            themeMode: localStorage.getItem('appThemeMode') || 'system',
+            themeColor: tempColor,        // ← было color
+            themeColorCustom: false       // ← было true
+        });
+        
+        // ★★★ ПРИМЕНЯЕМ ВИЗУАЛЬНО ★★★
+        document.body.style.removeProperty('--accent');
+        document.body.style.removeProperty('--accent-dark');
+        document.body.style.removeProperty('--accent-light');
+        
+        const isDarkMode = document.body.classList.contains('theme-dark-mode') ||
+                          localStorage.getItem('appThemeMode') === 'dark' ||
+                          (localStorage.getItem('appThemeMode') === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        
+        document.body.className = 'theme-' + tempColor;
+        if (isDarkMode) {
+            document.body.classList.add('theme-dark-mode');
+        }
+        
+        // ★★★ ПОКАЗЫВАЕМ ТОСТ ★★★
+        const colorNames = {
+            'red': 'Красный', 'orange': 'Оранжевый', 'yellow': 'Желтый',
+            'green': 'Зеленый', 'darkgreen': 'Темно-зеленый', 'blue': 'Голубой',
+            'darkblue': 'Синий', 'purple': 'Фиолетовый', 'pink': 'Розовый', 'gray': 'Серый'
+        };
+        showToast(`✅ Акцентный цвет изменён на ${colorNames[tempColor] || tempColor}`);
+        
+        // ★★★ ЗАДАНИЕ 5: ОФОРМЛЕНИЕ ★★★
+        if (!tasks[5]) {
+            tasks[5] = true;
+            saveTasks();
+            updateTasksUI();
+            showToast('✅ Задание "Оформление" выполнено!');
+            addTaskXp();
+        }
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ СТАТУС ★★★
+    updateColorStatus(tempColor);
+    
+    closeModal('colorModal');
+}
+
+function updateColorButtons(color) {
+    document.querySelectorAll('.color-btn').forEach(btn => {
+        btn.classList.toggle('color-btn-active', btn.dataset.color === color);
+    });
+}
+
+function updateColorStatus(color) {
+    const colorNames = {
+        'red': 'Красный', 'orange': 'Оранжевый', 'yellow': 'Желтый',
+        'green': 'Зеленый', 'darkgreen': 'Темно-зеленый', 'blue': 'Голубой',
+        'darkblue': 'Синий', 'purple': 'Фиолетовый', 'pink': 'Розовый', 'gray': 'Серый'
+    };
+    
+    const statusEl = document.getElementById('colorStatus');
+    if (!statusEl) return;
+    
+    // ★★★ ЕСЛИ ЦВЕТ ИЗ ПАЛИТРЫ — ПИШЕМ "Из палитры" ★★★
+    const isCustom = localStorage.getItem('themeColorCustom') === 'true';
+    const isHex = typeof color === 'string' && color.startsWith('#');
+    
+    if (isCustom && isHex) {
+        statusEl.textContent = 'Из палитры';
+    } else {
+        statusEl.textContent = colorNames[color];
+    }
+}
+
+// ★★★ ИНИЦИАЛИЗАЦИЯ ПРИ ЗАГРУЗКЕ ★★★
+const savedColor = localStorage.getItem('themeColor') || 'red';
+const isCustom = localStorage.getItem('themeColorCustom') === 'true';
+
+if (isCustom && savedColor && savedColor.startsWith('#')) {
+    // Кастомный цвет — применяем через CSS-переменные
+    applyColorToTheme(savedColor);
+} else {
+    // Стандартный цвет — применяем через класс
+    const isDarkMode = localStorage.getItem('appThemeMode') === 'dark' || 
+                      (localStorage.getItem('appThemeMode') === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    
+    document.body.className = 'theme-' + savedColor;
+    if (isDarkMode) {
+        document.body.classList.add('theme-dark-mode');
+    }
+}
+
+// ★★★ ОБНОВЛЯЕМ СТАТУС ★★★
+updateColorStatus(savedColor);
+
+// ★★★ ДОПОЛНИТЕЛЬНО: ОБНОВЛЯЕМ ПРИ ЗАГРУЗКЕ ★★★
+document.addEventListener('DOMContentLoaded', function() {
+    const savedColor2 = localStorage.getItem('themeColor') || 'red';
+    const isCustom2 = localStorage.getItem('themeColorCustom') === 'true';
+    
+    if (!isCustom2) {
+        // Если это НЕ кастомный цвет, убеждаемся, что классы правильные
+        const isDarkMode = document.body.classList.contains('theme-dark-mode') ||
+                          localStorage.getItem('appThemeMode') === 'dark' ||
+                          (localStorage.getItem('appThemeMode') === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        
+        document.body.className = 'theme-' + savedColor2;
+        if (isDarkMode) {
+            document.body.classList.add('theme-dark-mode');
+        }
+    }
+});
+
+// ===================НАВИГАЦИЯ ===================
+window.navigateTo = function(page, params) {
+    const activeTrainingPage = document.getElementById('page-training-session');
+    if (page !== 'training-session' && activeTrainingPage && activeTrainingPage.classList.contains('page-active') && !currentSessionId && sessionExercises.length) {
+        savePersonalTrainingSession();
+        if (sessionTimerInterval) { clearInterval(sessionTimerInterval); sessionTimerInterval = null; }
+        if (restTimerInterval) { clearInterval(restTimerInterval); restTimerInterval = null; }
+        if (exerciseTimerInterval) { clearInterval(exerciseTimerInterval); exerciseTimerInterval = null; }
+    }
+    // Проверки на блокировки
+    if (isEditingWorkout) {
+        const allowedPages = ['exercise-list', 'workout-edit', 'workout-detail'];
+        if (allowedPages.includes(page)) {
+        } else {
+            showToast('⚠️ Сначала завершите редактирование тренировки');
+            return;
+        }
+    }
+    if (isEditingProfile) {
+        showToast('⚠️ Сначала завершите редактирование профиля');
+        return;
+    }
+    const modalIds = ['exerciseModal', 'createExerciseModal', 'quickEditModal', 'exerciseUniversalModal'];
+    for (const id of modalIds) {
+        const modal = document.getElementById(id);
+        if (modal && modal.style.display === 'flex') {
+            showToast('⚠️ Сначала закройте модальное окно');
+            return;
+        }
+    }
+    if (window.statsEditor && window.statsEditor.isEditing) {
+        showToast('⚠️ Сначала завершите редактирование страницы статистики');
+        return;
+    }
+    if (window.workoutsEditor && window.workoutsEditor.isEditing) {
+        showToast('⚠️ Сначала завершите редактирование страницы тренировок');
+        return;
+    }
+
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = '';
+    });
+
+    // ★★★ СБРОС АНИМАЦИИ HERO ПЕРЕД СМЕНОЙ СТРАНИЦЫ ★★★
+    const heroEl = document.getElementById('page-hero');
+    if (heroEl) heroEl.classList.remove('loading-animate');
+    // ★★★ /СБРОС ★★★
+
+    const target = document.getElementById('page-' + page);
+    if (target) {
+        target.classList.add('page-active');
+    }
+
+    // ★★★ БЛОКИРОВКА СКРОЛЛА НА СТРАНИЦАХ СЕССИИ ★★★
+    if (page === 'training-session' || page === 'task-session') {
+        document.body.classList.add('no-scroll');
+        document.documentElement.classList.add('no-scroll');
+    } else {
+        document.body.classList.remove('no-scroll');
+        document.documentElement.classList.remove('no-scroll');
+    }
+
+// ★ Маппинг вложенных страниц на разделы меню
+const NAV_SECTION_MAP = {
+    'feed':                'feed',      // ← ДОБАВИТЬ
+    'workouts':            'workouts',
+    'programs': 'workouts',
+    'program-detail': 'workouts',
+    'workout-detail':      'workouts',
+    'level-select':        'workouts',
+    'workout-edit':        'workouts',
+    'exercise-list':       'workouts',
+    'training-session':    'workouts',
+    'training-waiting':    'workouts',
+    'finish':              'workouts',
+    'coop-finish':         'workouts',
+    'coop-waiting':        'workouts',
+    'task-session':        'workouts',
+    'stats':               'stats',
+    'profile':             'profile'
+};
+
+const activeSection = NAV_SECTION_MAP[page] || page;
+
+document.querySelectorAll('.nav-item').forEach(btn => {
+    btn.classList.toggle('nav-item-active', btn.dataset.page === activeSection);
+});
+
+    // ★★★ FEED NAV ITEM: иконка → «+», когда мы на ленте ★★★
+    const feedNavItem = document.querySelector('.nav-item[data-page="feed"]');
+    if (feedNavItem) {
+        const icon = feedNavItem.querySelector('i');
+        if (icon) {
+            if (page === 'feed') {
+                icon.className = 'fa-solid fa-plus';
+                feedNavItem.dataset.isCreatePost = 'true';
+            } else {
+                icon.className = 'fa-regular fa-images';
+                delete feedNavItem.dataset.isCreatePost;
+            }
+        }
+    }
+
+    // ===== ВЫЗОВЫ СТРАНИЦ =====
+    if (page === 'feed') {
+        if (typeof window._resetFeedSearchScroll === 'function') {
+            window._resetFeedSearchScroll();
+        }
+        loadFeed();
+    }
+
+    if (page === 'profile') {
+        loadProfile();
+        setTimeout(() => TabManager.profile(TabManager.state.profile), 300);
+    }
+    if (page === 'level-select' && params) {
+    // ★★★ СБРАСЫВАЕМ ПОДЗАГОЛОВОК ДО ВЫЗОВА ★★★
+    const subtitleEl = document.getElementById('levelSelectSubtitle');
+    if (subtitleEl) subtitleEl.textContent = 'Уровни тренировки';
+    loadLevelSelect(params.category, params);
+}
+    if (page === 'workout-detail' && params) {
+        loadWorkoutDetail(
+            params.category,
+            params.level,
+            params.isCustom,
+            params.id,
+            params.parentCategory,
+            params.isPremium,
+            params.gtoGender
+        );
+    }
+    if (page === 'workout-edit' && params) {
+        loadEditPage(
+            params.category,
+            params.isCustom,
+            params.id,
+            params.level,
+            params.exercises
+        );
+    }
+if (page === 'workouts') {
+    TabManager.workouts(TabManager.state.workouts);
+    renderMyWorkouts();
+    if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel(); // ★
+}
+        if (page === 'exercise-list') renderExerciseListPage();
+        if (page === 'programs') {
+    renderProgramsPage();
+}
+    if (page === 'stats') {
+        const currentTab = TabManager.state.stats || 'personal';
+        TabManager.stats(currentTab);
+        updateStats(currentTab); // ← ЕДИНЫЙ ВЫЗОВ
+    }
+
+    if (page === 'training-session' || page === 'finish' || page === 'training-waiting' || page === 'coop-finish') {
+        document.getElementById('bottomNav').style.display = 'none';
+    } else {
+        document.getElementById('bottomNav').style.display = 'block';
+    }
+    // ★★★ ДОБАВЬ ЭТО ★★★
+    setTimeout(() => {
+        tryOpenPendingInvite();
+    }, 500);
+};
+
+document.querySelectorAll('.nav-item').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const page = this.dataset.page;
+        if (!page) return;
+
+        // ★★★ На ленте «feed»-иконка стала «+» — открываем модалку поста ★★★
+        if (page === 'feed' && this.dataset.isCreatePost === 'true') {
+            if (typeof tryOpenCreatePostModal === 'function') {
+                tryOpenCreatePostModal();
+            }
+            return;
+        }
+
+        window.navigateTo(page);
+    });
+});
+
+// ===================УНИВЕРСАЛЬНЫЕ ФУНКЦИИ ДЛЯ МОДАЛОК ===================
+function openModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+
+    // Убираем класс "закрытия" (на случай повторного открытия)
+    modal.classList.remove('modal-overlay-closing');
+
+    // Показываем
+    modal.style.display = 'flex';
+    void modal.offsetWidth;
+
+    // Запускаем анимацию появления
+    modal.classList.add('modal-overlay-visible');
+}
+
+function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+
+    // Убираем класс появления — фон начнёт гаснуть
+    modal.classList.remove('modal-overlay-visible');
+
+    // Добавляем класс закрытия — контент уедет вверх
+    modal.classList.add('modal-overlay-closing');
+
+    // Через время анимации прячем полностью
+    setTimeout(() => {
+        modal.style.display = 'none';
+        modal.classList.remove('modal-overlay-closing');
+    }, 600);
+}
+
+// =================== ОЧЕРЕДЬ МОДАЛОК (АНТИ-ЛАГ) ===================
+const _modalQueue = [];
+let _activeModalId = null;
+let _closingModalId = null;
+
+const _rawOpenModal = openModal;
+const _rawCloseModal = closeModal;
+
+function _tryShowNextModal() {
+    if (_activeModalId !== null || _closingModalId !== null) return;
+    if (_modalQueue.length === 0) return;
+
+    // На всякий случай проверяем DOM — нет ли «посторонней» модалки,
+    // открытой напрямую (без openModal)
+    const busy = document.querySelector(
+        '.modal-overlay.modal-overlay-visible, .modal-overlay.modal-overlay-closing'
+    );
+    if (busy) return;
+
+    const next = _modalQueue.shift();
+    _activeModalId = next;
+    _rawOpenModal(next);
+}
+
+window.openModal = function(modalId) {
+    // ★★★ ЗАЩИТА: если _activeModalId совпадает, но модалка реально закрыта —
+    // значит кто-то закрыл её в обход closeModal. Сбрасываем состояние.
+    if (_activeModalId === modalId) {
+        const el = document.getElementById(modalId);
+        const isReallyOpen = el && el.classList.contains('modal-overlay-visible');
+        if (isReallyOpen) return;      // действительно открыта — игнор
+        _activeModalId = null;          // залипла — сбрасываем
+        _closingModalId = null;
+    }
+
+    if (_activeModalId !== null || _closingModalId !== null || _modalQueue.length > 0) {
+        if (!_modalQueue.includes(modalId)) _modalQueue.push(modalId);
+        return;
+    }
+
+    const busy = document.querySelector(
+        '.modal-overlay.modal-overlay-visible, .modal-overlay.modal-overlay-closing'
+    );
+    if (busy && busy.id !== modalId) {
+        if (!_modalQueue.includes(modalId)) _modalQueue.push(modalId);
+        return;
+    }
+
+    _activeModalId = modalId;
+    _rawOpenModal(modalId);
+};
+
+window.closeModal = function(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+
+    const wasActive = (_activeModalId === modalId);
+    _rawCloseModal(modalId);
+
+    if (wasActive) {
+        _activeModalId = null;
+        _closingModalId = modalId;
+        setTimeout(() => {
+            if (_closingModalId === modalId) _closingModalId = null;
+            _tryShowNextModal();
+
+            // ★★★ ПРОВЕРЯЕМ ВЫЗОВЫ ПОСЛЕ ЗАКРЫТИЯ МОДАЛКИ ★★★
+            if (window.Challenges) {
+                setTimeout(() => {
+                    Challenges.checkIncoming();
+                    Challenges._tryShowNextResult();
+                }, 300);
+            }
+        }, 650);
+    } else {
+        const idx = _modalQueue.indexOf(modalId);
+        if (idx !== -1) _modalQueue.splice(idx, 1);
+        setTimeout(() => {
+            _tryShowNextModal();
+
+            // ★★★ ПРОВЕРЯЕМ ВЫЗОВЫ ★★★
+            if (window.Challenges) {
+                setTimeout(() => {
+                    Challenges.checkIncoming();
+                    Challenges._tryShowNextResult();
+                }, 300);
+            }
+        }, 650);
+    }
+};
+
+// ===================ГЛОБАЛЬНАЯ ФУНКЦИЯ ДЛЯ ПЕРЕКЛЮЧЕНИЯ ВКЛАДОК СТАТИСТИКИ ===================
+window.switchStatsTab = function(tab) {
+    // ★★★ ЕСЛИ ИДЁТ ТУТОРИАЛ — НЕ ВЫПОЛНЯЕМ ЗАДАНИЕ ★★★
+    if (!tutorialActive) {
+        if (!tasks[2]) {
+            tasks[2] = true;
+            saveTasks();
+            updateTasksUI();
+            showToast('✅ Задание "Статистика" выполнено!');
+            addTaskXp();
+        }
+    } else {
+        console.log('⏳ Обучение активно, задание "Статистика" не выполняется');
+    }
+    
+    // Переключаем UI
+    applyStatsTab(tab);
+    
+    // Обновляем данные
+    updateStats(tab);
+};
+
+// =================== ЕДИНАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ СТАТИСТИКИ ===================
+let statsUpdatePending = false;
+
+function updateStats(tab) {
+    // Если вкладка не передана — берём из TabManager
+    const currentTab = tab || TabManager.state.stats || 'personal';
+    
+    // Защита от одновременных вызовов
+    if (statsUpdatePending) {
+        console.log('⏳ Обновление статистики уже выполняется, пропускаем');
+        return;
+    }
+    
+    statsUpdatePending = true;
+    
+    try {
+if (currentTab === 'world') {
+    // ★ Первая волна — только самое видимое (одно поле)
+    loadGlobalStats();
+
+    // ★ Вторая волна — после отрисовки
+    const runLater = () => {
+        // ★ Волна 1: рейтинг мира (визуально важный) + счётчик пользователей
+        loadGlobalUsersCount();
+        loadWorldLeaderboard();
+    };
+
+    const runVeryLate = () => {
+        // ★ Волна 2: остальное — после того, как первый рендер устоялся
+        loadOnlineUsersCount();
+        loadCommunityAchievements();
+        loadFriendsLeaderboard();
+    };
+
+    if ('requestIdleCallback' in window) {
+        requestIdleCallback(runLater, { timeout: 1000 });
+        setTimeout(() => {
+            requestIdleCallback(runVeryLate, { timeout: 3000 });
+        }, 800);
+    } else {
+        setTimeout(runLater, 100);
+        setTimeout(runVeryLate, 800);
+    }
+
+    setTimeout(() => {
+        applySavedWorldStatsOrder();
+        statsUpdatePending = false;
+    }, 200);
+        } else {
+            loadStats();
+            setTimeout(() => {
+                statsUpdatePending = false;
+                console.log('✅ [updateStats] Личная статистика обновлена');
+            }, 200);
+        }
+    } catch (error) {
+        console.error('❌ [updateStats] Ошибка:', error);
+        statsUpdatePending = false;
+    }
+}
+
+// ===================КАТЕГОРИИ ТРЕНИРОВОК ===================
+document.querySelectorAll('.item-card').forEach(card => {
+    card.addEventListener('click', async function(e) {
+        const name = this.dataset.category;
+        if (!name) return;
+
+        // ★★★ НЕ ОБРАБАТЫВАЕМ КЛИК, ЕСЛИ БЛОК ЗАКРЫТ ★★★
+        const parentBlock = this.closest('.section-block');
+        if (parentBlock && !parentBlock.classList.contains('open')) {
+            e.stopPropagation();
+            return;
+        }
+
+        console.log('=== КЛИК ПО КАРТОЧКЕ ===');
+        console.log('name:', name);
+
+        let parentCategory = null;
+        let categoryData = null;
+
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][name]) {
+                parentCategory = parent;
+                categoryData = exercisesData[parent][name];
+                break;
+            }
+        }
+
+        let isPremium = false;
+        if (categoryData && categoryData._premium === true) {
+            isPremium = true;
+        }
+        if (parentCategory === 'Особые') {
+            isPremium = true;
+        }
+
+        if (isPremium && !hasPremium()) {
+            openModal('premiumModal');
+            return;
+        }
+
+        // ★★★ ГТО: пол берём из профиля и сразу открываем нужный гендер ★★★
+        if (categoryData && categoryData._gender === true) {
+            let gender = localStorage.getItem('userGender');
+
+            // Если в localStorage нет — запрашиваем из Firestore
+            if (!gender) {
+                try {
+                    const user = await getFirebaseUser();
+                    if (user) {
+                        const profileResult = await getUserProfile(user.uid);
+                        if (profileResult.success) {
+                            gender = profileResult.data.gender || 'male';
+                            localStorage.setItem('userGender', gender);
+                        }
+                    }
+                } catch (err) {
+                    console.warn('Не удалось получить пол из профиля:', err);
+                }
+            }
+
+            const gtoGender = (gender === 'female') ? 'Женский' : 'Мужской';
+
+            window.navigateTo('level-select', {
+                category: name,
+                gtoGender: gtoGender,
+                parentCategory: 'Особые'
+            });
+            return;
+        }
+
+        window.navigateTo('level-select', { category: name });
+    });
+});
+
+// ===================СТРАНИЦА ВЫБОРА УРОВНЯ ===================
+function loadLevelSelect(category, params = {}) {
+    // ★ Зарядка — без уровней, сразу к тренировке
+    if (category === 'Зарядка') {
+        window.navigateTo('workout-detail', {
+            category: 'Зарядка',
+            level: '1 LVL',
+            parentCategory: 'Фитнес'
+        });
+        return;
+    }
+
+    // ... остальной код функции без изменений
+    let parentCategory = null;
+    for (const parent in exercisesData) {
+        if (exercisesData[parent] && exercisesData[parent][category]) {
+            parentCategory = parent;
+            break;
+        }
+    }
+    if (parentCategory === 'Особые') {
+        if (!hasPremium()) {
+            openModal('premiumModal');
+            window.navigateTo('workouts');
+            return;
+        }
+    }
+// ★★★ ЗАГОЛОВОК СТРАНИЦЫ — ВСЕГДА "ТРЕНИРОВКА" ★★★
+const titleEl = document.getElementById('levelSelectTitle');
+if (titleEl) titleEl.textContent = 'ТРЕНИРОВКА';
+
+// ★★★ ПОДЗАГОЛОВОК: для ГТО — "Уровни тренировки для мужчин/женщин" ★★★
+const subtitleEl = document.getElementById('levelSelectSubtitle');
+if (subtitleEl) {
+    if (category === 'ГТО' && params.gtoGender) {
+        const genderWord = (params.gtoGender === 'Женский') ? 'женщин' : 'мужчин';
+        subtitleEl.textContent = 'Уровни тренировки для ' + genderWord;
+    } else {
+        subtitleEl.textContent = 'Уровни тренировки';
+    }
+}
+    let isPremium = false;
+    if (parentCategory && exercisesData[parentCategory] && exercisesData[parentCategory][category]) {
+        isPremium = exercisesData[parentCategory][category]._premium || false;
+    }
+
+    // ★★★ ОПРЕДЕЛЯЕМ СПИСОК УРОВНЕЙ ★★★
+    let levelsArr = ['1 LVL', '2 LVL', '3 LVL'];
+    let levelDescs = ['Начинающий', 'Любитель', 'Профессионал'];
+
+    // ★★★ ДЛЯ ГТО — СВОИ УРОВНИ ★★★
+    if (category === 'ГТО' && params.gtoGender) {
+        const gender = params.gtoGender;
+        if (exercisesData['Особые'] && exercisesData['Особые']['ГТО'] && exercisesData['Особые']['ГТО'][gender]) {
+            levelsArr = Object.keys(exercisesData['Особые']['ГТО'][gender]).filter(k => !k.startsWith('_'));
+            levelDescs = levelsArr.map(level => GTO_AGE_MAP[level] || 'Ступень ГТО');
+        }
+    }
+
+    const CATEGORY_ICON_MAP = {
+        'Руки': 'bodybuilding', 'Плечи': 'shoulder', 'Пресс': 'press',
+        'Грудь': 'breast', 'Спина': 'back', 'Ноги': 'legs',
+        'Всё тело': 'WholeBody', 'Кардио': 'cardio', 'Растяжка': 'stretching',
+        'Зарядка': 'charging', 'Пилатес': 'Pilates', 'Кроссфит': 'crossfit',
+        'Мужская сила': 'men', 'Женское счастье': 'woman',
+        'Растяжка позвоночника': 'stretching-back', 'ГТО': 'bodybuilding'
+    };
+    const icon = CATEGORY_ICON_MAP[category] || null;
+
+    const container = document.getElementById('levelsContainer');
+    const userInventory = getUserInventoryFromStorage();
+
+    container.innerHTML = levelsArr.map((level, index) => {
+        let exercises = [];
+        let displayName = category + ' ' + level;
+
+        let levelData = null;
+        if (category === 'ГТО' && params.gtoGender) {
+            if (exercisesData['Особые'] && exercisesData['Особые']['ГТО'] && exercisesData['Особые']['ГТО'][params.gtoGender]) {
+                levelData = exercisesData['Особые']['ГТО'][params.gtoGender][level];
+            }
+        } else if (parentCategory && exercisesData[parentCategory] && exercisesData[parentCategory][category]) {
+            levelData = exercisesData[parentCategory][category][level];
+        } else if (exercisesData[category] && exercisesData[category][level]) {
+            levelData = exercisesData[category][level];
+        } else {
+            for (const parent in exercisesData) {
+                if (exercisesData[parent] && exercisesData[parent][category]) {
+                    levelData = exercisesData[parent][category][level];
+                    if (levelData) break;
+                }
+            }
+        }
+
+        // ★★★ СОБИРАЕМ УПРАЖНЕНИЯ С УЧЁТОМ ИНВЕНТАРЯ ★★★
+if (levelData) {
+    if (Array.isArray(levelData)) {
+        exercises = levelData;
+    } else if (typeof levelData === 'object' && levelData._exercises) {
+        exercises = levelData._exercises;
+        displayName = levelData._title || displayName;
+    } else if (typeof levelData === 'object') {
+        // ★★★ НОВЫЙ ФОРМАТ: none / dumbbells / pullup / dumbbells_pullup
+        exercises = buildWorkoutForUser(levelData, userInventory);
+    }
+}
+
+        const count = exercises.length;
+        return `
+            <div class="item-card" onclick="window.navigateTo('workout-detail', {
+                category: '${category}',
+                level: '${level}',
+                parentCategory: '${parentCategory || ''}',
+                isPremium: ${isPremium},
+                gtoGender: '${params.gtoGender || ''}'
+            })">
+                <div class="item-icon">${icon ? `<img src="images/${icon}.png">` : ''}</div>
+                <div class="item-info">
+                    <h3 class="item-title">${displayName}</h3>
+                    <p class="item-desc">${levelDescs[index] || ''} · ${count} ${declOfNum(count, ['упражнение', 'упражнения', 'упражнений'])}</p>
+                </div>
+                <button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>
+            </div>
+        `;
+    }).join('');
+}
+
+// ===================СТРАНИЦА ДЕТАЛЕЙ ТРЕНИРОВКИ ===================
+let currentCategory = '';
+let currentLevel = '1 LVL';
+let currentIsCustom = false;
+let currentWorkoutId = null;
+
+let _quickEditIndex = null;
+let _quickEditExercises = null;
+let _quickEditIsCustom = false;
+let _quickEditCategory = '';
+let _quickEditLevel = '';
+let _quickEditParentCategory = '';
+let _quickEditWorkoutId = null;
+
+function loadWorkoutDetail(category, level, isCustom, id, parentCategory, isPremium, gtoGender) {
+    let isPremiumWorkout = false;
+    if (isPremium === true) isPremiumWorkout = true;
+    if (parentCategory === 'Особые') isPremiumWorkout = true;
+    if (!isPremiumWorkout) {
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][category] && exercisesData[parent][category]._premium === true) {
+                isPremiumWorkout = true;
+                break;
+            }
+        }
+    }
+    if (isPremiumWorkout && !hasPremium()) {
+        setTimeout(() => {
+            openModal('premiumModal');
+            window.navigateTo('workouts');
+        }, 100);
+        return;
+    }
+    currentCategory = category;
+    currentLevel = level || '1 LVL';
+    currentIsCustom = isCustom || false;
+    currentWorkoutId = id || null;
+
+    window._currentIsPremium = isPremiumWorkout;
+    window._currentGtoGender = gtoGender || '';
+
+    _quickEditCategory = category;
+    _quickEditLevel = currentLevel;
+    _quickEditIsCustom = isCustom;
+    _quickEditParentCategory = parentCategory || '';
+    _quickEditWorkoutId = id || null;
+
+    let exercises = [];
+    let displayTitle = '';
+    let workoutIcon = null;
+
+    if (isCustom && id) {
+        const workout = getWorkoutById(id);
+        if (workout) {
+            exercises = workout.exercises || [];
+            displayTitle = workout.title;
+            currentCategory = workout.title;
+            workoutIcon = workout.icon || null;
+        } else {
+            console.warn('⚠️ Тренировка не найдена по id:', id);
+            showToast('⚠️ Тренировка не найдена');
+            setTimeout(() => window.navigateTo('workouts'), 100);
+            return;
+        }
+    } else {
+        let found = false;
+        let savedTitle = '';
+        let levelData = null;
+
+        // ★★★ ДЛЯ ГТО — ИЩЕМ В ПОДРАЗДЕЛЕ ПОЛА ★★★
+        if (category === 'ГТО' && gtoGender && exercisesData['Особые'] && exercisesData['Особые']['ГТО'] && exercisesData['Особые']['ГТО'][gtoGender]) {
+            levelData = exercisesData['Особые']['ГТО'][gtoGender][currentLevel];
+        } else {
+            for (const parent in exercisesData) {
+                if (exercisesData[parent] && exercisesData[parent][category]) {
+                    levelData = exercisesData[parent][category][currentLevel];
+                    if (levelData) break;
+                }
+            }
+            if (!levelData && exercisesData[category] && exercisesData[category][currentLevel]) {
+                levelData = exercisesData[category][currentLevel];
+            }
+        }
+
+        // ★★★ СОБИРАЕМ УПРАЖНЕНИЯ ПО ИНВЕНТАРЮ ★★★
+if (levelData) {
+    if (Array.isArray(levelData) && levelData.length > 0) {
+        exercises = levelData;
+        found = true;
+    } else if (typeof levelData === 'object' && !Array.isArray(levelData) && levelData._exercises) {
+        exercises = levelData._exercises;
+        found = true;
+        if (levelData._title) savedTitle = levelData._title;
+    } else if (typeof levelData === 'object' && !Array.isArray(levelData)) {
+        const userInventory = getUserInventoryFromStorage();   // ← ДОБАВИЛИ
+        exercises = buildWorkoutForUser(levelData, userInventory);
+        found = exercises.length > 0;
+    }
+}
+
+        if (!found) {
+            for (const parent in exercisesData) {
+                if (exercisesData[parent] && exercisesData[parent][category]) {
+                    const levelsArr = ['1 LVL', '2 LVL', '3 LVL'];
+                    for (const lvl of levelsArr) {
+                        const data = exercisesData[parent][category][lvl];
+                        if (data) {
+                            if (data.core && Array.isArray(data.core)) {
+                                const userInventory = getUserInventoryFromStorage();
+                                exercises = buildWorkoutForUser(data, userInventory);
+                            } else if (typeof data === 'object' && !Array.isArray(data) && data._exercises) {
+                                exercises = data._exercises;
+                                if (data._title) savedTitle = data._title;
+                            } else if (Array.isArray(data) && data.length > 0) {
+                                exercises = data;
+                            }
+                            if (exercises.length > 0) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (found) break;
+                }
+            }
+        }
+
+        if (savedTitle) {
+            displayTitle = savedTitle;
+        } else if (category === 'ГТО' && gtoGender) {
+            displayTitle = 'ГТО · ' + gtoGender + ' · ' + (level || '1 LVL');
+        } else {
+            displayTitle = category + ' ' + (level || '1 LVL');
+        }
+
+        const CATEGORY_ICON_MAP = {
+            'Руки': 'bodybuilding',
+            'Плечи': 'shoulder',
+            'Пресс': 'press',
+            'Грудь': 'breast',
+            'Спина': 'back',
+            'Ноги': 'legs',
+            'Всё тело': 'WholeBody',
+            'Кардио': 'cardio',
+            'Растяжка': 'stretching',
+            'Зарядка': 'charging',
+            'Пилатес': 'Pilates',
+            'Кроссфит': 'crossfit',
+            'Мужская сила': 'men',
+            'Женское счастье': 'woman',
+            'Растяжка позвоночника': 'stretching-back',
+            'ГТО': 'WholeBody'
+        };
+        workoutIcon = CATEGORY_ICON_MAP[category] || null;
+    }
+
+    _quickEditExercises = exercises;
+
+    window._currentWorkoutForInvite = {
+        title: displayTitle,
+        exercises: exercises
+    };
+
+    // ★★★ ЗАГРУЖАЕМ ВРЕМЯ ОТДЫХА ★★★
+    let restTime = 30;
+
+    if (isCustom && id) {
+        const workout = getWorkoutById(id);
+        if (workout && workout.restTime) {
+            restTime = workout.restTime;
+        }
+    } else {
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][category]) {
+                const levelData = exercisesData[parent][category][currentLevel];
+                if (levelData && levelData._restTime) {
+                    restTime = levelData._restTime;
+                    break;
+                }
+            }
+        }
+    }
+
+    console.log('⏱️ Время отдыха для этой тренировки:', restTime, 'сек');
+
+    const titleEl = document.getElementById('workoutDetailTitle');
+    if (titleEl) {
+        titleEl.textContent = 'ТРЕНИРОВКА';
+    }
+
+    const container = document.getElementById('exercisesContainer');
+    if (container) {
+        if (exercises.length === 0) {
+            container.innerHTML = `<div class="empty-state"><span class="empty-icon">📋</span><h3 class="empty-title">Упражнения не найдены</h3><p class="empty-text">По вашему запросу ничего не нашлось.</p></div>`;
+        } else {
+            container.innerHTML = exercises.map((ex, index) => {
+                const icon = ex.icon || getExerciseIcon(ex.name);
+                let detailsText = `${formatSets(ex.sets)} × ${formatReps(ex.reps)}`;
+                if (hasWeight(ex) && ex.weight > 0) {
+                    detailsText += ` · ${ex.weight} кг`;
+                }
+                return `
+                    <div class="item-card" id="exercise-${index}">
+                        <div class="exercise-status" id="status-${index}">
+                            <span class="exercise-number" id="number-${index}">${index + 1}</span>
+                        </div>
+                        <div class="item-info" style="display:flex; align-items:center; justify-content:space-between; gap:0.5rem; flex:1; min-width:0;">
+                            <div style="flex:1; min-width:0;">
+                                <h3 class="item-title">${ex.name}</h3>
+                                <p class="item-desc">${detailsText}</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+    }
+
+    // ★★★ КНОПКА ПОДЕЛИТЬСЯ ССЫЛКОЙ ★★★
+const shareLinkBtn = document.getElementById('shareWorkoutLinkBtn');
+if (shareLinkBtn) {
+    shareLinkBtn.onclick = function() {
+        shareWorkoutLink(displayTitle, exercises, workoutIcon, restTime);
+    };
+}
+
+    const editWorkoutBtn = document.getElementById('editWorkoutBtn');
+    const workoutEditEnabled = localStorage.getItem(EDIT_WORKOUT_KEY) !== 'false';
+
+    if (editWorkoutBtn) {
+        if (isPremiumWorkout || !workoutEditEnabled) {
+            editWorkoutBtn.style.display = 'none';
+        } else {
+            editWorkoutBtn.style.display = 'block';
+            editWorkoutBtn.onclick = function() {
+                const params = { category: currentCategory, isCustom: currentIsCustom, id: currentWorkoutId };
+                if (!currentIsCustom && currentLevel) params.level = currentLevel;
+                if (parentCategory) params.parentCategory = parentCategory;
+                if (gtoGender) params.gtoGender = gtoGender;
+                window.navigateTo('workout-edit', params);
+            };
+        }
+    }
+
+    const actionButton = document.getElementById('actionButton');
+    if (actionButton) {
+        actionButton.onclick = function() {
+            if (!preventDoubleClick('startWorkoutBtn', 3000)) {
+                showToast('⏳ Подождите, тренировка уже запускается...');
+                return;
+            }
+
+            let sessionExercises = [];
+            let finalWorkoutIcon = workoutIcon;
+            let workoutId = null;
+            let workoutTitle = '';
+            let resolvedCategory = 'Без категории';
+
+            if (currentIsCustom && currentWorkoutId) {
+                const workout = getWorkoutById(currentWorkoutId);
+                if (workout) {
+                    sessionExercises = workout.exercises || [];
+                    finalWorkoutIcon = workout.icon || null;
+                    workoutId = currentWorkoutId;
+                    workoutTitle = workout.title || currentCategory;
+                }
+            } else {
+                sessionExercises = exercises;
+                if (category === 'ГТО' && gtoGender) {
+                    workoutTitle = 'ГТО · ' + gtoGender + ' · ' + currentLevel;
+                } else {
+                    workoutTitle = currentCategory + ' ' + currentLevel;
+                }
+            }
+
+            if (sessionExercises.length === 0) {
+                showToast('⚠️ Нет упражнений для тренировки');
+                return;
+            }
+
+            if (currentIsCustom && currentWorkoutId) {
+                resolvedCategory = finalWorkoutIcon ? (ICON_TO_CATEGORY[finalWorkoutIcon] || 'Всё тело') : 'Без категории';
+            } else if (category === 'ГТО') {
+                resolvedCategory = 'ГТО';
+            } else {
+                let parent = parentCategory || '';
+                if (!parent) {
+                    for (const p in exercisesData) {
+                        if (exercisesData[p] && exercisesData[p][currentCategory]) {
+                            parent = p;
+                            break;
+                        }
+                    }
+                }
+                resolvedCategory = resolveWorkoutCategory(currentCategory, parent, isPremiumWorkout);
+            }
+
+            startTrainingSession(sessionExercises, workoutTitle, resolvedCategory, finalWorkoutIcon);
+        };
+    }
+
+    const inviteBtn = document.getElementById('coopInviteBtn');
+    if (inviteBtn) {
+        inviteBtn.onclick = function() {
+            getFriendsList().then(result => {
+                if (!result.success || result.data.length === 0) {
+                    showToast('⚠️ Сначала добавьте друзей в профиле');
+                    TabManager.profile('friends');
+                    return;
+                }
+                showFriendSelectModal(result.data);
+            });
+        };
+    }
+
+    if (actionButton) {
+        actionButton.parentNode.insertBefore(inviteBtn, actionButton);
+    }
+}
+
+// ========== ДОБАВЛЯЕМ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
+// (после объявления sessionWorkoutIcon)
+let isResting = false;
+let restTimerInterval = null;
+let restSeconds = 30;
+
+// ========== НОВЫЕ ФУНКЦИИ УПРАВЛЕНИЯ ОТДЫХОМ ==========
+
+function startRest() {
+    if (restTimerInterval) {
+        clearInterval(restTimerInterval);
+        restTimerInterval = null;
+    }
+    isResting = true;
+    restSeconds = sessionRestSeconds || 30;  // ← ИСПОЛЬЗУЕМ ГЛОБАЛЬНУЮ ПЕРЕМЕННУЮ
+    restEndsAt = Date.now() + restSeconds * 1000;
+    updateRestUI();
+    savePersonalTrainingSession();
+    startRestTimer();
+}
+
+function updateRestUI() {
+    // Во время отдыха фото упражнения не показываем и не переключаем.
+    const exerciseGallery = document.getElementById('sessionExerciseGallery');
+    if (exerciseGallery) {
+        if (exerciseGallery._galleryTimer) {
+            clearInterval(exerciseGallery._galleryTimer);
+            exerciseGallery._galleryTimer = null;
+        }
+        exerciseGallery.style.display = 'none';
+    }
+
+    // Скрываем кнопку редактирования
+    document.getElementById('sessionEditBtn').style.display = 'none';
+    
+    // Меняем название упражнения на "Отдых"
+    document.getElementById('sessionExerciseName').textContent = 'Отдых';
+    document.getElementById('sessionExerciseDetails').textContent = '';
+    
+    // Меняем текст главной кнопки
+    document.getElementById('sessionMainBtn').textContent = 'ПРОПУСТИТЬ';
+    
+    // Показываем большой таймер, скрываем фоновый текст
+    const bgText = document.querySelector('.session-bg-text');
+    const restTimer = document.getElementById('sessionRestTimer');
+    const restControls = document.getElementById('sessionRestControls');
+    
+    // ★★★ СКРЫВАЕМ СТРОКУ С ВЕСОМ ★★★
+    const weightRow = document.getElementById('sessionWeightRow');
+    if (weightRow) weightRow.style.display = 'none';
+    
+    if (bgText) bgText.style.display = 'none';
+    if (restTimer) {
+        restTimer.style.display = 'block';
+        restTimer.textContent = formatTime(restSeconds);
+    }
+    if (restControls) {
+        restControls.classList.add('visible');
+    }
+
+    // Во время отдыха показываем не только название, но и технику следующего упражнения.
+    const hint = document.getElementById('sessionNextExerciseHint');
+    if (hint) {
+        const nextEx = sessionExercises?.[sessionCurrentIndex + 1] || null;
+        hint.replaceChildren();
+
+        if (nextEx) {
+            const title = document.createElement('div');
+            title.textContent = 'Далее: ' + (nextEx.name || 'Следующее упражнение');
+            title.style.fontWeight = '600';
+            hint.appendChild(title);
+
+        } else {
+            hint.textContent = 'Это было последнее упражнение';
+        }
+        hint.style.display = 'block';
+    }
+}
+
+// Запуск таймера отдыха
+function startRestTimer() {
+    if (!restEndsAt) restEndsAt = Date.now() + (restSeconds || 1) * 1000;
+    if (restTimerInterval) clearInterval(restTimerInterval);
+    restTimerInterval = setInterval(() => {
+        restSeconds = Math.max(0, Math.ceil((restEndsAt - Date.now()) / 1000));
+        const restTimer = document.getElementById('sessionRestTimer');
+        if (restTimer) {
+            restTimer.textContent = formatTime(restSeconds);
+        }
+        
+        if (restSeconds === 3) {
+            soundCountdown.currentTime = 0;
+            soundCountdown.play().catch(() => {});
+        }
+        
+        savePersonalTrainingSession();
+        if (restSeconds <= 0) {
+            finishRest();
+        }
+    }, 1000);
+}
+
+function finishRest() {
+    restEndsAt = null;
+    if (restTimerInterval) {
+        clearInterval(restTimerInterval);
+        restTimerInterval = null;
+    }
+    isResting = false;
+    
+    // Восстанавливаем обычный вид
+    const bgText = document.querySelector('.session-bg-text');
+    const restTimer = document.getElementById('sessionRestTimer');
+    const restControls = document.getElementById('sessionRestControls');
+    const weightRow = document.getElementById('sessionWeightRow');
+    
+    if (bgText) bgText.style.display = 'block';
+    if (restTimer) restTimer.style.display = 'none';
+    if (restControls) restControls.classList.remove('visible');
+
+        // ★★★ СКРЫВАЕМ ПОДСКАЗКУ ★★★
+    const hint = document.getElementById('sessionNextExerciseHint');
+    if (hint) hint.style.display = 'none';
+    
+    // ★★★ ВОССТАНАВЛИВАЕМ СТРОКУ С ВЕСОМ ★★★
+    const ex = sessionExercises[sessionCurrentIndex];
+    if (weightRow && hasWeight(ex)) {
+        weightRow.style.display = 'flex';
+    } else if (weightRow) {
+        weightRow.style.display = 'none';
+    }
+    
+    sessionCurrentIndex++;
+    renderSessionExercise();
+    renderSessionProgress();
+    updateSessionButtons();
+    document.getElementById('sessionEditBtn').style.display = 'block';
+    savePersonalTrainingSession();
+}
+
+function skipRest() {
+    restEndsAt = null;
+    if (restTimerInterval) {
+        clearInterval(restTimerInterval);
+        restTimerInterval = null;
+    }
+    isResting = false;
+    
+    const bgText = document.querySelector('.session-bg-text');
+    const restTimer = document.getElementById('sessionRestTimer');
+    const restControls = document.getElementById('sessionRestControls');
+    const weightRow = document.getElementById('sessionWeightRow');
+    
+    if (bgText) bgText.style.display = 'block';
+    if (restTimer) restTimer.style.display = 'none';
+    if (restControls) restControls.classList.remove('visible');
+
+        // ★★★ СКРЫВАЕМ ПОДСКАЗКУ ★★★
+    const hint = document.getElementById('sessionNextExerciseHint');
+    if (hint) hint.style.display = 'none';
+    
+    // ★★★ ВОССТАНАВЛИВАЕМ СТРОКУ С ВЕСОМ ★★★
+    const ex = sessionExercises[sessionCurrentIndex];
+    if (weightRow && hasWeight(ex)) {
+        weightRow.style.display = 'flex';
+    } else if (weightRow) {
+        weightRow.style.display = 'none';
+    }
+    
+    sessionCurrentIndex++;
+    renderSessionExercise();
+    renderSessionProgress();
+    updateSessionButtons();
+    document.getElementById('sessionEditBtn').style.display = 'block';
+    savePersonalTrainingSession();
+}
+
+// ===================СТРАНИЦА ТРЕНИРОВКИ СЕССИЯ ===================
+let sessionExercises = [];
+let sessionCurrentIndex = 0;
+let sessionCompleted = new Set();
+let sessionTimerInterval = null;
+let sessionSkipped = new Set();
+let sessionSeconds = 0;
+let isSessionPaused = false;
+let sessionWorkoutTitle = '';
+let sessionCategory = '';
+let sessionWorkoutIcon = null;
+
+
+/* =================== ВОССТАНОВЛЕНИЕ ЛИЧНОЙ ТРЕНИРОВКИ =================== */
+const PERSONAL_TRAINING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let personalSessionStartedAt = null;
+let personalSessionRestoreInProgress = false;
+let restEndsAt = null;
+
+function getPersonalTrainingStorageKey() {
+    const user = typeof firebase !== 'undefined' && firebase.auth ? firebase.auth().currentUser : null;
+    return user ? 'sportapp_active_personal_training_v1_' + user.uid : null;
+}
+
+function getStoredPersonalTraining() {
+    const key = getPersonalTrainingStorageKey();
+    if (!key) return null;
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        const startedAt = Number(data.startedAt || 0);
+        if (!startedAt || Date.now() - startedAt > PERSONAL_TRAINING_TTL_MS) {
+            localStorage.removeItem(key);
+            return null;
+        }
+        return data;
+    } catch (error) {
+        console.warn('Не удалось прочитать сохранённую тренировку:', error);
+        return null;
+    }
+}
+
+function savePersonalTrainingSession() {
+    if (personalSessionRestoreInProgress || currentSessionId || !sessionExercises.length || !personalSessionStartedAt) return false;
+    const key = getPersonalTrainingStorageKey();
+    if (!key) return false;
+
+    const snapshot = {
+        version: 1,
+        startedAt: personalSessionStartedAt,
+        savedAt: Date.now(),
+        title: sessionWorkoutTitle,
+        category: sessionCategory,
+        workoutIcon: sessionWorkoutIcon,
+        exercises: sessionExercises,
+        currentIndex: sessionCurrentIndex,
+        completed: Array.from(sessionCompleted || []),
+        skipped: Array.from(sessionSkipped || []),
+        completedSets: sessionCompletedSets || {},
+        seconds: sessionSeconds || 0,
+        restSeconds: restSeconds || 30,
+        sessionRestSeconds: sessionRestSeconds || 30,
+        isResting: !!isResting,
+        restEndsAt: restEndsAt,
+        isSessionPaused: !!isSessionPaused,
+        exerciseTimeLeft: exerciseTimeLeft || 0,
+        exerciseTotalTime: exerciseTotalTime || 0,
+        exerciseCurrentSet: exerciseCurrentSet || 0,
+        exerciseTotalSets: exerciseTotalSets || 0,
+        isTimedExercise: !!isTimedExercise,
+        exerciseTimerWasRunning: !!(isExerciseTimerRunning || window._resumeExerciseTimerAfterPause)
+    };
+
+    try {
+        localStorage.setItem(key, JSON.stringify(snapshot));
+        return true;
+    } catch (error) {
+        console.warn('Не удалось сохранить прогресс тренировки:', error);
+        return false;
+    }
+}
+
+function clearStoredPersonalTraining() {
+    const key = getPersonalTrainingStorageKey();
+    if (key) {
+        try { localStorage.removeItem(key); } catch (error) {
+            console.warn('Не удалось удалить сохранённую тренировку:', error);
+        }
+    }
+    personalSessionStartedAt = null;
+    restEndsAt = null;
+}
+
+function showResumePersonalTrainingPrompt() {
+    const saved = getStoredPersonalTraining();
+    if (!saved) return;
+
+    const title = document.getElementById('resumePersonalTrainingTitle');
+    const details = document.getElementById('resumePersonalTrainingDetails');
+    if (title) title.textContent = saved.title || 'Незавершённая тренировка';
+    if (details) {
+        const completedCount = Array.isArray(saved.completed) ? saved.completed.length : 0;
+        const totalCount = Array.isArray(saved.exercises) ? saved.exercises.length : 0;
+        const minutes = Math.floor((Number(saved.seconds) || 0) / 60);
+        details.textContent = completedCount + ' из ' + totalCount + ' упражнений выполнено · ' + minutes + ' мин';
+    }
+    openModal('resumePersonalTrainingModal');
+}
+
+function cancelStoredPersonalTraining() {
+    closeModal('resumePersonalTrainingModal');
+    showConfirmModal(
+        'Отменить тренировку?',
+        'Весь прогресс этой тренировки будет потерян. Она не попадёт в историю, статистику и рейтинг, XP начислены не будут.',
+        function() {
+            stopSessionTimer();
+            clearStoredPersonalTraining();
+            sessionExercises = [];
+            sessionCurrentIndex = 0;
+            sessionCompleted = new Set();
+            sessionSkipped = new Set();
+            sessionCompletedSets = {};
+            sessionSeconds = 0;
+            sessionWorkoutTitle = '';
+            sessionCategory = '';
+            sessionWorkoutIcon = null;
+            isResting = false;
+            isExerciseTimerRunning = false;
+            isSessionPaused = false;
+            window._resumeExerciseTimerAfterPause = false;
+            showToast('Тренировка отменена');
+        },
+        'Да, отменить'
+    );
+}
+
+function restorePersonalTrainingSession(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.exercises) || !snapshot.exercises.length) return;
+    personalSessionRestoreInProgress = true;
+
+    try {
+        sessionExercises = snapshot.exercises;
+        sessionCurrentIndex = Math.max(0, Math.min(Number(snapshot.currentIndex) || 0, sessionExercises.length - 1));
+        sessionCompleted = new Set(snapshot.completed || []);
+        sessionSkipped = new Set(snapshot.skipped || []);
+        sessionCompletedSets = snapshot.completedSets || {};
+        sessionSeconds = Number(snapshot.seconds) || 0;
+        sessionWorkoutTitle = snapshot.title || 'Тренировка';
+        sessionCategory = snapshot.category || 'Без категории';
+        sessionWorkoutIcon = snapshot.workoutIcon || null;
+        personalSessionStartedAt = Number(snapshot.startedAt) || Date.now();
+        sessionRestSeconds = Number(snapshot.sessionRestSeconds) || 30;
+        restSeconds = Number(snapshot.restSeconds) || 30;
+        restEndsAt = Number(snapshot.restEndsAt) || null;
+        isResting = !!snapshot.isResting;
+        isSessionPaused = false;
+        isExerciseTimerRunning = false;
+        window._resumeExerciseTimerAfterPause = false;
+        _isFromSession = false;
+        _currentTrainingIndex = null;
+
+        window.navigateTo('training-session');
+        renderSessionExercise();
+
+        if (isResting && restEndsAt) {
+            restSeconds = Math.max(0, Math.ceil((restEndsAt - Date.now()) / 1000));
+            if (restSeconds <= 0) {
+                finishRest();
+            } else {
+                updateRestUI();
+                startRestTimer();
+            }
+        } else {
+            isResting = false;
+            restEndsAt = null;
+            if (isTimedExercise) {
+                exerciseTimeLeft = Math.max(0, Number(snapshot.exerciseTimeLeft) || 0);
+                exerciseTotalTime = Number(snapshot.exerciseTotalTime) || exerciseTotalTime;
+                exerciseCurrentSet = Number(snapshot.exerciseCurrentSet) || exerciseCurrentSet;
+                exerciseTotalSets = Number(snapshot.exerciseTotalSets) || exerciseTotalSets;
+                const setCurrent = document.getElementById('sessionSetCurrent');
+                if (setCurrent) setCurrent.textContent = exerciseCurrentSet;
+                updateExerciseTimerDisplay();
+            }
+        }
+
+        renderSessionProgress();
+        updateSessionButtons();
+        updateSessionTimerDisplay();
+        startSessionTimer();
+
+        if (snapshot.isSessionPaused) {
+            isSessionPaused = true;
+            window._resumeExerciseTimerAfterPause = !!snapshot.exerciseTimerWasRunning;
+            const overlay = document.getElementById('sessionPauseOverlay');
+            if (overlay) overlay.classList.add('visible');
+            updatePauseOverlayTime();
+        } else if (snapshot.exerciseTimerWasRunning && !isResting && isTimedExercise) {
+            isExerciseTimerRunning = true;
+            startExerciseTimer();
+        }
+
+        savePersonalTrainingSession();
+        showToast('Тренировка восстановлена');
+    } catch (error) {
+        console.error('Ошибка восстановления тренировки:', error);
+        showToast('Не удалось восстановить тренировку');
+    } finally {
+        personalSessionRestoreInProgress = false;
+    }
+}
+
+document.getElementById('resumePersonalTrainingBtn')?.addEventListener('click', function() {
+    const saved = getStoredPersonalTraining();
+    closeModal('resumePersonalTrainingModal');
+    if (saved) restorePersonalTrainingSession(saved);
+});
+document.getElementById('cancelPersonalTrainingBtn')?.addEventListener('click', cancelStoredPersonalTraining);
+
+window.addEventListener('pagehide', savePersonalTrainingSession);
+document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'hidden') savePersonalTrainingSession();
+});
+/* =================== /ВОССТАНОВЛЕНИЕ ЛИЧНОЙ ТРЕНИРОВКИ =================== */
+
+function startTrainingSession(exercises, title, category, workoutIcon) {
+    const existingPersonalSession = getStoredPersonalTraining();
+    if (existingPersonalSession && !personalSessionRestoreInProgress) {
+        showResumePersonalTrainingPrompt();
+        showToast('Сначала продолжите или отмените предыдущую тренировку');
+        return;
+    }
+    // ★ Если программа была выбрана, но категория не та — сбрасываем
+    if (_pendingProgramDay && _pendingProgramDay.category !== category) {
+        _pendingProgramDay = null;
+    }
+    // Сброс совместных данных
+    if (sessionListener) {
+        sessionListener();
+        sessionListener = null;
+    }
+    currentSessionId = null;
+    isHost = false;
+    sessionData = null;
+    coopExercises = [];
+    coopStarted = false;
+    finishPageShown = false;
+    
+    const participantsContainer = document.getElementById('participantsContainer');
+    if (participantsContainer) {
+        participantsContainer.remove();
+    }
+
+    if (!exercises || exercises.length === 0) {
+        showToast('⚠️ Нет упражнений для тренировки');
+        return;
+    }
+
+        // ★★★ ОБНОВЛЯЕМ ВИД ПЛАШКИ ★★★
+    updateMusclesHintState();
+    
+    sessionExercises = exercises.map(ex => ({
+        ...ex,
+        icon: ex.icon || getExerciseIcon(ex.name)
+    }));
+    sessionCurrentIndex = 0;
+    sessionCompleted = new Set();
+    sessionSkipped = new Set();
+    sessionCompletedSets = {};
+    sessionSeconds = 0;
+    personalSessionStartedAt = Date.now();
+    restEndsAt = null;
+    sessionWorkoutTitle = title;
+    sessionCategory = category || 'Без категории';
+    sessionWorkoutIcon = workoutIcon || null;
+
+    // Загружаем время отдыха
+    let savedRestTime = 30;
+    if (currentWorkoutId && currentIsCustom) {
+        const workout = getWorkoutById(currentWorkoutId);
+        if (workout && workout.restTime) {
+            savedRestTime = workout.restTime;
+        }
+    } else {
+        let found = false;
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][currentCategory]) {
+                const levelData = exercisesData[parent][currentCategory][currentLevel];
+                if (levelData && levelData._restTime) {
+                    savedRestTime = levelData._restTime;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found && exercisesData[currentCategory] && exercisesData[currentCategory][currentLevel]) {
+            const levelData = exercisesData[currentCategory][currentLevel];
+            if (levelData && levelData._restTime) {
+                savedRestTime = levelData._restTime;
+            }
+        }
+    }
+
+    sessionRestSeconds = savedRestTime;
+
+    _isFromSession = false;
+    _currentTrainingIndex = null;
+
+    closeModal('sessionExitModal');
+    window.navigateTo('training-session');
+
+    renderSessionExercise();
+    renderSessionProgress();
+    updateSessionButtons();
+    savePersonalTrainingSession();
+    startSessionTimer();
+}
+
+// Отображение галереи упражнения. Если файл отсутствует, показываем понятную заглушку.
+function renderExerciseGallery(exercise, containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.style.display = 'flex';
+
+    if (container._galleryTimer) {
+        clearInterval(container._galleryTimer);
+        container._galleryTimer = null;
+    }
+
+    const catalogExercise = typeof EXERCISES_CATALOG !== 'undefined'
+        ? EXERCISES_CATALOG.find(item => item.name === exercise?.name)
+        : null;
+    const images = Array.isArray(exercise?.images) && exercise.images.length
+        ? exercise.images
+        : (Array.isArray(catalogExercise?.images) ? catalogExercise.images : []);
+    const sources = images.filter(src => typeof src === 'string' && src.trim() && !src.startsWith('*'));
+
+    container.innerHTML = '';
+    if (!sources.length) {
+        container.innerHTML = '<span class="session-bg-text">Фото будет добавлено позже</span>';
+        return;
+    }
+
+    // Один и тот же img-элемент и единый холст для всех кадров:
+    // это исключает смещение из-за разных размеров и прозрачных полей PNG.
+    const imageElement = document.createElement('img');
+    imageElement.className = 'exercise-gallery-image';
+    imageElement.alt = exercise?.name || 'Техника выполнения упражнения';
+    imageElement.draggable = false;
+    container.appendChild(imageElement);
+
+    const normalizedFrames = [];
+    let currentIndex = 0;
+    let readyCount = 0;
+    let finalized = false;
+
+    function normalizeTransparentImage(img) {
+        const sourceCanvas = document.createElement('canvas');
+        sourceCanvas.width = img.naturalWidth;
+        sourceCanvas.height = img.naturalHeight;
+        const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true });
+        sourceContext.drawImage(img, 0, 0);
+
+        const pixels = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height).data;
+        let minX = sourceCanvas.width, minY = sourceCanvas.height, maxX = -1, maxY = -1;
+        for (let y = 0; y < sourceCanvas.height; y++) {
+            for (let x = 0; x < sourceCanvas.width; x++) {
+                if (pixels[(y * sourceCanvas.width + x) * 4 + 3] > 16) {
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+
+        const output = document.createElement('canvas');
+        output.width = 1000;
+        output.height = 1000;
+        const context = output.getContext('2d');
+        if (maxX < minX || maxY < minY) {
+            context.drawImage(img, 0, 0, output.width, output.height);
+            return output.toDataURL('image/png');
+        }
+
+        const cropWidth = maxX - minX + 1;
+        const cropHeight = maxY - minY + 1;
+        const scale = Math.min(900 / cropWidth, 940 / cropHeight);
+        const drawWidth = cropWidth * scale;
+        const drawHeight = cropHeight * scale;
+        const drawX = (output.width - drawWidth) / 2;
+        const drawY = (output.height - drawHeight) / 2;
+        context.drawImage(sourceCanvas, minX, minY, cropWidth, cropHeight,
+            drawX, drawY, drawWidth, drawHeight);
+        return output.toDataURL('image/png');
+    }
+
+    function showFrame(index) {
+        if (!normalizedFrames.length) return;
+        currentIndex = (index + normalizedFrames.length) % normalizedFrames.length;
+        imageElement.src = normalizedFrames[currentIndex];
+    }
+
+    function finishPreloading() {
+        if (finalized || readyCount !== sources.length) return;
+        finalized = true;
+        const usableFrames = normalizedFrames.filter(Boolean);
+        if (!usableFrames.length) {
+            container.innerHTML = '<span class="session-bg-text">Фото будет добавлено позже</span>';
+            return;
+        }
+        normalizedFrames.splice(0, normalizedFrames.length, ...usableFrames);
+        showFrame(0);
+        if (normalizedFrames.length > 1) {
+            container._galleryTimer = setInterval(() => showFrame(currentIndex + 1), 1000);
+        }
+    }
+
+    sources.forEach((src, index) => {
+        const preload = new Image();
+        preload.onload = function() {
+            try {
+                normalizedFrames[index] = normalizeTransparentImage(preload);
+            } catch (error) {
+                normalizedFrames[index] = src;
+            }
+            readyCount++;
+            finishPreloading();
+        };
+        preload.onerror = function() {
+            normalizedFrames[index] = null;
+            readyCount++;
+            finishPreloading();
+        };
+        preload.src = src;
+    });
+}
+function renderSessionExercise() {
+    if (isResting) {
+        updateRestUI();
+        return;
+    }
+    const ex = sessionExercises[sessionCurrentIndex];
+    if (!ex) return;
+    
+    document.getElementById('sessionExerciseName').textContent = ex.name;
+    renderExerciseGallery(ex, 'sessionExerciseGallery');
+    
+    const repsStr = String(ex.reps || '');
+    const isSeconds = isTimeBased(repsStr);
+    const repsValue = parseInt(repsStr.replace(/[^0-9.]/g, '')) || 0;
+    
+    isTimedExercise = isSeconds;
+    
+    let details = '';
+    let timerDisplay = '';
+    
+    if (isSeconds) {
+        const mins = String(Math.floor(repsValue / 60)).padStart(2, '0');
+        const secs = String(repsValue % 60).padStart(2, '0');
+        details = `${ex.sets} × ${mins}:${secs}`;
+        timerDisplay = `${mins}:${secs}`;
+        
+        exerciseTotalSets = parseInt(ex.sets) || 1;
+        
+        // ★★★ ВОССТАНАВЛИВАЕМ КОЛИЧЕСТВО ВЫПОЛНЕННЫХ ПОДХОДОВ ★★★
+        const key = sessionCurrentIndex;
+        const completedSets = sessionCompletedSets[key] || 0;
+        exerciseCurrentSet = exerciseTotalSets - completedSets;
+        
+        exerciseTotalTime = repsValue;
+        exerciseTimeLeft = repsValue;
+        isExerciseTimerRunning = false;
+        
+        if (exerciseTimerInterval) {
+            clearInterval(exerciseTimerInterval);
+            exerciseTimerInterval = null;
+        }
+        
+        const timerEl = document.getElementById('sessionExerciseTimer');
+        if (timerEl) {
+            timerEl.style.display = 'block';
+            timerEl.textContent = timerDisplay;
+        }
+        
+        const setCounter = document.getElementById('sessionSetCounter');
+        const setCurrent = document.getElementById('sessionSetCurrent');
+        const setTotal = document.getElementById('sessionSetTotal');
+        if (setCounter) {
+            setCounter.style.display = 'block';
+        }
+        if (setCurrent) {
+            setCurrent.textContent = exerciseCurrentSet;
+        }
+        if (setTotal) {
+            setTotal.textContent = exerciseTotalSets;
+        }
+        
+        document.getElementById('sessionMainBtn').textContent = 'СТАРТ';
+        
+    } else {
+        details = `${ex.sets} × ${repsValue}`;
+        
+        const timerEl = document.getElementById('sessionExerciseTimer');
+        if (timerEl) {
+            timerEl.style.display = 'none';
+        }
+        
+        const setCounter = document.getElementById('sessionSetCounter');
+        if (setCounter) {
+            setCounter.style.display = 'none';
+        }
+        
+        const total = sessionExercises.length;
+        const isLast = sessionCurrentIndex === total - 1;
+        document.getElementById('sessionMainBtn').textContent = isLast ? 'ФИНИШ' : 'ГОТОВО';
+    }
+    
+    if (hasWeight(ex)) {
+        details += ` · ${ex.weight || 0} кг`;
+    }
+    
+    document.getElementById('sessionExerciseDetails').textContent = details;
+    
+    const editBtn = document.getElementById('sessionEditBtn');
+    if (editBtn) {
+        editBtn.style.display = 'block';
+        editBtn.onclick = function() {
+            openSessionEditExerciseModal(sessionCurrentIndex);
+        };
+    }
+    
+    const restControls = document.getElementById('sessionRestControls');
+    if (restControls) {
+        restControls.classList.remove('visible');
+    }
+}
+
+// ★★★ КОРРЕКТИРОВКА ВЕСА В МОДАЛКЕ РЕДАКТИРОВАНИЯ ★★★
+function adjustModalWeight(delta) {
+    const display = document.getElementById('modalExerciseWeightDisplay');
+    let val = parseFloat(display.textContent.replace(' кг', '')) || 0;
+    val = val + delta;
+    if (val < 0) val = 0;
+    if (val > 100) val = 100;
+    display.textContent = val + ' кг';
+}
+
+function renderSessionProgress() {
+    const container = document.getElementById('sessionProgress');
+    const total = sessionExercises.length;
+    const current = sessionCurrentIndex;
+
+    container.innerHTML = '';
+    for (let i = 0; i < total; i++) {
+        const dash = document.createElement('div');
+        dash.className = 'progress-dash';
+
+        if (sessionCompleted.has(i) || sessionSkipped.has(i)) {
+            dash.classList.add('progress-dash-active');
+        }
+        else if (i === current) {
+            dash.classList.add('progress-dash-current');
+        }
+        container.appendChild(dash);
+    }
+    savePersonalTrainingSession();
+}
+
+function updateSessionButtons() {
+    const total = sessionExercises.length;
+    const isFirst = sessionCurrentIndex === 0;
+    const isLast = sessionCurrentIndex === total - 1;
+    const prevBtn = document.getElementById('sessionPrevBtn');
+    const nextBtn = document.getElementById('sessionNextBtn');
+    const mainBtn = document.getElementById('sessionMainBtn');
+
+    // ★★★ УБРАЛИ БЛОК, СКРЫВАЮЩИЙ КНОПКИ ★★★
+    // Всегда показываем кнопки навигации (они могут быть скрыты только если нет соседних упражнений)
+    prevBtn.style.visibility = 'visible';
+    prevBtn.style.pointerEvents = 'auto';
+    nextBtn.style.visibility = 'visible';
+    nextBtn.style.pointerEvents = 'auto';
+
+    if (isResting) {
+        prevBtn.style.pointerEvents = isFirst ? 'none' : 'auto';
+        nextBtn.style.pointerEvents = 'auto';
+        mainBtn.textContent = 'ПРОПУСТИТЬ';
+        return;
+    }
+
+    prevBtn.style.pointerEvents = isFirst ? 'none' : 'auto';
+    nextBtn.style.pointerEvents = 'auto';
+    
+    if (!isTimedExercise) {
+        mainBtn.textContent = isLast ? 'ФИНИШ' : 'ГОТОВО';
+    }
+}
+
+function goToPrevExercise() {
+    if (isResting) {
+        if (restTimerInterval) {
+            clearInterval(restTimerInterval);
+            restTimerInterval = null;
+        }
+        isResting = false;
+        if (sessionCurrentIndex > 0) {
+            sessionCurrentIndex--;
+        }
+        renderSessionExercise();
+        renderSessionProgress();
+        updateSessionButtons();
+        document.getElementById('sessionEditBtn').style.display = 'block';
+        return;
+    }
+    
+    // ★★★ ЕСЛИ ТАЙМЕР ЗАПУЩЕН - ОСТАНАВЛИВАЕМ ★★★
+    if (isExerciseTimerRunning) {
+        clearInterval(exerciseTimerInterval);
+        exerciseTimerInterval = null;
+        isExerciseTimerRunning = false;
+        document.getElementById('sessionMainBtn').textContent = 'СТАРТ';
+    }
+    
+    if (sessionCurrentIndex > 0) {
+        sessionCurrentIndex--;
+        renderSessionExercise();
+        renderSessionProgress();
+        updateSessionButtons();
+    }
+}
+
+function goToNextExercise() {
+    if (isExerciseTimerRunning) {
+        clearInterval(exerciseTimerInterval);
+        exerciseTimerInterval = null;
+        isExerciseTimerRunning = false;
+        document.getElementById('sessionMainBtn').textContent = 'СТАРТ';
+    }
+    
+    if (isResting) {
+        skipRest();
+        return;
+    }
+    
+    const currentEx = sessionExercises[sessionCurrentIndex];
+    const repsStr = String(currentEx?.reps || '');
+    const isTimed = isTimeBased(repsStr);
+    const hasNext = sessionCurrentIndex < sessionExercises.length - 1;
+    const exerciseName = currentEx?.name || 'Упражнение';
+    const key = sessionCurrentIndex;
+    const completedSets = sessionCompletedSets[key] || 0;
+    const totalSets = parseInt(currentEx?.sets) || 0;
+    
+if (isTimed) {
+    showConfirmModal(
+        'Упражнение не завершено',
+        `Вы выполнили ${completedSets} из ${totalSets} подходов. Пропустить остальные подходы?`,
+        function() {
+            sessionCompletedSets[key] = completedSets;
+            sessionSkipped.add(sessionCurrentIndex);   // ← добавили
+            if (hasNext) {
+                sessionCurrentIndex++;
+                renderSessionExercise();
+                renderSessionProgress();
+                updateSessionButtons();
+            } else {
+                finishTrainingSession();
+            }
+        },
+        'Пропустить'
+    );
+    return;
+}
+    
+showConfirmModal(
+    'Пропустить упражнение?',
+    `Вы уверены, что хотите пропустить "${exerciseName}"? Оно не будет засчитано.`,
+    function() {
+        sessionSkipped.add(sessionCurrentIndex);   // ← добавили
+        if (hasNext) {
+            sessionCurrentIndex++;
+            renderSessionExercise();
+            renderSessionProgress();
+            updateSessionButtons();
+        } else {
+            finishTrainingSession();
+        }
+    },
+    'Пропустить'
+);
+}
+
+function markCurrentComplete() {
+    const currentEx = sessionExercises[sessionCurrentIndex];
+    const repsStr = String(currentEx?.reps || '');
+    const isTimed = isTimeBased(repsStr);
+    const key = sessionCurrentIndex;
+    
+    // ★★★ 1. ВРЕМЕННОЕ УПРАЖНЕНИЕ (ПОДХОДЫ × СЕКУНДЫ) ★★★
+    if (isTimed) {
+        const completedSets = sessionCompletedSets[key] || 0;
+        const totalSets = parseInt(currentEx?.sets) || 0;
+        
+        if (completedSets === 0) {
+            showToast('⏱️ Нажмите СТАРТ, чтобы начать упражнение');
+            return;
+        }
+        
+        if (completedSets < totalSets) {
+            showToast(`⏱️ Выполнено ${completedSets} из ${totalSets} подходов. Завершите все подходы.`);
+            return;
+        }
+        
+        sessionCompleted.add(sessionCurrentIndex);
+        renderSessionProgress();   // ★ обновляем полоски СРАЗУ
+        const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+        if (isLast) {
+            finishTrainingSession();
+        } else {
+            startRest();
+        }
+        return;
+    }
+    
+    // ★★★ 2. ОБЫЧНОЕ УПРАЖНЕНИЕ (ПОДХОДЫ × ПОВТОРЕНИЯ) ★★★
+    const completedSets = sessionCompletedSets[key] || 0;
+    const totalSets = parseInt(currentEx?.sets) || 0;
+    
+    // ★★★ ЕСЛИ 0 ПОДХОДОВ — СПРАШИВАЕМ, НЕ ЗАСЧИТЫВАЕМ АВТОМАТИЧЕСКИ ★★★
+    if (completedSets === 0) {
+        showConfirmModal(
+            'Упражнение не выполнено',
+            `Вы не выполнили ни одного подхода. Засчитать как выполненное?`,
+            function() {
+                sessionCompletedSets[key] = totalSets;
+                sessionCompleted.add(sessionCurrentIndex);
+                renderSessionProgress();   // ★ обновляем полоски СРАЗУ
+                
+                if (currentSessionId && sessionData) {
+                    updateCoopProgress(sessionCompleted.size, false);
+                }
+                
+                const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+                if (isLast) {
+                    finishTrainingSession();
+                } else {
+                    startRest();
+                }
+            },
+            'Засчитать'
+        );
+        return;
+    }
+    
+    // Если есть выполненные подходы, но не все
+    if (completedSets > 0 && completedSets < totalSets) {
+        showConfirmModal(
+            'Упражнение не завершено',
+            `Вы выполнили ${completedSets} из ${totalSets} подходов. Засчитать как выполненное?`,
+            function() {
+                sessionCompletedSets[key] = totalSets;
+                sessionCompleted.add(sessionCurrentIndex);
+                renderSessionProgress();   // ★ обновляем полоски СРАЗУ
+                
+                if (currentSessionId && sessionData) {
+                    updateCoopProgress(sessionCompleted.size, false);
+                }
+                
+                const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+                if (isLast) {
+                    finishTrainingSession();
+                } else {
+                    startRest();
+                }
+            },
+            'Засчитать'
+        );
+        return;
+    }
+    
+    // ★★★ ВСЕ ПОДХОДЫ ВЫПОЛНЕНЫ ★★★
+    sessionCompleted.add(sessionCurrentIndex);
+    renderSessionProgress();   // ★ обновляем полоски СРАЗУ
+    
+    if (currentSessionId && sessionData) {
+        updateCoopProgress(sessionCompleted.size, false);
+    }
+    
+    const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+    if (isLast) {
+        finishTrainingSession();
+    } else {
+        startRest();
+    }
+}
+
+// ===================ТАЙМЕР ===================
+function startSessionTimer() {
+    if (sessionTimerInterval) return;
+    isSessionPaused = false;
+    sessionTimerInterval = setInterval(() => {
+        if (isSessionPaused) return;      // ← не считаем, пока пауза
+        sessionSeconds++;
+        updateSessionTimerDisplay();
+        savePersonalTrainingSession();
+    }, 1000);
+}
+
+function stopSessionTimer() {
+    if (sessionTimerInterval) {
+        clearInterval(sessionTimerInterval);
+        sessionTimerInterval = null;
+    }
+    if (restTimerInterval) {
+        clearInterval(restTimerInterval);
+        restTimerInterval = null;
+        isResting = false;
+        // Восстанавливаем вид
+        const bgText = document.querySelector('.session-bg-text');
+        const restTimer = document.getElementById('sessionRestTimer');
+        const restControls = document.getElementById('sessionRestControls');
+        
+        if (bgText) bgText.style.display = 'block';
+        if (restTimer) restTimer.style.display = 'none';
+        // ★★★ СКРЫВАЕМ КНОПКИ УПРАВЛЕНИЯ (УБИРАЕМ КЛАСС visible) ★★★
+        if (restControls) {
+            restControls.classList.remove('visible');
+                    // ★★★ СКРЫВАЕМ ПОДСКАЗКУ ★★★
+        const hint = document.getElementById('sessionNextExerciseHint');
+        if (hint) hint.style.display = 'none';
+        }
+    }
+
+    // ★★★ СБРАСЫВАЕМ ПАУЗУ ★★★
+    isSessionPaused = false;
+    window._resumeExerciseTimerAfterPause = false;
+
+    // Скрываем оверлей паузы, если он был открыт
+    const pauseOverlay = document.getElementById('sessionPauseOverlay');
+    if (pauseOverlay) pauseOverlay.classList.remove('visible');
+
+    // Останавливаем таймер упражнения, если он вдруг ещё крутится
+    if (exerciseTimerInterval) {
+        clearInterval(exerciseTimerInterval);
+        exerciseTimerInterval = null;
+    }
+    isExerciseTimerRunning = false;
+
+    // в конце stopSessionTimer()
+const pauseTime = document.getElementById('sessionPauseTime');
+if (pauseTime) pauseTime.textContent = '00:00';
+}
+
+function updateSessionTimerDisplay() {
+    const mins = String(Math.floor(sessionSeconds / 60)).padStart(2, '0');
+    const secs = String(sessionSeconds % 60).padStart(2, '0');
+    document.getElementById('sessionTimer').textContent = `${mins}:${secs}`;
+}
+
+function updatePauseOverlayTime() {
+    const el = document.getElementById('sessionPauseTime');
+    if (!el) return;
+    const mins = String(Math.floor(sessionSeconds / 60)).padStart(2, '0');
+    const secs = String(sessionSeconds % 60).padStart(2, '0');
+    el.textContent = `${mins}:${secs}`;
+}
+
+// ===================КНОПКИ СЕССИИ ===================
+document.getElementById('sessionPrevBtn')?.addEventListener('click', goToPrevExercise);
+document.getElementById('sessionNextBtn')?.addEventListener('click', goToNextExercise);
+document.getElementById('sessionMainBtn')?.addEventListener('click', function() {
+    if (isResting) {
+        skipRest();
+        return;
+    }
+    
+    // ★★★ ЕСЛИ ВРЕМЕННОЕ УПРАЖНЕНИЕ ★★★
+    if (isTimedExercise) {
+        handleTimedExerciseClick();
+        return;
+    }
+    
+    // ★★★ ОБЫЧНОЕ УПРАЖНЕНИЕ (ПОВТОРЕНИЯ) ★★★
+    markCurrentComplete();
+});
+
+// ★★★ ПАУЗА ★★★
+document.getElementById('sessionPauseBtn')?.addEventListener('click', pauseSession);
+document.getElementById('sessionPauseResumeBtn')?.addEventListener('click', resumeSession);
+
+function handleTimedExerciseClick() {
+    const timerEl = document.getElementById('sessionExerciseTimer');
+    const mainBtn = document.getElementById('sessionMainBtn');
+    
+    if (!isExerciseTimerRunning) {
+        // ЗАПУСКАЕМ ТАЙМЕР
+        if (exerciseTimeLeft <= 0) {
+            exerciseTimeLeft = exerciseTotalTime;
+        }
+        isExerciseTimerRunning = true;
+        mainBtn.textContent = 'СТОП';
+        startExerciseTimer();
+    } else {
+        // ОСТАНАВЛИВАЕМ ТАЙМЕР
+        isExerciseTimerRunning = false;
+        mainBtn.textContent = 'СТАРТ';
+        if (exerciseTimerInterval) {
+            clearInterval(exerciseTimerInterval);
+            exerciseTimerInterval = null;
+        }
+    }
+}
+
+// Добавьте в консоль браузера для проверки
+function debugXP() {
+    console.log('=== DEBUG XP ===');
+    console.log('sessionExercises:', sessionExercises);
+    console.log('sessionCompletedSets:', sessionCompletedSets);
+    console.log('sessionCompleted:', sessionCompleted);
+    console.log('sessionCurrentIndex:', sessionCurrentIndex);
+    
+    // Рассчитать XP
+    const xp = calculateWorkoutXp(sessionExercises, sessionCompletedSets);
+    console.log('Total XP:', xp);
+    return xp;
+}
+
+function startExerciseTimer() {
+    if (exerciseTimerInterval) {
+        clearInterval(exerciseTimerInterval);
+        exerciseTimerInterval = null;
+    }
+    
+exerciseTimerInterval = setInterval(() => {
+    exerciseTimeLeft--;
+    updateExerciseTimerDisplay();
+    savePersonalTrainingSession();
+    
+    if (exerciseTimeLeft === 3) {
+        soundCountdown.currentTime = 0;
+        soundCountdown.play().catch(() => {});
+    }
+    
+    if (exerciseTimeLeft <= 0) {
+            // ★★★ ПОДХОД ЗАВЕРШЁН ★★★
+            clearInterval(exerciseTimerInterval);
+            exerciseTimerInterval = null;
+            isExerciseTimerRunning = false;
+            
+            // Уменьшаем количество подходов
+            exerciseCurrentSet--;
+            
+            // ★★★ СОХРАНЯЕМ КОЛИЧЕСТВО ВЫПОЛНЕННЫХ ПОДХОДОВ ★★★
+            const key = sessionCurrentIndex;
+            if (!sessionCompletedSets[key]) {
+                sessionCompletedSets[key] = 0;
+            }
+            sessionCompletedSets[key] = sessionCompletedSets[key] + 1;
+            savePersonalTrainingSession();
+            
+            console.log('✅ Подход завершён! sessionCompletedSets:', sessionCompletedSets);
+            
+            const setCurrent = document.getElementById('sessionSetCurrent');
+            if (setCurrent) {
+                setCurrent.textContent = exerciseCurrentSet;
+            }
+            
+            if (exerciseCurrentSet > 0) {
+                // Ещё есть подходы
+                exerciseTimeLeft = exerciseTotalTime;
+                document.getElementById('sessionMainBtn').textContent = 'СТАРТ';
+                updateExerciseTimerDisplay();
+            } else {
+                // ★★★ ВСЕ ПОДХОДЫ ВЫПОЛНЕНЫ ★★★
+                sessionCompleted.add(sessionCurrentIndex);
+                 renderSessionProgress();
+                console.log('✅ Все подходы выполнены! Упражнение завершено.');
+                
+                const timerEl = document.getElementById('sessionExerciseTimer');
+                if (timerEl) {
+                    timerEl.style.display = 'none';
+                }
+                
+                const setCounter = document.getElementById('sessionSetCounter');
+                if (setCounter) {
+                    setCounter.style.display = 'none';
+                }
+                
+                const isLast = sessionCurrentIndex === sessionExercises.length - 1;
+                if (isLast) {
+                    finishTrainingSession();
+                } else {
+                    startRest();
+                }
+            }
+        }
+    }, 1000);
+}
+
+function updateExerciseTimerDisplay() {
+    const timerEl = document.getElementById('sessionExerciseTimer');
+    if (!timerEl) return;
+    
+    const mins = String(Math.floor(exerciseTimeLeft / 60)).padStart(2, '0');
+    const secs = String(exerciseTimeLeft % 60).padStart(2, '0');
+    timerEl.textContent = `${mins}:${secs}`;
+}
+
+// ★★★ КОРРЕКТИРОВКА ВРЕМЕНИ ОТДЫХА ★★★
+function adjustRestTime(seconds) {
+    if (!isResting) {
+        showToast('⏳ Отдых не активен');
+        return;
+    }
+    
+    // Вычисляем новое время
+    let newTime = restSeconds + seconds;
+    
+    // Ограничиваем минимальное и максимальное время
+    if (newTime < 5) {
+        newTime = 5;
+        return;
+    }
+    if (newTime > 300) {
+        newTime = 300;
+        showToast('⏳ Максимум 5 минут');
+        return;
+    }
+    
+    // Обновляем время
+    restSeconds = newTime;
+    restEndsAt = Date.now() + restSeconds * 1000;
+    savePersonalTrainingSession();
+    
+    // Обновляем отображение таймера
+    const restTimer = document.getElementById('sessionRestTimer');
+    if (restTimer) {
+        restTimer.textContent = formatTime(restSeconds);
+    }
+    
+    // Показываем тост с новым временем
+}
+
+// ===================КРЕСТИК СЕССИИ ===================
+document.getElementById('sessionCloseBtn')?.addEventListener('click', function() {
+    const total = sessionExercises.length;
+    const completed = sessionCompleted.size;
+    const mins = String(Math.floor(sessionSeconds / 60)).padStart(2, '0');
+    const secs = String(sessionSeconds % 60).padStart(2, '0');
+    
+    // ★★★ РАССЧИТЫВАЕМ XP НА ОСНОВЕ ВСЕХ ВЫПОЛНЕННЫХ ПОДХОДОВ ★★★
+    let xpDisplay = '0 XP';
+    
+    // Проверяем, есть ли хоть один выполненный подход
+    let hasAnyCompletedSets = false;
+    for (const key in sessionCompletedSets) {
+        if (sessionCompletedSets[key] > 0) {
+            hasAnyCompletedSets = true;
+            break;
+        }
+    }
+    
+    if (hasAnyCompletedSets) {
+        const xpEarned = calculateWorkoutXp(sessionExercises, sessionCompletedSets);
+        xpDisplay = (isNaN(xpEarned) ? 0 : xpEarned).toFixed(1) + ' XP';
+    }
+
+    document.getElementById('sessionExitTitle').textContent = 'ТРЕНИРОВКА';
+    document.getElementById('exitExercises').textContent = `${completed}/${total}`;
+    document.getElementById('exitMinutes').textContent = `${mins}:${secs}`;
+    document.getElementById('exitXp').textContent = `+${xpDisplay}`;
+    
+    openModal('sessionExitModal');
+});
+
+document.getElementById('exitContinueBtn')?.addEventListener('click', function() {
+    closeModal('sessionExitModal');
+});
+
+document.getElementById('exitFinishBtn')?.addEventListener('click', function() {
+    closeModal('sessionExitModal');
+
+    // Для совместной тренировки оставляем прежнюю логику.
+    if (currentSessionId && sessionData) {
+        stopSessionTimer();
+        finishTrainingSession();
+        return;
+    }
+
+    // Личная тренировка сохраняется, но не засчитывается как завершённая.
+    savePersonalTrainingSession();
+    if (sessionTimerInterval) { clearInterval(sessionTimerInterval); sessionTimerInterval = null; }
+    if (restTimerInterval) { clearInterval(restTimerInterval); restTimerInterval = null; }
+    if (exerciseTimerInterval) { clearInterval(exerciseTimerInterval); exerciseTimerInterval = null; }
+    window.navigateTo('workouts');
+    showToast('Прогресс тренировки сохранён');
+});
+
+// ===================БЫСТРОЕ РЕДАКТИРОВАНИЕ УПРАЖНЕНИЯ ===================
+function openQuickEditModal(index) {
+    _quickEditIndex = index;
+
+    const ex = _quickEditExercises[index];
+    if (!ex) return;
+
+    document.getElementById('quickEditSets').value = ex.sets || 3;
+
+    const repsStr = String(ex.reps || '');
+    const isSeconds = repsStr.includes('сек') || repsStr.includes('с') || repsStr.includes('Секунд');
+    let repsValue = parseInt(repsStr.replace(/[^0-9.]/g, '')) || 12;
+    if (isNaN(repsValue) || repsValue < 1) repsValue = 12;
+    if (repsValue > 60) repsValue = 60;
+    document.getElementById('quickEditReps').value = repsValue;
+
+    const label = document.getElementById('quickEditRepsLabel');
+    if (label) label.textContent = isSeconds ? 'Секунды' : 'Повторения';
+
+    document.querySelectorAll('#quickEditModal input').forEach(inp => {
+        inp.classList.remove('error');
+    });
+
+    openModal('quickEditModal');
+}
+
+document.getElementById('quickEditSaveBtn')?.addEventListener('click', function() {
+    if (_quickEditIndex === null || !_quickEditExercises) {
+        showToast('⚠️ Ошибка: упражнение не найдено');
+        return;
+    }
+
+    const sets = document.getElementById('quickEditSets').value.trim();
+    const reps = document.getElementById('quickEditReps').value.trim();
+    const setsInput = document.getElementById('quickEditSets');
+    const repsInput = document.getElementById('quickEditReps');
+
+    [setsInput, repsInput].forEach(inp => inp.classList.remove('error'));
+    let hasError = false;
+    let errorMessage = '';
+
+    if (!sets || parseInt(sets) < 1 || parseInt(sets) > 5) {
+        setsInput.classList.add('error');
+        hasError = true;
+        errorMessage = 'Подходы должны быть от 1 до 5';
+    }
+    if (!reps || parseInt(reps) < 1 || parseInt(reps) > 60) {
+        repsInput.classList.add('error');
+        hasError = true;
+        if (!errorMessage) errorMessage = 'Повторения должны быть от 2 до 60';
+    }
+    if (hasError) {
+        showToast('⚠️ ' + errorMessage);
+        return;
+    }
+
+    const label = document.getElementById('quickEditRepsLabel');
+    const isSeconds = label ? label.textContent === 'Секунды' : false;
+    const repsDisplay = isSeconds ? `${reps} секунд` : `${reps}`;
+
+    _quickEditExercises[_quickEditIndex] = {
+        ..._quickEditExercises[_quickEditIndex],
+        sets: parseInt(sets),
+        reps: repsDisplay
+    };
+
+    if (_quickEditIsCustom) {
+        const allWorkouts = getMyWorkouts();
+        const index = allWorkouts.findIndex(w => w._id === _quickEditWorkoutId);
+        if (index !== -1) {
+            allWorkouts[index].exercises = _quickEditExercises;
+            saveMyWorkouts(allWorkouts);
+        }
+    } else {
+        let saved = false;
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][_quickEditCategory]) {
+                const levelData = exercisesData[parent][_quickEditCategory][_quickEditLevel];
+                if (levelData) {
+                    if (typeof levelData === 'object' && !Array.isArray(levelData) && levelData._exercises) {
+                        levelData._exercises = _quickEditExercises;
+                    } else if (Array.isArray(levelData)) {
+                        exercisesData[parent][_quickEditCategory][_quickEditLevel] = _quickEditExercises;
+                    }
+                    saved = true;
+                    break;
+                }
+            }
+        }
+        if (saved) saveExercisesData();
+    }
+
+    closeModal('quickEditModal');
+    const editedIndex = _quickEditIndex;
+    _quickEditIndex = null;
+
+    const infoDiv = document.querySelector(`#exercise-${editedIndex} .item-info`);
+    if (infoDiv) {
+        const p = infoDiv.querySelector('.item-desc');
+        if (p) {
+            p.textContent = `${formatSets(sets)} × ${formatReps(repsDisplay)}`;
+        }
+    }
+
+    showToast('✅ Упражнение обновлено');
+});
+
+document.getElementById('quickEditCancelBtn')?.addEventListener('click', function() {
+    closeModal('quickEditModal');
+    _quickEditIndex = null;
+});
+
+// ===================ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РЕДАКТИРОВАНИЯ ===================
+function getExercisesForEdit(category, level, isCustom, id) {
+    // Личные тренировки
+    if (isCustom && id && id !== 'new') {
+        const workout = getWorkoutById(id);
+        if (workout) return JSON.parse(JSON.stringify(workout.exercises || []));
+        return [];
+    }
+
+    // Готовые тренировки
+    if (!isCustom) {
+        const targetLevel = level || '1 LVL';
+        let levelData = null;
+
+        // Ищем levelData в структуре exercisesData
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][category]) {
+                levelData = exercisesData[parent][category][targetLevel];
+                if (levelData) break;
+            }
+        }
+        if (!levelData && exercisesData[category] && exercisesData[category][targetLevel]) {
+            levelData = exercisesData[category][targetLevel];
+        }
+
+        if (levelData) {
+            // ★ 1. Старый формат — просто массив
+            if (Array.isArray(levelData)) {
+                return JSON.parse(JSON.stringify(levelData));
+            }
+
+            // ★ 2. Пользовательское переопределение с _exercises
+            if (levelData._exercises) {
+                return JSON.parse(JSON.stringify(levelData._exercises));
+            }
+
+            // ★ 3. Новый адаптивный формат — собираем по инвентарю
+            if (typeof levelData === 'object') {
+                const userInventory = getUserInventoryFromStorage();
+                const built = buildWorkoutForUser(levelData, userInventory);
+                return JSON.parse(JSON.stringify(built));
+            }
+        }
+    }
+
+    return [];
+}
+
+function saveWorkoutData(category, level, isCustom, id, title, icon, exercises) {
+    // ★★★ ПОЛУЧАЕМ ВРЕМЯ ОТДЫХА ИЗ АКТИВНОЙ КНОПКИ ★★★
+    const activeBtn = document.querySelector('.rest-time-btn.rest-time-active');
+    const restTime = activeBtn ? parseInt(activeBtn.dataset.seconds) : 30;
+    
+    const exercisesToSave = editExercises;
+    
+    if (isCustom || id === 'new') {
+        const allWorkouts = getMyWorkouts();
+        const isDuplicate = allWorkouts.some(w => w._id !== id && w.title.toLowerCase() === title.toLowerCase());
+        if (isDuplicate) {
+            showConfirmModal(
+                'Тренировка с таким названием уже существует',
+                'Сохранить с дубликатом?',
+                function() {},
+                'Да, сохранить'
+            );
+        }
+        if (id === 'new') {
+            // ★★★ ГЕНЕРИРУЕМ ID ЗДЕСЬ И ВОЗВРАЩАЕМ ЕГО ★★★
+            const newId = Date.now().toString();
+            const newWorkout = {
+                _id: newId,
+                title: title,
+                icon: icon,
+                exercises: exercisesToSave,
+                restTime: restTime
+            };
+            const workouts = getMyWorkouts();
+            workouts.push(newWorkout);
+            saveMyWorkouts(workouts);
+            
+            if (!tasks[3]) {
+                tasks[3] = true;
+                saveTasks();
+                updateTasksUI();
+                showToast('✅ Задание "Индивидуальность" выполнено!');
+                addTaskXp();
+            }
+            
+            localStorage.removeItem('temp_edit_name');
+            localStorage.removeItem('temp_edit_exercises');
+            localStorage.removeItem('temp_edit_category');
+            localStorage.removeItem('temp_edit_level');
+            localStorage.removeItem('temp_edit_isCustom');
+            localStorage.removeItem('temp_edit_id');
+            localStorage.removeItem('temp_edit_icon');
+            localStorage.removeItem('temp_edit_rest_time');
+            
+            // ★★★ ВОЗВРАЩАЕМ ОБЪЕКТ С ID ★★★
+            return { success: true, id: newId };
+        } else {
+            const allWorkouts = getMyWorkouts();
+            const index = allWorkouts.findIndex(w => w._id === id);
+            if (index !== -1) {
+                allWorkouts[index] = {
+                    ...allWorkouts[index],
+                    title: title,
+                    icon: icon,
+                    exercises: exercisesToSave,
+                    restTime: restTime
+                };
+                saveMyWorkouts(allWorkouts);
+            }
+            
+            localStorage.removeItem('temp_edit_name');
+            localStorage.removeItem('temp_edit_exercises');
+            localStorage.removeItem('temp_edit_category');
+            localStorage.removeItem('temp_edit_level');
+            localStorage.removeItem('temp_edit_isCustom');
+            localStorage.removeItem('temp_edit_id');
+            localStorage.removeItem('temp_edit_icon');
+            localStorage.removeItem('temp_edit_rest_time');
+            
+            return { success: true, id: id };
+        }
+    } else {
+        const targetLevel = level || '1 LVL';
+        let saved = false;
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][category]) {
+                if (exercisesData[parent][category][targetLevel]) {
+                    if (Array.isArray(exercisesData[parent][category][targetLevel])) {
+                        exercisesData[parent][category][targetLevel] = {
+                            _title: title,
+                            _exercises: JSON.parse(JSON.stringify(exercisesToSave)),
+                            _restTime: restTime
+                        };
+                    } else {
+                        exercisesData[parent][category][targetLevel]._title = title;
+                        exercisesData[parent][category][targetLevel]._exercises = JSON.parse(JSON.stringify(exercisesToSave));
+                        exercisesData[parent][category][targetLevel]._restTime = restTime;
+                    }
+                    saved = true;
+                    break;
+                }
+            }
+        }
+        if (!saved) {
+            if (exercisesData[category] && exercisesData[category][targetLevel]) {
+                if (Array.isArray(exercisesData[category][targetLevel])) {
+                    exercisesData[category][targetLevel] = {
+                        _title: title,
+                        _exercises: JSON.parse(JSON.stringify(exercisesToSave)),
+                        _restTime: restTime
+                    };
+                } else {
+                    exercisesData[category][targetLevel]._title = title;
+                    exercisesData[category][targetLevel]._exercises = JSON.parse(JSON.stringify(exercisesToSave));
+                    exercisesData[category][targetLevel]._restTime = restTime;
+                }
+                saved = true;
+            }
+        }
+        if (saved) {
+            saveExercisesData();
+            localStorage.removeItem('temp_edit_rest_time');
+            return { success: true };
+        }
+        showToast('❌ Ошибка: категория "' + category + '" не найдена');
+        return { success: false };
+    }
+}
+
+// ★★★ ОБНОВЛЕНИЕ UI ВРЕМЕНИ ОТДЫХА ★★★
+function updateRestTimeUI(seconds) {
+    document.querySelectorAll('.rest-time-btn').forEach(btn => {
+        const val = parseInt(btn.dataset.seconds);
+        btn.classList.toggle('rest-time-active', val === seconds);
+    });
+    
+    // Сохраняем в глобальную переменную
+    sessionRestSeconds = seconds;
+}
+
+// ★★★ ИНИЦИАЛИЗАЦИЯ ОБРАБОТЧИКОВ КНОПОК ВРЕМЕНИ ОТДЫХА ★★★
+function initRestTimePicker() {
+    const buttons = document.querySelectorAll('.rest-time-btn');
+    
+    buttons.forEach((btn) => {
+        // Убираем старые обработчики
+        const oldHandler = btn._restTimeHandler;
+        if (oldHandler) {
+            btn.removeEventListener('click', oldHandler);
+        }
+        
+        // Создаём новый обработчик
+        const handler = function(e) {
+            e.stopPropagation();
+            const seconds = parseInt(this.dataset.seconds);
+            
+            // Обновляем UI
+            document.querySelectorAll('.rest-time-btn').forEach(b => {
+                b.classList.remove('rest-time-active');
+            });
+            this.classList.add('rest-time-active');
+            
+            // Сохраняем в глобальную переменную
+            sessionRestSeconds = seconds;
+            
+            // ★★★ СОХРАНЯЕМ ТОЛЬКО В localStorage КАК ВРЕМЕННОЕ ЗНАЧЕНИЕ ★★★
+            localStorage.setItem('temp_edit_rest_time', String(seconds));
+        };
+        
+        // Сохраняем обработчик
+        btn._restTimeHandler = handler;
+        btn.addEventListener('click', handler);
+    });
+}
+
+function loadEditPage(category, isCustom, id, level, exercises) {
+    isEditingWorkout = true;
+    editCategory = category;
+    editIsCustom = isCustom;
+    editWorkoutId = id;
+    editLevel = level || '1 LVL';
+
+    // ★★★ УНИЧТОЖАЕМ СТАРЫЙ SORTABLE ★★★
+    destroyEditSortable();
+
+    const iconPickerBlock = document.getElementById('iconPickerBlock');
+    if (iconPickerBlock) {
+        if (isCustom || id === 'new') {
+            iconPickerBlock.style.display = 'block';
+        } else {
+            iconPickerBlock.style.display = 'none';
+        }
+    }
+
+    let savedName = null;
+    let savedIcon = null;
+    
+    if (isCustom || id === 'new') {
+        savedName = localStorage.getItem('temp_edit_name');
+        savedIcon = localStorage.getItem('temp_edit_icon');
+    } else {
+        localStorage.removeItem('temp_edit_name');
+        localStorage.removeItem('temp_edit_exercises');
+        localStorage.removeItem('temp_edit_category');
+        localStorage.removeItem('temp_edit_level');
+        localStorage.removeItem('temp_edit_isCustom');
+        localStorage.removeItem('temp_edit_id');
+        localStorage.removeItem('temp_edit_icon');
+        localStorage.removeItem('temp_edit_rest_time');
+    }
+
+    if (!exercises || exercises.length === 0) {
+        if (isCustom || id === 'new') {
+            const saved = localStorage.getItem('temp_edit_exercises');
+            if (saved) {
+                const parsed = JSON.parse(saved);
+                const savedCategory = localStorage.getItem('temp_edit_category');
+                const savedLevel = localStorage.getItem('temp_edit_level');
+                if (savedCategory === category && savedLevel === level) {
+                    exercises = parsed;
+                }
+            }
+        }
+    }
+
+    const titleEl = document.getElementById('editTitle');
+    if (titleEl) {
+        titleEl.textContent = (id === 'new') ? 'СОЗДАНИЕ ТРЕНИРОВКИ' : 'РЕДАКТИРОВАТЬ';
+    }
+    const resetBtn = document.getElementById('resetWorkoutBtn');
+    if (resetBtn) resetBtn.style.display = (isCustom || id === 'new') ? 'none' : 'block';
+
+    const iconPicker = document.querySelector('.edit-header-block .icon-picker');
+    const iconPickerLabel = document.querySelector('.edit-header-block label[for="iconPicker"]');
+    if (iconPicker) {
+        if (isCustom || id === 'new') {
+            iconPicker.style.display = 'flex';
+            if (iconPickerLabel) iconPickerLabel.style.display = 'block';
+        } else {
+            iconPicker.style.display = 'none';
+            if (iconPickerLabel) iconPickerLabel.style.display = 'none';
+        }
+    }
+
+    const nameInput = document.getElementById('editWorkoutName');
+    if (nameInput) {
+        if (savedName) {
+            nameInput.value = savedName;
+        } else if (isCustom && id && id !== 'new') {
+            const workout = getWorkoutById(id);
+            if (workout) nameInput.value = workout.title || category;
+        } else if (!isCustom) {
+            let savedTitle = '';
+            for (const parent in exercisesData) {
+                if (exercisesData[parent] && exercisesData[parent][category]) {
+                    const levelData = exercisesData[parent][category][editLevel];
+                    if (levelData && levelData._title) {
+                        savedTitle = levelData._title;
+                        break;
+                    }
+                }
+            }
+            if (!savedTitle && exercisesData[category] && exercisesData[category][editLevel] && exercisesData[category][editLevel]._title) {
+                savedTitle = exercisesData[category][editLevel]._title;
+            }
+            nameInput.value = savedTitle || (category + ' ' + editLevel);
+        } else {
+            const workouts = getMyWorkouts();
+            nameInput.value = 'Тренировка №' + (workouts.length + 1);
+        }
+    }
+
+    // ★★★ ВСТАВЬ СЮДА ★★★
+    if (nameInput && !nameInput._nameHandler) {
+        const handler = function() {
+            if (editIsCustom || editWorkoutId === 'new') {
+                localStorage.setItem('temp_edit_name', this.value);
+            }
+        };
+        nameInput._nameHandler = handler;
+        nameInput.addEventListener('input', handler);
+    }
+
+    if (exercises && exercises.length > 0) {
+        editExercises = exercises;
+    } else {
+        editExercises = getExercisesForEdit(category, editLevel, isCustom, id);
+    }
+    
+    // ★★★ ПРИМЕНЯЕМ СОХРАНЁННЫЙ ПОРЯДОК ★★★
+    const workoutIdForOrder = (isCustom || id === 'new') ? (id || 'temp_' + Date.now()) : (category + '_' + editLevel);
+    editExercises = applySavedOrder(editExercises, workoutIdForOrder);
+
+    if (isCustom || id === 'new') {
+        const defaultIconMap = {
+            'Руки': 'bodybuilding', 'Плечи': 'shoulder', 'Пресс': 'press',
+            'Грудь': 'breast', 'Спина': 'back', 'Ноги': 'legs',
+            'Всё тело': 'WholeBody', 'Кардио': 'cardio', 'Растяжка': 'stretching',
+            'Зарядка': 'charging', 'Пилатес': 'Pilates', 'Кроссфит': 'crossfit',
+            'Мужская сила': 'men', 'Женское счастье': 'woman',
+            'Растяжка позвоночника': 'stretching'
+        };
+        
+        let iconToSet = savedIcon;
+        if (!iconToSet) {
+            if (id && id !== 'new') {
+                const workout = getWorkoutById(id);
+                if (workout && workout.icon) {
+                    iconToSet = workout.icon;
+                }
+            }
+if (!iconToSet) {
+    iconToSet = defaultIconMap[category] || 'bodybuilding';
+}
+        }
+        
+// ★ Скоупим на пикер редактора — фильтр и универсальный пикер не трогаем
+document.querySelectorAll('#createExerciseIconPicker .icon-option').forEach(el => {
+    el.classList.toggle('icon-option-active', el.dataset.icon === iconToSet);
+});
+
+// ★ Не сохраняем "null" / "undefined" — только реальный ID иконки
+if (iconToSet && iconToSet !== 'null' && iconToSet !== 'undefined') {
+    localStorage.setItem('temp_edit_icon', iconToSet);
+} else {
+    localStorage.removeItem('temp_edit_icon');
+}
+    }
+
+    let savedRestTime = null;
+
+    if (isCustom || id === 'new') {
+        savedRestTime = localStorage.getItem('temp_edit_rest_time');
+        if (!savedRestTime && id && id !== 'new') {
+            const workout = getWorkoutById(id);
+            if (workout && workout.restTime) {
+                savedRestTime = String(workout.restTime);
+                localStorage.setItem('temp_edit_rest_time', savedRestTime);
+            }
+        }
+    } else {
+        let found = false;
+        for (const parent in exercisesData) {
+            if (exercisesData[parent] && exercisesData[parent][category]) {
+                const levelData = exercisesData[parent][category][editLevel];
+                if (levelData && levelData._restTime) {
+                    savedRestTime = String(levelData._restTime);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found && exercisesData[category] && exercisesData[category][editLevel]) {
+            const levelData = exercisesData[category][editLevel];
+            if (levelData && levelData._restTime) {
+                savedRestTime = String(levelData._restTime);
+            }
+        }
+    }
+
+    const restTime = savedRestTime ? parseInt(savedRestTime) : 30;
+    updateRestTimeUI(restTime);
+
+    setTimeout(() => {
+        initRestTimePicker();
+        updateRestTimeUI(restTime);
+    }, 200);
+
+    // ★★★ РЕНДЕРИМ И ИНИЦИАЛИЗИРУЕМ SORTABLE ★★★
+    setTimeout(() => {
+        renderEditExercises();
+        setTimeout(() => {
+            if (editExercises.length > 1) {
+                initEditSortable();
+            }
+        }, 300);
+    }, 300);
+}
+
+// ===================ВЫБОР ЗНАЧКА (ТОЛЬКО В РЕДАКТОРЕ ТРЕНИРОВКИ) ===================
+document.querySelectorAll('#createExerciseIconPicker .icon-option').forEach(el => {
+    el.addEventListener('click', function() {
+        // ★ Сбрасываем активность ТОЛЬКО внутри этого пикера
+        document.querySelectorAll('#createExerciseIconPicker .icon-option').forEach(e => 
+            e.classList.remove('icon-option-active')
+        );
+        this.classList.add('icon-option-active');
+        
+        // ★ Сохраняем ТОЛЬКО если у иконки реально есть data-icon
+        if (this.dataset.icon && (editIsCustom || editWorkoutId === 'new')) {
+            localStorage.setItem('temp_edit_icon', this.dataset.icon);
+        }
+    });
+});
+
+// =================== SORTABLE ДЛЯ УПРАЖНЕНИЙ В РЕДАКТИРОВАНИИ ===================
+
+let editSortableInstance = null;
+
+function initEditSortable() {
+    const container = document.getElementById('editExercisesContainer');
+    if (!container) return;
+    
+    const items = container.querySelectorAll('.edit-exercise-item');
+    if (items.length < 2) return;
+    if (editSortableInstance) return;
+    
+    editSortableInstance = new Sortable(container, {
+        animation: 150,
+        handle: '.edit-drag-handle',
+        ghostClass: 'sortable-ghost',
+        chosenClass: 'sortable-chosen',
+        forceFallback: true,
+        delay: 200,
+        delayOnTouchOnly: true,
+        touchStartThreshold: 10,
+        scroll: true,
+        scrollSensitivity: 50,
+        scrollSpeed: 15,
+        onEnd: function(evt) {
+            // ★★★ ПОЛУЧАЕМ НОВЫЙ ПОРЯДОК ИЗ SORTABLE ★★★
+            const newOrder = this.toArray();
+            
+            // ★★★ ПЕРЕСТРАИВАЕМ МАССИВ СОГЛАСНО НОВОМУ ПОРЯДКУ ★★★
+            const oldExercises = [...editExercises];
+            editExercises = newOrder.map(id => {
+                const index = parseInt(id);
+                return oldExercises[index];
+            }).filter(ex => ex !== undefined);
+            
+            // ★★★ ОБНОВЛЯЕМ data-index У ВСЕХ ЭЛЕМЕНТОВ ★★★
+            const items = container.querySelectorAll('.edit-exercise-item');
+            items.forEach((item, index) => {
+                item.dataset.index = index;
+                const editBtn = item.querySelector('.edit-btn');
+                if (editBtn) {
+                    editBtn.setAttribute('onclick', `openEditExerciseModal(${index})`);
+                }
+                const deleteBtn = item.querySelector('.delete-btn');
+                if (deleteBtn) {
+                    deleteBtn.setAttribute('onclick', `removeEditExercise(${index})`);
+                }
+            });
+            
+            saveEditExercisesState();
+        }
+    });
+}
+
+function destroyEditSortable() {
+    if (editSortableInstance) {
+        editSortableInstance.destroy();
+        editSortableInstance = null;
+    }
+}
+
+function reinitEditSortable() {
+    destroyEditSortable();
+    setTimeout(initEditSortable, 50);
+}
+
+function renderEditExercisesSilent() {
+    const container = document.getElementById('editExercisesContainer');
+    if (!container) return;
+    
+    const validExercises = editExercises.filter(ex => ex !== null && ex !== undefined);
+    if (validExercises.length !== editExercises.length) {
+        editExercises = validExercises;
+        saveEditExercisesState();
+    }
+    
+    const maxExercises = getMaxExercisesForLevel(editLevel, editIsCustom);
+    const currentCount = editExercises.length;
+    
+    let headerHtml = `
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0rem; padding:0 0.2rem;">
+            <span class="section-title">Упражнения</span>
+            <span class="section-title0-10">${currentCount}/${maxExercises}</span>
+        </div>
+    `;
+    
+    if (editExercises.length === 0) {
+        container.innerHTML = headerHtml + `<div class="empty-state"><span class="empty-icon">📋</span><h3 class="empty-title">Нет упражнений</h3><p class="empty-text">Добавьте свое первое упражнение!</p></div>`;
+        destroyEditSortable();
+        return;
+    }
+    
+    const exercisesHtml = editExercises.map((ex, index) => {
+        const icon = ex.icon || getExerciseIcon(ex.name);
+        let detailsText = `${formatSets(ex.sets, true)} × ${formatReps(ex.reps, true)}`;
+        if (hasWeight(ex)) detailsText += ` · ${ex.weight} кг`;
+        return `
+            <div class="edit-exercise-item" data-index="${index}" data-id="${index}" style="cursor: grab; border: 2px dashed transparent;">
+                <div class="edit-drag-handle" touch-action="none"><span>☰</span></div>
+                <div class="item-icon">
+                    ${icon ? `<img src="images/${icon}.png" class="edit-exercise-icon">` : ''}
+                </div>
+                <div class="edit-exercise-info">
+                    <h4 class="edit-exercise-name">${ex.name}</h4>
+                    <p class="edit-exercise-details">${detailsText}</p>
+                </div>
+                <div class="edit-exercise-actions">
+                    <button class="edit-btn" onclick="openEditExerciseModal(${index})"><i class="fa-regular fa-pen-to-square"></i></button>
+                    <button class="delete-btn" onclick="removeEditExercise(${index})"><i class="fa-regular fa-trash-can"></i></button>
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    container.innerHTML = headerHtml + exercisesHtml;
+}
+
+// Ключ для сохранения порядка упражнений
+const EXERCISES_ORDER_KEY = 'sportapp_exercises_order';
+
+// Сохранить порядок упражнений
+function saveExercisesOrder(workoutId, order) {
+    const allOrders = JSON.parse(localStorage.getItem(EXERCISES_ORDER_KEY) || '{}');
+    allOrders[workoutId] = order;
+    localStorage.setItem(EXERCISES_ORDER_KEY, JSON.stringify(allOrders));
+}
+
+// Загрузить порядок упражнений
+function loadExercisesOrder(workoutId) {
+    const allOrders = JSON.parse(localStorage.getItem(EXERCISES_ORDER_KEY) || '{}');
+    return allOrders[workoutId] || null;
+}
+
+// Применить сохранённый порядок к массиву упражнений
+function applySavedOrder(exercises, workoutId) {
+    const savedOrder = loadExercisesOrder(workoutId);
+    if (!savedOrder || savedOrder.length === 0) return exercises;
+    if (savedOrder.length !== exercises.length) return exercises;
+    
+    const exerciseMap = {};
+    exercises.forEach((ex, index) => {
+        exerciseMap[index] = ex;
+    });
+    
+    const reordered = [];
+    savedOrder.forEach(oldIndex => {
+        if (exerciseMap[oldIndex] !== undefined) {
+            reordered.push(exerciseMap[oldIndex]);
+        }
+    });
+    
+    if (reordered.length !== exercises.length) {
+        exercises.forEach((ex, index) => {
+            if (!savedOrder.includes(index)) {
+                reordered.push(ex);
+            }
+        });
+    }
+    
+    return reordered;
+}
+
+function renderEditExercises() {
+    renderEditExercisesSilent();
+    if (editExercises.length > 1) {
+        setTimeout(() => {
+            destroyEditSortable();
+            setTimeout(initEditSortable, 50);
+        }, 50);
+    } else {
+        destroyEditSortable();
+    }
+}
+
+function saveEditExercisesState() {
+    if (editIsCustom || editWorkoutId === 'new') {
+        const nameInput = document.getElementById('editWorkoutName');
+        if (nameInput) localStorage.setItem('temp_edit_name', nameInput.value);
+        localStorage.setItem('temp_edit_exercises', JSON.stringify(editExercises));
+        localStorage.setItem('temp_edit_category', editCategory);
+        localStorage.setItem('temp_edit_level', editLevel);
+        localStorage.setItem('temp_edit_isCustom', editIsCustom);
+        localStorage.setItem('temp_edit_id', editWorkoutId || '');
+    } else {
+        saveExercisesData();
+    }
+}
+
+// =================== УПРАВЛЕНИЕ УПРАЖНЕНИЯМИ В РЕДАКТИРОВАНИИ ===================
+
+function openEditExerciseModal(index) {
+    if (index === undefined || index === null || !editExercises[index]) {
+        showToast('⚠️ Упражнение не найдено');
+        return;
+    }
+    openUniversalExerciseModal('edit', 'edit', index, editExercises, function(index, exercise) {
+        editExercises[index] = exercise;
+        renderEditExercises();
+        saveEditExercisesState();
+    });
+}
+window.openEditExerciseModal = openEditExerciseModal;
+
+window.addEditExercise = function() {
+    const maxExercises = getMaxExercisesForLevel(editLevel, editIsCustom);
+    if (editExercises.length >= maxExercises) {
+        showToast(`⚠️ Вы достигли максимума упражнений ${maxExercises}!`);
+        return;
+    }
+    editExercises.push({ name: 'Новое упражнение', sets: 3, reps: 12, weight: 0 });
+    renderEditExercises();
+    openEditExerciseModal(editExercises.length - 1);
+};
+
+window.removeEditExercise = function(index) {
+    showConfirmModal(
+        'Удалить упражнение?',
+        'Это действие нельзя отменить.',
+        function() {
+            editExercises.splice(index, 1);
+            renderEditExercises();
+            showToast('🗑️ Упражнение удалено');
+        },
+        'Удалить'
+    );
+};
+
+// ===================СОХРАНЕНИЕ И ОТМЕНА В РЕДАКТИРОВАНИИ ===================
+document.getElementById('saveEditBtn')?.addEventListener('click', function() {
+    // ★★★ УНИЧТОЖАЕМ SORTABLE ★★★
+    destroyEditSortable();
+    
+    if (!preventDoubleClick('saveEditBtn', 2000)) {
+        showToast('⏳ Подождите, сохранение уже выполняется...');
+        return;
+    }
+    
+    if (editExercises.length === 0) {
+        showToast('⚠️ Добавьте хотя бы одно упражнение');
+        return;
+    }
+    const nameInput = document.getElementById('editWorkoutName');
+    const title = nameInput ? nameInput.value.trim() : (editCategory || 'Моя тренировка');
+    if (!title) { showToast('⚠️ Введите название тренировки'); return; }
+const selectedIcon = document.querySelector('#createExerciseIconPicker .icon-option-active');
+let icon = (selectedIcon && selectedIcon.dataset.icon) ? selectedIcon.dataset.icon : null;
+if (!icon) {
+    const firstIcon = document.querySelector('#createExerciseIconPicker .icon-option');
+    if (firstIcon && firstIcon.dataset.icon) icon = firstIcon.dataset.icon;
+}
+    
+    // ★★★ ПОЛУЧАЕМ РЕЗУЛЬТАТ С ID ★★★
+    const result = saveWorkoutData(editCategory, editLevel, editIsCustom, editWorkoutId, title, icon, editExercises);
+    
+    if (result && result.success) {
+        isEditingWorkout = false;
+        
+        showToast('✅ Тренировка сохранена!');
+        localStorage.removeItem('temp_edit_name');
+        localStorage.removeItem('temp_edit_exercises');
+        localStorage.removeItem('temp_edit_category');
+        localStorage.removeItem('temp_edit_level');
+        localStorage.removeItem('temp_edit_isCustom');
+        localStorage.removeItem('temp_edit_id');
+        localStorage.removeItem('temp_edit_icon');
+        localStorage.removeItem('temp_edit_rest_time');
+        
+        // ★★★ ИСПОЛЬЗУЕМ ID ИЗ РЕЗУЛЬТАТА ★★★
+        if (editIsCustom || editWorkoutId === 'new') {
+            const id = result.id;
+            if (id) {
+                const workout = getWorkoutById(id);
+                if (workout) {
+                    // ★★★ ОБНОВЛЯЕМ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ПЕРЕД ПЕРЕХОДОМ ★★★
+                    currentCategory = workout.title;
+                    currentIsCustom = true;
+                    currentWorkoutId = id;
+                    currentLevel = editLevel;
+                    
+                    window.navigateTo('workout-detail', { 
+                        category: workout.title, 
+                        isCustom: true, 
+                        id: id,
+                        level: editLevel
+                    });
+                    return;
+                }
+            }
+            // Fallback
+            window.navigateTo('workouts');
+            return;
+        }
+        window.navigateTo('workout-detail', { category: editCategory, level: editLevel, parentCategory: '' });
+    }
+});
+
+document.getElementById('cancelEditBtn')?.addEventListener('click', function() {
+    // ★★★ УНИЧТОЖАЕМ SORTABLE ★★★
+    destroyEditSortable();
+    
+    isEditingWorkout = false;
+    
+    localStorage.removeItem('temp_edit_name');
+    localStorage.removeItem('temp_edit_exercises');
+    localStorage.removeItem('temp_edit_category');
+    localStorage.removeItem('temp_edit_level');
+    localStorage.removeItem('temp_edit_isCustom');
+    localStorage.removeItem('temp_edit_id');
+    localStorage.removeItem('temp_edit_icon');
+    localStorage.removeItem('temp_edit_rest_time');
+    
+    if (editIsCustom || editWorkoutId === 'new') {
+        const id = editWorkoutId === 'new' ? null : editWorkoutId;
+        if (id) {
+            const workout = getWorkoutById(id);
+            if (workout) {
+                window.navigateTo('workout-detail', { category: workout.title, isCustom: true, id: id });
+                return;
+            }
+        }
+        window.navigateTo('workouts');
+    } else {
+        window.navigateTo('workout-detail', { category: editCategory, level: editLevel, parentCategory: '' });
+    }
+});
+
+// ===================СБРОС ТРЕНИРОВКИ ===================
+function resetWorkout() {
+    if (!editCategory || editIsCustom) {
+        showToast('⚠️ Эта функция только для готовых тренировок');
+        return;
+    }
+
+    const oldModal = document.getElementById('resetConfirmModal');
+    if (oldModal) oldModal.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'resetConfirmModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">Сбросить тренировку?</div>
+            <p style="color:var(--slate); font-size:0.95rem; margin:0.5rem 0 1.5rem 0; text-align:center;">Тренировка вернется к исходному виду.</p>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-danger" id="resetConfirmYes" style="flex:1;">
+                    Сбросить
+                </button>
+                <button class="btn btn-primary" id="resetConfirmNo" style="flex:1;">
+                    Отмена
+                </button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+
+document.getElementById('resetConfirmYes').addEventListener('click', function() {
+    closeModal('resetConfirmModal');
+
+    destroyEditSortable();
+
+    const category = editCategory;
+    const level = editLevel || '1 LVL';
+    let parentCategory = null;
+    for (const parent in exercisesDataDefault) {
+        if (exercisesDataDefault[parent] && exercisesDataDefault[parent][category]) {
+            parentCategory = parent;
+            break;
+        }
+    }
+    if (parentCategory) {
+        const defaultExercises = exercisesDataDefault[parentCategory][category][level];
+        if (defaultExercises) {
+            editExercises = JSON.parse(JSON.stringify(defaultExercises));
+            const nameInput = document.getElementById('editWorkoutName');
+            if (nameInput) nameInput.value = category + ' ' + level;
+            renderEditExercises();
+            showToast('✅ Тренировка сброшена');
+            return;
+        }
+    }
+    if (exercisesDataDefault[category] && exercisesDataDefault[category][level]) {
+        const defaultExercises = exercisesDataDefault[category][level];
+        if (defaultExercises) {
+            editExercises = JSON.parse(JSON.stringify(defaultExercises));
+            const nameInput = document.getElementById('editWorkoutName');
+            if (nameInput) nameInput.value = category + ' ' + level;
+            renderEditExercises();
+            showToast('✅ Тренировка сброшена');
+            return;
+        }
+    }
+    showToast('❌ Не удалось найти исходные данные для этой тренировки');
+});
+
+document.getElementById('resetConfirmNo').addEventListener('click', function() {
+    closeModal('resetConfirmModal');
+});
+}
+
+// ===================МОИ ТРЕНИРОВКИ (localStorage) ===================
+function getMyWorkouts() {
+    const cached = Cache.getLocal('myCustomWorkouts');
+    if (cached) return cached;
+
+    const data = JSON.parse(localStorage.getItem('myCustomWorkouts')) || [];
+    Cache.setLocal('myCustomWorkouts', data);
+    return data;
+}
+
+function saveMyWorkouts(workouts) {
+    Cache.setLocal('myCustomWorkouts', workouts);
+    localStorage.setItem('myCustomWorkouts', JSON.stringify(workouts));
+    syncSaveToFirestore('customWorkouts', workouts);
+}
+
+function getWorkoutById(id) {
+    const all = getMyWorkouts();
+    return all.find(w => w._id === id);
+}
+
+function updateWorkout(id, data) {
+    const all = getMyWorkouts();
+    const index = all.findIndex(w => w._id === id);
+    if (index !== -1) {
+        all[index] = { ...all[index], ...data };
+        saveMyWorkouts(all);
+        return true;
+    }
+    return false;
+}
+
+function deleteWorkout(id) {
+    const all = getMyWorkouts();
+    const filtered = all.filter(w => w._id !== id);
+    saveMyWorkouts(filtered);
+}
+
+
+function renderMyWorkouts() {
+    const container = document.getElementById('myWorkoutsList');
+    const workouts = getMyWorkouts();
+    const isEditing = !!(window.workoutsEditor && window.workoutsEditor.isEditing);
+
+    if (workouts.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <span class="empty-icon">📋</span>
+                <h3 class="empty-title">Нет своих тренировок</h3>
+                <p class="empty-text">Создайте свою первую тренировку!</p>
+                <button class="btn btn-primary" onclick="createNewWorkout()">
+                    <i class="fa-solid fa-plus"></i> Создать тренировку
+                </button>
+            </div>`;
+        return;
+    }
+
+    container.innerHTML = workouts.map(w => `
+        <div class="item-card" data-workout-id="${w._id}" onclick="handleWorkoutClick('${w._id}', event)">
+            ${w.icon ? `<div class="item-icon"><img src="images/${w.icon}.png"></div>` : ''}
+            <div class="item-info">
+                <h3 class="item-title">${w.title}</h3>
+                <p class="item-desc">${w.exercises?.length || 0} ${declOfNum(w.exercises?.length || 0, ['упражнение', 'упражнения', 'упражнений'])}</p>
+            </div>
+            ${isEditing
+                ? `<button class="item-action workout-delete" onclick="event.stopPropagation(); deleteCustomWorkout('${w._id}')"><i class="fa-regular fa-trash-can"></i></button>`
+                : `<button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>`
+            }
+        </div>
+    `).join('');
+}
+
+
+function handleWorkoutClick(id, event) {
+    const card = event.target.closest('.item-card');
+if (card && card.classList.contains('sortable-chosen')) {
+        return;
+    }
+    const workout = getWorkoutById(id);
+    if (workout) {
+        window.navigateTo('workout-detail', { 
+            category: workout.title, 
+            isCustom: true, 
+            id: id
+            // parentCategory НЕ ПЕРЕДАЁМ!
+        });
+    }
+}
+
+window.deleteCustomWorkout = function(id) {
+    showConfirmModal(
+        'Удалить тренировку?',
+        'Это действие нельзя отменить.',
+        function() {
+            deleteWorkout(id);
+            renderMyWorkouts();
+            showToast('🗑️ Тренировка удалена');
+        },
+        'Удалить'
+    );
+};
+
+function createNewWorkout() {
+    window.navigateTo('workout-edit', { category: 'Новая тренировка', isCustom: true, id: 'new' });
+};
+
+// ===================СТАТИСТИКА ===================
+async function loadStats() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    const result = await getUserWorkoutsFromFirestore(user.uid);
+    if (!result.success) return;
+    
+    // ★★★ ИСКЛЮЧАЕМ ЗАРЯДКУ И ОДИНОЧНЫЕ УПРАЖНЕНИЯ (ДЛЯ ТРЕНИРОВОК) ★★★
+        const workouts = result.data.filter(w => {
+            const icon = getWorkoutIcon(w);
+            return icon && icon !== 'charging' && !w.isSingle;
+        });
+
+    // ★★★ ДЛЯ ПОДСЧЁТА УПРАЖНЕНИЙ БЕРЁМ ВСЕ, ВКЛЮЧАЯ ОДИНОЧНЫЕ ★★★
+    const allWorkouts = result.data.filter(w => getWorkoutIcon(w) !== 'charging');
+
+    // === ОБЩАЯ СТАТИСТИКА ===
+    const total = workouts.length;
+    const totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const totalExercises = allWorkouts.reduce((sum, w) => {
+        const completed = w.exercises?.filter(e => e.completed === true).length || 0;
+        return sum + completed;
+    }, 0);
+    
+    const totalWorkoutsEl = document.getElementById('totalWorkouts');
+    const totalMinutesEl = document.getElementById('totalMinutes');
+    const totalExercisesEl = document.getElementById('totalExercises');
+    
+    if (totalWorkoutsEl) totalWorkoutsEl.textContent = total;
+    if (totalMinutesEl) totalMinutesEl.textContent = totalMinutes;
+    if (totalExercisesEl) totalExercisesEl.textContent = totalExercises;
+
+const exerciseCounts = {};
+allWorkouts.forEach(w => {
+    (w.exercises || []).forEach(ex => {
+        if (ex.completed) {
+            // ★ Сначала пробуем category, fallback на иконку
+            const icon = ex.icon || getExerciseIcon(ex.name);
+            const category = ex.category || getCategoryByIcon(icon);
+            if (category && category !== 'Зарядка') {
+                exerciseCounts[category] = (exerciseCounts[category] || 0) + 1;
+            }
+        }
+    });
+});
+
+    const exercisesContainer = document.getElementById('exerciseMuscleStats');
+    if (exercisesContainer) {
+const displayCategories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы'];
+        const maxCount = Math.max(1, ...Object.values(exerciseCounts));
+        exercisesContainer.innerHTML = displayCategories.map(cat => {
+            const count = exerciseCounts[cat] || 0;
+            const percent = Math.round((count / maxCount) * 100);
+            return `<div class="stat-item"><span class="stat-name">${cat}</span><div class="stat-bar"><div class="stat-fill" style="width:${percent}%;"></div></div><span class="stat-count">${count}</span></div>`;
+        }).join('');
+    }
+
+    // === ТРЕНИРОВКИ ПО КАТЕГОРИЯМ (ТОЛЬКО ПО ИКОНКАМ) ===
+    const categoryCounts = {};
+workouts.forEach(w => {
+    const icon = getWorkoutIcon(w);
+    if (!icon) return;
+    const category = getCategoryByIcon(icon);
+    if (category && category !== 'Зарядка') {
+        categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+    }
+});
+
+    const categoriesContainer = document.getElementById('categoriesStats');
+    if (categoriesContainer) {
+        const displayCategories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+        const maxCount = Math.max(1, ...Object.values(categoryCounts));
+        categoriesContainer.innerHTML = displayCategories.map(cat => {
+            const count = categoryCounts[cat] || 0;
+            const percent = Math.round((count / maxCount) * 100);
+            return `<div class="stat-item"><span class="stat-name">${cat}</span><div class="stat-bar"><div class="stat-fill" style="width:${percent}%;"></div></div><span class="stat-count">${count}</span></div>`;
+        }).join('');
+    }
+
+    // === КАЛЕНДАРЬ ===
+    renderCalendar(currentMonth, currentYear);
+
+    // === ИСТОРИЯ ТРЕНИРОВОК ★ с фильтрами ===
+    _historyAllWorkouts = workouts.slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+    initHistoryFilters();
+    renderWorkoutHistory();
+    applyStatsTab(activeStatsTab);
+    initAccordion();
+
+    // ★★★ РЕНДЕРИМ ЕЖЕМЕСЯЧНЫЕ ЗНАЧКИ ★★★
+    renderMonthlyBadges();
+
+    // ★★★ ПРИМЕНЯЕМ ПОРЯДОК БЛОКОВ ★★★
+    applySavedStatsOrder();
+
+    // ★★★ ОТЛОЖЕННАЯ ЗАГРУЗКА: не блокируем первый рендер ★★★
+    const runDeferred = () => {
+        loadPremiumStats();
+        loadBodyMeasurements();
+    };
+
+    if ('requestIdleCallback' in window) {
+        requestIdleCallback(runDeferred, { timeout: 2000 });
+    } else {
+        setTimeout(runDeferred, 400);
+    }
+}
+
+// =================== КАЛЕНДАРЬ ===================
+async function renderCalendar(month, year) {
+    const monthNames = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+    const monthYearEl = document.getElementById('currentMonthYear');
+    if (monthYearEl) monthYearEl.textContent = `${monthNames[month]} ${year}`;
+    
+    const firstDay = new Date(year, month, 1);
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const startDayOfWeek = firstDay.getDay() || 7;
+    const container = document.getElementById('calendarDays');
+    if (!container) return;
+    
+    container.innerHTML = '';
+    
+    for (let i = 1; i < startDayOfWeek; i++) {
+        const empty = document.createElement('div');
+        empty.classList.add('calendar-empty');
+        container.appendChild(empty);
+    }
+    
+    const today = new Date();
+    const user = await getFirebaseUser();
+    
+    // ★★★ ПОЛУЧАЕМ ДАТЫ ТРЕНИРОВОК ★★★
+    let workoutDates = [];
+    if (user) {
+        const result = await getUserWorkoutsFromFirestore(user.uid);
+        if (result.success) {
+            workoutDates = result.data
+                .filter(w => {
+                    const icon = getWorkoutIcon(w);
+                    return icon && icon !== 'charging';
+                })
+                .map(w => new Date(w.date));
+        }
+    }
+    
+    // ★★★ ПОДСЧИТЫВАЕМ КОЛИЧЕСТВО ТРЕНИРОВОК ПО ДНЯМ ★★★
+    const workoutCount = {};
+    workoutDates.forEach(d => {
+        const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+        workoutCount[key] = (workoutCount[key] || 0) + 1;
+    });
+    
+    for (let day = 1; day <= daysInMonth; day++) {
+        const dayEl = document.createElement('div');
+        dayEl.classList.add('calendar-day');
+        dayEl.textContent = day;
+        
+        const key = `${year}-${month}-${day}`;
+        const count = workoutCount[key] || 0;
+        
+        // ★★★ ВЫДЕЛЯЕМ В ЗАВИСИМОСТИ ОТ КОЛИЧЕСТВА ТРЕНИРОВОК ★★★
+        if (count === 1) {
+            dayEl.classList.add('calendar-day-has-workout-1');
+        } else if (count >= 2) {
+            dayEl.classList.add('calendar-day-has-workout-2');
+        }
+        
+        // ★★★ ВЫДЕЛЯЕМ СЕГОДНЯШНИЙ ДЕНЬ ★★★
+        if (day === today.getDate() && 
+            month === today.getMonth() && 
+            year === today.getFullYear()) {
+            dayEl.classList.add('calendar-day-today');
+        }
+        
+        // ★★★ ДОБАВЛЯЕМ ОБРАБОТЧИК КЛИКА ДЛЯ ОТКРЫТИЯ МОДАЛКИ С ТРЕНИРОВКАМИ ЗА ДЕНЬ ★★★
+        dayEl.addEventListener('click', function() {
+            openDayWorkoutsModal(year, month, day);
+        });
+        
+        container.appendChild(dayEl);
+    }
+}
+
+document.getElementById('prevMonth')?.addEventListener('click', () => {
+    currentMonth--;
+    if (currentMonth < 0) { currentMonth = 11; currentYear--; }
+    renderCalendar(currentMonth, currentYear);
+});
+document.getElementById('nextMonth')?.addEventListener('click', () => {
+    currentMonth++;
+    if (currentMonth > 11) { currentMonth = 0; currentYear++; }
+    renderCalendar(currentMonth, currentYear);
+});
+
+// =================== ПРОФИЛЬ ===================
+async function loadProfile() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    const profileResult = await getUserProfile(user.uid);
+    if (!profileResult.success) return;
+    const profile = profileResult.data;
+    // ★★★ СИНХРОНИЗИРУЕМ PREMIUM ★★★
+    window._userPremium = profile.premium === true;
+    const xp = profile.totalXp || 0;
+    const currentLevel = getCurrentLevel(xp);
+    const progress = getXpProgress(xp);
+    const nextLevel = getNextLevel(xp);
+    
+    // ★★★ ОКРУГЛЯЕМ XP ДО ЦЕЛОГО ★★★
+    const xpRounded = Math.round(xp);
+    window._lastProfileXp = xpRounded;
+    let progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+    
+    const profileName = document.getElementById('profileName');
+    const profileInitials = document.getElementById('profileInitials');
+    const profileEmailDisplay = document.getElementById('profileEmailDisplay');
+    const profileDate = document.getElementById('profileDate');
+    const editName = document.getElementById('editName');
+    const levelLvl = document.getElementById('levelLvl');
+    const levelTitle = document.getElementById('levelTitle');
+    const levelProgressText = document.getElementById('levelProgressText');
+    const levelFill = document.getElementById('levelFill');
+    
+    if (profileName) profileName.textContent = profile.displayName || 'Пользователь';
+    if (profileInitials) profileInitials.textContent = (profile.displayName || 'П')[0].toUpperCase();
+    if (profileEmailDisplay) profileEmailDisplay.textContent = user.email || '';
+    if (profileDate && profile.createdAt) {
+        const date = new Date(profile.createdAt);
+        profileDate.textContent = date.toLocaleDateString('ru-RU', { day: '2-digit', month: 'long', year: 'numeric' });
+    }
+    if (editName) editName.value = profile.displayName || '';
+    if (levelLvl) levelLvl.textContent = currentLevel.id + ' LVL';
+    if (levelTitle) levelTitle.textContent = currentLevel.name;
+    if (levelProgressText) levelProgressText.textContent = progressText;
+    if (levelFill) levelFill.style.width = progress + '%';
+
+// ★★★ ЗАГРУЖАЕМ ПОЛ И АВАТАР ★★★
+applyGenderToUI(profile.gender || 'male');
+
+// ★★★ СОХРАНЯЕМ ПОЛ В LOCALSTORAGE — пригодится для ГТО ★★★
+localStorage.setItem('userGender', profile.gender || 'male');
+
+const avatarImg = document.querySelector('.profile-avatar img');
+if (avatarImg) {
+    avatarImg.src = (profile.gender === 'female')
+        ? 'images/avatar-woman.png'
+        : 'images/avatar-men.png';
+}
+    
+// ★★★ ПРОВЕРКА ПОВЫШЕНИЯ УРОВНЯ И СОХРАНЕНИЕ СОБЫТИЯ ★★★
+const prevLevelData = await syncLoadFromFirestore('prevLevel');
+const prevLevel = parseInt(prevLevelData || localStorage.getItem('prevLevel') || '0');
+if (currentLevel.id > prevLevel) {
+    // Сохраняем событие о новом уровне
+    await saveUserEvent(user.uid, 'level_up', {
+        level: currentLevel.id,
+        levelName: currentLevel.name
+    });
+        
+        // Показываем уведомление
+        if (currentLevel.id > 1) {
+            const id = 'new_level_' + currentLevel.id;
+            if (!isNotificationSeen(id)) {
+                showNotification('🎉', `Поздравляем! Вы достигли ${currentLevel.id} уровня!`, null, true, function() {
+                    TabManager.profile('my');
+                    window.navigateTo('profile');
+                    setTimeout(() => loadProfile(), 300);
+                });
+                markNotificationSeen(id);
+            }
+        }
+        localStorage.setItem('prevLevel', String(currentLevel.id));
+syncSaveToFirestore('prevLevel', currentLevel.id);
+    }
+    
+    const lastVisit = localStorage.getItem(LAST_VISIT_KEY);
+    if (lastVisit) {
+        const daysDiff = Math.floor((Date.now() - parseInt(lastVisit)) / (1000 * 60 * 60 * 24));
+        if (daysDiff >= 7) {
+            const id = 'welcome_back_' + Date.now();
+            if (!isNotificationSeen(id)) {
+                showNotification('👋', 'Давно не виделись, с возвращением!', null);
+            }
+        }
+    }
+    localStorage.setItem(LAST_VISIT_KEY, String(Date.now()));
+    initProfileBlocks();
+    switchProfileTab(activeProfileTab);
+
+    await loadFriendsHistoryVisibilityFromProfile();
+
+    updateNotificationsSettingsItem();
+
+    renderAchievements();
+    loadAchievementsVisibility();
+    document.getElementById('profileLevelBlock')?.addEventListener('click', openLevelInfoModal);
+    
+await loadInventoryFromProfile();
+
+    // ★ Откладываем всё второстепенное — не блокируем первый рендер
+    const runDeferred = async () => {
+        try {
+            await updateProfileStreak();
+            const results = await checkAllAchievements(user.uid);
+            if (results) renderAchievements();
+        } catch (error) {
+            console.warn('Ошибка отложенной загрузки профиля:', error);
+        }
+    };
+
+    if ('requestIdleCallback' in window) {
+        requestIdleCallback(runDeferred, { timeout: 3000 });
+    } else {
+        setTimeout(runDeferred, 800);
+    }
+
+    if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel();
+}
+
+// ===================ПРОФИЛЬ - РЕДАКТИРОВАНИЕ ===================
+document.getElementById('editProfileBtn')?.addEventListener('click', () => {
+    isEditingProfile = true;
+    document.getElementById('profileView').style.display = 'none';
+    document.getElementById('profileEdit').style.display = 'block';
+    const currentName = document.getElementById('profileName').textContent;
+    document.getElementById('editName').value = currentName;
+
+    // ★★★ ПОДСВЕЧИВАЕМ ВЫБРАННЫЙ ПОЛ ★★★
+    applyGenderToUI(tempGender || 'male');
+});
+
+document.getElementById('cancelProfileEditBtn')?.addEventListener('click', () => {
+    isEditingProfile = false;
+    document.getElementById('profileView').style.display = 'flex';  // ← flex вместо block
+    document.getElementById('profileEdit').style.display = 'none';
+    loadProfile();
+});
+
+document.getElementById('saveProfileBtn')?.addEventListener('click', async () => {
+    const nameInput = document.getElementById('editName');
+    const name = nameInput.value.trim();
+
+    if (!name) {
+        showToast('⚠️ Введите имя и фамилию');
+        nameInput.classList.add('error');
+        return;
+    }
+    nameInput.classList.remove('error');
+
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Пользователь не авторизован');
+        return;
+    }
+
+    // ★★★ ВСЕГДА СОХРАНЯЕМ И ИМЯ, И ПОЛ ★★★
+    const updates = {
+        displayName: name,
+        gender: tempGender || 'male'
+    };
+
+    const result = await updateUserProfile(user.uid, updates);
+
+    if (result.success) {
+        isEditingProfile = false;
+        document.getElementById('profileView').style.display = 'flex';
+        document.getElementById('profileEdit').style.display = 'none';
+
+        // ★★★ СРАЗУ МЕНЯЕМ АВАТАР, НЕ ДОЖИДАЯСЬ loadProfile ★★★
+        const avatarImg = document.querySelector('.profile-avatar img');
+        if (avatarImg) {
+            avatarImg.src = (updates.gender === 'female')
+                ? 'images/avatar-woman.png'
+                : 'images/avatar-men.png';
+        }
+
+        await loadProfile();
+        showToast('✅ Профиль обновлён');
+    } else {
+        showToast('❌ Ошибка сохранения профиля');
+    }
+});
+
+// ===================СЛУШАТЕЛЬ АВТОРИЗАЦИИ ===================
+firebase.auth().onAuthStateChanged(async (user) => {
+    // ★★★ ЕДИНАЯ ТОЧКА УПРАВЛЕНИЯ СЛУШАТЕЛЯМИ ★★★
+    setupInviteListener(user);
+    setupFriendAcceptedListener(user);
+
+    // ★★★ ПРОВЕРЯЕМ ФЛАГ РЕГИСТРАЦИИ ★★★
+    if (isRegistering) {
+        console.log('⏳ Идёт регистрация, пропускаем onAuthStateChanged');
+        return;
+    }
+    
+    const bottomNav = document.getElementById('bottomNav');
+    try {
+        // ★★★ ЕСЛИ ПОЛЬЗОВАТЕЛЬ НЕ АВТОРИЗОВАН — СРАЗУ ПОКАЗЫВАЕМ HERO ★★★
+        if (!user) {
+            isDataLoaded = false;
+            console.log('👤 Пользователь не авторизован');
+            if (bottomNav) bottomNav.style.display = 'none';
+            showHero();
+            // ★★★ ПЛАВНО ПОКАЗЫВАЕМ КНОПКИ ★★★
+            showHeroButtons();
+            clearAuthFields();
+            return;
+        }
+
+        try { 
+            await user.reload(); 
+        } catch (e) { 
+            console.warn('Ошибка перезагрузки пользователя:', e); 
+        }
+
+        // ===== ПРОВЕРКА ПОДТВЕРЖДЕНИЯ ПОЧТЫ =====
+        if (!user.emailVerified) {
+            console.log('📧 Почта не подтверждена, показываем экран приветствия');
+            
+            isDataLoaded = false;
+            if (bottomNav) bottomNav.style.display = 'none';
+            
+            // Скрываем все страницы
+            document.querySelectorAll('.page').forEach(p => {
+                p.classList.remove('page-active');
+                p.style.display = 'none';
+            });
+            
+            // Показываем hero
+            const heroPage = document.getElementById('page-hero');
+            if (heroPage) {
+                heroPage.classList.add('page-active');
+                heroPage.style.display = 'block';
+            }
+            
+            clearAuthFields();
+            showHeroButtons();
+            
+            // Показываем тост с напоминанием
+            showToast('⚠️ Подтвердите почту! Проверьте письмо на ' + user.email);
+            return;
+        }
+
+                // ★★★ СОХРАНЯЕМ ФЛАГ ПОДТВЕРЖДЕНИЯ ПОЧТЫ В FIRESTORE ★★★
+        try {
+            await firebase.firestore().collection('users').doc(user.uid).set({
+                emailVerified: true
+            }, { merge: true });
+        } catch (e) {
+            console.warn('Не удалось сохранить emailVerified:', e);
+        }
+
+                // ★★★ ОБНОВЛЯЕМ lastSeenAt — ДЛЯ ПЛЯШКИ "ОНЛАЙН СЕЙЧАС" ★★★
+        try {
+            await firebase.firestore().collection('users').doc(user.uid).set({
+                lastSeenAt: firebase.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        } catch (e) {
+            console.warn('Не удалось обновить lastSeenAt:', e);
+        }
+
+        // ★★★ ПОЧТА ПОДТВЕРЖДЕНА — УДАЛЯЕМ ИЗ PENDING ★★★
+        try {
+            await firebase.firestore()
+                .collection('pendingDeletions')
+                .doc(user.uid)
+                .delete();
+            localStorage.removeItem('pendingVerification_' + user.uid);
+        } catch (e) {}
+
+        // ★★★ ПРОВЕРЯЕМ ФЛАГ ЗАГРУЗКИ ★★★
+        if (isDataLoaded) {
+            console.log('⚠️ Данные уже загружены, пропускаем');
+            return;
+        }
+
+        const isPageLoaded = document.querySelector('#page-workouts.page-active') || 
+                            document.querySelector('#page-stats.page-active') || 
+                            document.querySelector('#page-profile.page-active');
+        if (isPageLoaded) {
+            isDataLoaded = true;
+            return;
+        }
+
+        // ★★★ МГНОВЕННО ПОКАЗЫВАЕМ ЭКРАН ЗАГРУЗКИ — БЕЗ КНОПКИ ★★★
+        document.querySelectorAll('.page').forEach(p => {
+            p.style.display = 'none';
+            p.classList.remove('page-active');
+        });
+        
+const loadingPage = document.getElementById('page-loading');
+if (loadingPage) {
+    loadingPage.style.display = 'block';
+    loadingPage.classList.add('page-active');
+    triggerLoadingAnimations();   // ★★★ запуск анимации ★★★
+    console.log('📱 Страница загрузки показана мгновенно');
+}
+        if (bottomNav) bottomNav.style.display = 'none';
+        
+        // ★★★ УБЕЖДАЕМСЯ, ЧТО КНОПКА СКРЫТА ★★★
+        hideHeroButtons();
+
+        // ★★★ ТЕПЕРЬ ГРУЗИМ ДАННЫЕ В ФОНЕ ★★★
+        console.log('📊 Загрузка данных...');
+        const [profileResult, workoutsResult] = await Promise.all([
+            getUserProfile(user.uid),
+            getUserWorkoutsFromFirestore(user.uid)
+        ]);
+
+let profile = null;
+if (profileResult.success) {
+    profile = profileResult.data;
+} else {
+    const newProfile = {
+        displayName: user.displayName || user.email?.split('@')[0] || 'Пользователь',
+        avatar: 'bodybuilding',
+        level: 1,
+        totalXp: 0,
+        createdAt: new Date().toISOString(),
+        tutorialCompleted: false
+    };
+    await saveUserProfile(user.uid, newProfile);
+    profile = newProfile;
+}
+
+// ★★★ СИНХРОНИЗИРУЕМ PREMIUM ИЗ FIRESTORE ★★★
+window._userPremium = profile.premium === true;
+
+        clearAuthFields();
+
+        if (document.readyState !== 'complete') {
+            await new Promise(resolve => {
+                window.addEventListener('load', resolve, { once: true });
+            });
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel();
+
+        // ★★★ ЕДИНАЯ ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ★★★
+        // Прогреваем кэш профиля и тренировок ОДНИМ заходом,
+        // а затем параллельно рендерим всё, что нужно.
+        console.log('📊 Загрузка профиля, статистики и тренировок...');
+
+        await Promise.all([
+            getUserProfile(user.uid),
+            getUserWorkoutsFromFirestore(user.uid)
+        ]);
+
+        // Теперь всё читается из памяти — гоним параллельно
+        await Promise.all([
+            loadProfile(),
+            loadStats(),
+            renderMyWorkouts()
+        ]);
+
+        // renderCalendar уже вызван внутри loadStats — отдельно НЕ надо
+        updatePremiumUI();
+        initProfileBlocks();
+        switchProfileTab('my');
+
+        loadPremiumStats();
+// ★★★ ЗАГРУЖАЕМ ЗАДАНИЯ ★★★
+await loadTasks();
+await initDailyTasks();
+
+// ★★★ ЗАГРУЖАЕМ ЛИЧНЫЕ ТРЕНИРОВКИ ★★★
+const customWorkouts = await syncLoadWithFallback('customWorkouts', 'myCustomWorkouts', []);
+if (Array.isArray(customWorkouts)) {
+    localStorage.setItem('myCustomWorkouts', JSON.stringify(customWorkouts));
+    renderMyWorkouts();
+}
+
+// ★★★ ЗАГРУЖАЕМ ПРОГРЕСС ПРОГРАММ ★★★
+await syncLoadWithFallback('programProgress', PROGRAM_PROGRESS_KEY, {});
+
+// ★★★ ЗАГРУЖАЕМ НАСТРОЙКИ ТЕМЫ ★★★
+const settings = await syncLoadFromFirestore('settings');
+if (settings) {
+    if (settings.themeMode) {
+        localStorage.setItem('appThemeMode', settings.themeMode);
+    }
+    if (settings.themeColor) {
+        localStorage.setItem('themeColor', settings.themeColor);
+        localStorage.setItem('themeColorCustom', String(settings.themeColorCustom === true));
+    }
+    // Применяем тему
+    updateThemeUI();
+    setupSystemThemeListener();
+    
+    const savedColor = localStorage.getItem('themeColor') || 'red';
+    const isCustom = localStorage.getItem('themeColorCustom') === 'true';
+    if (isCustom && savedColor.startsWith('#')) {
+        applyColorToTheme(savedColor);
+    } else {
+        document.body.className = 'theme-' + savedColor;
+        const isDarkMode = localStorage.getItem('appThemeMode') === 'dark' || 
+                          (localStorage.getItem('appThemeMode') === 'system' && 
+                           window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (isDarkMode) document.body.classList.add('theme-dark-mode');
+    }
+}
+
+await loadLayoutsFromFirestore();
+applySavedStatsOrder();
+applySavedWorkoutsOrder();
+applySavedWorldStatsOrder();
+
+        window._tutorialNeeded = profile && profile.tutorialCompleted === false;
+
+        if (typeof syncPendingWorkouts === 'function') {
+            syncPendingWorkouts();
+        }
+        
+        // ★★★ УСТАНАВЛИВАЕМ ФЛАГ, ЧТО ДАННЫЕ ЗАГРУЖЕНЫ ★★★
+        isDataLoaded = true;
+
+        // ★★★ ЕСЛИ ЭТО ЛОГИН — СРАЗУ ВХОДИМ В ПРИЛОЖЕНИЕ ★★★
+        if (window._justLoggedIn) {
+            window._justLoggedIn = false;
+            console.log('🚀 Автовход после логина');
+            enterApp();
+            return;
+        }
+
+        console.log('✅ Данные загружены, показываем кнопку');
+
+        // ★★★ ПРОВЕРЯЕМ ОТЛОЖЕННОЕ ПРИГЛАШЕНИЕ (ЕСЛИ ПОЛЬЗОВАТЕЛЬ УЖЕ В ПРИЛОЖЕНИИ) ★★★
+        setTimeout(() => {
+            tryOpenPendingInvite();
+        }, 1500);
+
+        // ★★★ ПЛАВНО ПОКАЗЫВАЕМ КНОПКУ ★★★
+        showHeroButtons();
+
+    } catch (error) {
+        console.error('❌ Ошибка в onAuthStateChanged:', error);
+        isDataLoaded = false;
+        if (bottomNav) bottomNav.style.display = 'none';
+        
+        document.querySelectorAll('.page').forEach(p => {
+            p.style.display = 'none';
+            p.classList.remove('page-active');
+        });
+        
+        const loginPage = document.getElementById('page-login');
+        if (loginPage) {
+            loginPage.style.display = 'block';
+            loginPage.classList.add('page-active');
+        }
+        clearAuthFields();
+        showHeroButtons();
+    }
+});
+
+// ===================ПЕРЕКЛЮЧЕНИЕ СТРАНИЦ ===================
+function showHero() {
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = '';
+    });
+    const heroPage = document.getElementById('page-hero');
+    if (heroPage) {
+        heroPage.classList.add('page-active');
+        heroPage.style.display = 'block';
+    }
+    clearAuthFields();
+
+    // ★★★ ЗАПУСКАЕМ АНИМАЦИЮ ФИЧ ★★★
+    triggerHeroAnimations();
+    // ★ Кнопки появятся сами после анимации (через showHeroButtons)
+    showHeroButtons();
+}
+
+// ★★★ ПЛАВНО ПОКАЗАТЬ КНОПКИ НА ЭКРАНАХ HERO / LOADING ★★★
+function showHeroButtons() {
+    // Отменяем предыдущий отложенный показ (если был)
+    if (_showButtonsTimeout) {
+        clearTimeout(_showButtonsTimeout);
+        _showButtonsTimeout = null;
+    }
+
+    const now = Date.now();
+    const elapsed = now - _loadingAnimStartTime;
+    // ★ Если данные уже загружены и анимация давно стартовала — показываем сразу
+    const remaining = Math.max(0, Math.min(LOADING_ANIM_DURATION_MS - elapsed, 600));
+
+    console.log(`⏳ Кнопка появится через ${remaining}мс`);
+
+    _showButtonsTimeout = setTimeout(() => {
+        document.querySelectorAll('.hero-buttons').forEach(el => {
+            el.classList.add('hero-buttons-ready');
+        });
+        _showButtonsTimeout = null;
+        console.log('✅ Кнопка показана');
+    }, remaining);
+}
+
+// ★★★ СКРЫТЬ КНОПКИ ★★★
+function hideHeroButtons() {
+    if (_showButtonsTimeout) {
+        clearTimeout(_showButtonsTimeout);
+        _showButtonsTimeout = null;
+    }
+    document.querySelectorAll('.hero-buttons').forEach(el => {
+        el.classList.remove('hero-buttons-ready');
+    });
+}
+
+// =================== АНИМАЦИЯ ЭКРАНА ЗАГРУЗКИ ===================
+const LOADING_ANIM_DURATION_MS = 1800;   // достаточно, чтобы анимация успела проиграть
+let _loadingAnimStartTime = 0;
+let _showButtonsTimeout = null;
+
+/**
+ * Запускает анимацию появления фич на экране загрузки
+ * и запоминает время старта, чтобы потом правильно рассчитать
+ * момент появления кнопки.
+ */
+function triggerLoadingAnimations() {
+    const loadingPage = document.getElementById('page-loading');
+    if (!loadingPage) return;
+
+    // ★★★ СБРАСЫВАЕМ И ПЕРЕЗАПУСКАЕМ АНИМАЦИИ ★★★
+    loadingPage.classList.remove('loading-animate');
+    void loadingPage.offsetWidth;   // force reflow — обязательно, иначе не перезапустится
+    loadingPage.classList.add('loading-animate');
+
+    _loadingAnimStartTime = Date.now();
+    console.log('🎬 Анимация загрузки запущена');
+}
+
+/**
+ * Запускает анимацию появления фич на странице приветствия (hero)
+ * и запоминает время старта для показа кнопок.
+ */
+function triggerHeroAnimations() {
+    const heroPage = document.getElementById('page-hero');
+    if (!heroPage) return;
+
+    // Сбрасываем и перезапускаем анимации
+    heroPage.classList.remove('loading-animate');
+    void heroPage.offsetWidth;   // force reflow
+    heroPage.classList.add('loading-animate');
+
+    _loadingAnimStartTime = Date.now();
+    console.log('🎬 Анимация приветствия запущена');
+}
+
+// =================== РЕГИСТРАЦИЯ (ПОШАГОВАЯ) ===================
+
+// Хранилище данных регистрации
+let registerData = {
+    name: '',
+    email: '',
+    password: ''
+};
+
+function switchToPage(pageId) {
+    // Сначала скрываем ВСЕ страницы
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = 'none';
+    });
+    
+    // Потом показываем нужную страницу
+    const target = document.getElementById(pageId);
+    if (target) {
+        target.classList.add('page-active');
+        target.style.display = 'block';
+
+        // ★★★ ЗАПУСКАЕМ АНИМАЦИЮ, ЕСЛИ ЭТО ЭКРАН ЗАГРУЗКИ ★★★
+        if (pageId === 'page-loading') {
+            triggerLoadingAnimations();
+        }
+    }
+}
+
+// Шаг 1: Имя
+document.getElementById('registerFormStep1')?.addEventListener('submit', function(e) {
+    e.preventDefault();
+
+    const nameInput = document.getElementById('regName');
+    const consentCheckbox = document.getElementById('regConsentCheckbox');
+
+    const name = nameInput.value.trim();
+
+    if (!name) {
+        nameInput.classList.add('error');
+        showToast('⚠️ Введите ваше имя');
+        return;
+    }
+    nameInput.classList.remove('error');
+
+    // ★★★ ПРОВЕРЯЕМ СОГЛАСИЕ ★★★
+if (!consentCheckbox.checked) {
+    consentCheckbox.classList.add('error');
+    showToast('⚠️ Примите условия, чтобы продолжить');
+    return;
+}
+consentCheckbox.classList.remove('error');
+
+// ★ Проверяем второй чекбокс
+const consentDataCheckbox = document.getElementById('regConsentDataCheckbox');
+if (!consentDataCheckbox.checked) {
+    consentDataCheckbox.classList.add('error');
+    showToast('⚠️ Дайте согласие на обработку данных');
+    return;
+}
+consentDataCheckbox.classList.remove('error');
+
+    registerData.name = name;
+
+    switchToPage('page-register-email');
+    document.getElementById('regEmail').focus();
+});
+
+// Шаг 2: Почта (регистрация)
+document.getElementById('registerFormStep2')?.addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    const emailInput = document.getElementById('regEmail');
+    const email = emailInput.value.trim();
+    
+    if (!email) {
+        emailInput.classList.add('error');
+        showToast('⚠️ Введите вашу почту');
+        return;
+    }
+    
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        emailInput.classList.add('error');
+        showToast('⚠️ Неверный формат email');
+        return;
+    }
+    
+    emailInput.classList.remove('error');
+    registerData.email = email;
+    
+    switchToPage('page-register-password');
+    document.getElementById('regPassword').focus();
+});
+
+// ★★★ ФЛАГ ДЛЯ ПРЕДОТВРАЩЕНИЯ СРАБАТЫВАНИЯ onAuthStateChanged ★★★
+let isRegistering = false;
+
+// Шаг 3: Пароль + создание аккаунта
+document.getElementById('registerFormStep3')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    
+    const passwordInput = document.getElementById('regPassword');
+    const password = passwordInput.value;
+    const btn = document.getElementById('registerStep3Btn');
+    
+    if (!password || password.length < 6) {
+        passwordInput.classList.add('error');
+        showToast('⚠️ Пароль должен быть минимум 6 символов');
+        return;
+    }
+    passwordInput.classList.remove('error');
+    
+    registerData.password = password;
+    
+    isRegistering = true;
+    btn.disabled = true;
+    
+    try {
+        const result = await firebase.auth().createUserWithEmailAndPassword(
+            registerData.email, 
+            registerData.password
+        );
+        
+        await result.user.updateProfile({ displayName: registerData.name });
+        
+        await saveUserProfile(result.user.uid, {
+            displayName: registerData.name,
+            email: registerData.email,
+            avatar: 'bodybuilding',
+            level: 1,
+            totalXp: 0,
+            createdAt: new Date().toISOString(),
+            tutorialCompleted: false
+        });
+        
+        await result.user.sendEmailVerification();
+        
+        // ★★★ ЗАПУСКАЕМ ТАЙМЕР УДАЛЕНИЯ ★★★
+        scheduleAccountDeletion(result.user);
+        
+        // ★★★ ПЕРЕХОДИМ НА ШАГ 4 (ПОДТВЕРЖДЕНИЕ ПОЧТЫ) ★★★
+        switchToPage('page-register-verify');
+        
+        registerData = { name: '', email: '', password: '' };
+        
+    } catch (error) {
+        let message = 'Ошибка регистрации';
+        const emailInput = document.getElementById('regEmail');
+        const passwordInputLocal = document.getElementById('regPassword');
+        
+        // ★★★ ОЧИЩАЕМ ОШИБКИ СО ВСЕХ ПОЛЕЙ ★★★
+        emailInput.classList.remove('error');
+        passwordInputLocal.classList.remove('error');
+        
+        switch (error.code) {
+            case 'auth/email-already-in-use':
+                message = 'Эта почта уже зарегистрирована. Войдите в аккаунт.';
+                emailInput.classList.add('error');
+                
+                // Очищаем данные регистрации
+                registerData = { name: '', email: '', password: '' };
+                
+                // Переключаемся на страницу входа
+                setTimeout(() => {
+                    // Скрываем все страницы
+                    document.querySelectorAll('.page').forEach(p => {
+                        p.classList.remove('page-active');
+                        p.style.display = 'none';
+                    });
+                    
+                    // Показываем страницу входа (шаг 1)
+                    const loginPage = document.getElementById('page-login');
+                    if (loginPage) {
+                        loginPage.classList.add('page-active');
+                        loginPage.style.display = 'block';
+                    }
+                    
+                    // Очищаем поля входа
+                    document.getElementById('loginEmail').value = '';
+                    document.getElementById('loginPassword').value = '';
+                    
+                    // Устанавливаем email в поле входа для удобства
+                    if (registerData.email) {
+                        document.getElementById('loginEmail').value = registerData.email;
+                    }
+                    
+                    clearAuthFields();
+                }, 1500);
+                
+                break;
+                
+            case 'auth/invalid-email':
+                message = 'Неверный формат почты';
+                emailInput.classList.add('error');
+                break;
+                
+            case 'auth/weak-password':
+                message = 'Пароль должен быть минимум 6 символов';
+                passwordInputLocal.classList.add('error');
+                break;
+                
+            case 'auth/network-request-failed':
+                message = 'Проверьте интернет-соединение';
+                break;
+                
+            case 'auth/too-many-requests':
+                message = 'Слишком много попыток. Подождите.';
+                break;
+                
+            case 'auth/operation-not-allowed':
+                message = 'Регистрация временно отключена';
+                break;
+                
+            default:
+                message = error.message || 'Произошла ошибка, попробуйте позже';
+        }
+        
+        showToast('❌ ' + message);
+        btn.disabled = false;
+        
+    } finally {
+        isRegistering = false;
+    }
+});
+
+// ★★★ ОБРАБОТЧИК ШАГА 4 (ПОДТВЕРЖДЕНИЕ ПОЧТЫ) ★★★
+document.getElementById('registerVerifyBtn')?.addEventListener('click', async function() {
+    const btn = this;
+    
+    if (btn.disabled) return;
+    
+    btn.disabled = true;
+    
+    try {
+        const user = firebase.auth().currentUser;
+        
+        if (!user) {
+            showToast('❌ Пользователь не найден');
+            btn.disabled = false;
+            return;
+        }
+        
+        await user.reload();
+        
+        if (user.emailVerified) {
+            // ★★★ ПОЧТА ПОДТВЕРЖДЕНА - УДАЛЯЕМ МЕТКУ ★★★
+            localStorage.removeItem('pendingVerification_' + user.uid);
+            
+            // ★★★ ПЕРЕХОДИМ НА ШАГ 5 (ВЫБОР ИНВЕНТАРЯ) ★★★
+            switchToPage('page-register-gender');
+            
+            // Загружаем сохранённый выбор инвентаря
+            setTimeout(() => {
+                loadInventorySelection();
+            }, 100);
+            
+            btn.disabled = false;
+            
+        } else {
+            const sent = await resendVerificationEmail();
+            if (sent) {
+                showToast('⚠️ Подтвердите почту!');
+            }
+            btn.disabled = false;
+        }
+        
+    } catch (error) {
+        if (error.code === 'auth/too-many-requests') {
+            showToast('⚠️ Слишком много попыток');
+        } else {
+            showToast('❌ Ошибка проверки почты');
+        }
+        btn.disabled = false;
+    }
+});
+
+// =================== РЕГИСТРАЦИЯ: ВЫБОР ПОЛА (ШАГ 5) ===================
+let registerGender = 'male';  // по умолчанию
+
+window.selectGenderRegister = function(gender) {
+    registerGender = gender;
+
+    document.querySelectorAll('#page-register-gender .toggle-btn[data-gender]').forEach(btn => {
+        btn.classList.toggle('toggle-btn-active', btn.dataset.gender === gender);
+    });
+
+    console.log('👤 Выбран пол при регистрации:', gender);
+};
+
+// Кнопка «Далее» на шаге с полом
+document.getElementById('registerGenderBtn')?.addEventListener('click', function() {
+    localStorage.setItem('pendingGender', registerGender);
+    console.log('💾 Пол сохранён:', registerGender);
+
+    // ★ Переходим на шаг «Данные тела»
+    switchToPage('page-register-body');
+});
+
+// =================== РЕГИСТРАЦИЯ: ШАГ 6 (ДАННЫЕ ТЕЛА) ===================
+
+/** Очистить поля данных тела */
+function resetRegBodyFields() {
+    ['regBodyHeight', 'regBodyWeight', 'regBodyChest',
+     'regBodyWaist', 'regBodyHips', 'regBodyArm']
+        .forEach(id => {
+            const el = document.getElementById(id);
+            if (el) { el.value = ''; el.classList.remove('error'); }
+        });
+}
+
+/** Кнопка «Пропустить» */
+document.getElementById('regBodySkipBtn')?.addEventListener('click', function() {
+    resetRegBodyFields();
+    switchToPage('page-inventory');
+    setTimeout(() => {
+        if (typeof loadInventorySelection === 'function') {
+            loadInventorySelection();
+        }
+    }, 100);
+});
+
+/** Кнопка «>» — сохранить и продолжить */
+document.getElementById('regBodyNextBtn')?.addEventListener('click', async function() {
+    const getVal = (id) => {
+        const el = document.getElementById(id);
+        if (!el) return null;
+        const v = el.value.trim();
+        return v === '' ? null : parseFloat(v);
+    };
+
+    const data = {
+        height: getVal('regBodyHeight'),
+        weight: getVal('regBodyWeight'),
+        chest:  getVal('regBodyChest'),
+        waist:  getVal('regBodyWaist'),
+        hips:   getVal('regBodyHips'),
+        arm:    getVal('regBodyArm')
+    };
+
+    const hasAny = ['height', 'weight', 'chest', 'waist', 'hips', 'arm']
+        .some(k => data[k] !== null);
+
+    if (hasAny) {
+        // Валидация диапазонов
+        const limits = {
+            height: [100, 250],
+            weight: [20, 500],
+            chest:  [30, 300],
+            waist:  [30, 300],
+            hips:   [30, 300],
+            arm:    [10, 100]
+        };
+        for (const key in limits) {
+            if (data[key] !== null) {
+                const [min, max] = limits[key];
+                if (data[key] < min || data[key] > max) {
+                    showToast(`⚠️ Значение должно быть от ${min} до ${max}`);
+                    return;
+                }
+            }
+        }
+
+        // ★ Сохраняем как обычный замер в Firestore
+        try {
+            const user = await getFirebaseUser();
+            if (user) {
+                data.userId = user.uid;
+                data.date = new Date().toISOString();
+                data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+                await firebase.firestore().collection('measurements').add(data);
+                console.log('✅ Данные тела сохранены:', data);
+                showToast('✅ Параметры сохранены');
+            }
+        } catch (e) {
+            console.warn('Ошибка сохранения данных тела:', e);
+            showToast('⚠️ Не удалось сохранить параметры');
+        }
+    }
+
+    // Сбрасываем поля перед переходом
+    resetRegBodyFields();
+
+    // Переход на инвентарь
+    switchToPage('page-inventory');
+    setTimeout(() => {
+        if (typeof loadInventorySelection === 'function') {
+            loadInventorySelection();
+        }
+    }, 100);
+});
+
+// =================== ПОВТОРНАЯ ОТПРАВКА ПИСЬМА ===================
+
+async function resendVerificationEmail() {
+    const user = firebase.auth().currentUser;
+    
+    if (!user) {
+        showToast('❌ Пользователь не найден');
+        return false;
+    }
+    
+    await user.reload();
+    
+    if (user.emailVerified) {
+        showToast('✅ Почта уже подтверждена');
+        return false;
+    }
+    
+    const lastSent = localStorage.getItem('lastVerificationSent');
+    
+    if (lastSent) {
+        const timeDiff = Date.now() - parseInt(lastSent);
+        if (timeDiff < 60000) {
+            const remaining = Math.ceil((60000 - timeDiff) / 1000);
+            showToast(`⏳ Подождите ${remaining} сек перед повторной отправкой`);
+            return false;
+        }
+    }
+    
+    try {
+        await user.sendEmailVerification();
+        localStorage.setItem('lastVerificationSent', String(Date.now()));
+        
+        // ★★★ ОБНОВЛЯЕМ ТАЙМЕР УДАЛЕНИЯ В FIRESTORE ★★★
+        refreshDeletionTimer(user);
+        
+        showToast('📧 Письмо отправлено на ' + user.email);
+        return true;
+        
+    } catch (error) {
+        if (error.code === 'auth/too-many-requests') {
+            showToast('⚠️ Слишком много запросов');
+        } else if (error.code === 'auth/network-request-failed') {
+            showToast('⚠️ Проверьте интернет-соединение');
+        } else {
+            showToast('❌ Не удалось отправить письмо');
+        }
+        return false;
+    }
+}
+
+// =================== АВТОУДАЛЕНИЕ НЕПОДТВЕРЖДЁННЫХ АККАУНТОВ (ЧЕРЕЗ FIRESTORE) ===================
+
+function scheduleAccountDeletion(user) {
+    if (!user) return;
+    
+    const creationTime = Date.now();
+    const deleteAt = creationTime + 300000; // +5 минут
+    
+    // ★★★ СОЗДАЁМ ПРОФИЛЬ С ФЛАГОМ emailVerified: false ★★★
+    firebase.firestore().collection('users').doc(user.uid).set({
+        emailVerified: false,
+        createdAt: new Date().toISOString()
+    }, { merge: true });
+    
+    // ★★★ СОХРАНЯЕМ ДАННЫЕ В FIRESTORE ★★★
+    firebase.firestore().collection('pendingDeletions').doc(user.uid).set({
+        userId: user.uid,
+        email: user.email,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        deleteAt: new Date(deleteAt),
+        pendingVerification: true,
+        processed: false
+    });
+    
+    localStorage.setItem('pendingVerification_' + user.uid, String(creationTime));
+    
+    console.log('⏰ Запланировано удаление аккаунта через 5 минут');
+}
+
+async function checkAndDeleteExpiredAccounts() {
+    const KEY = 'lastExpiredCheck';
+    const last = parseInt(localStorage.getItem(KEY) || '0');
+    if (Date.now() - last < 5 * 60 * 1000) return;
+    localStorage.setItem(KEY, String(Date.now()));
+    try {
+        const now = new Date();
+        
+        const snapshot = await firebase.firestore()
+            .collection('pendingDeletions')
+            .where('deleteAt', '<=', now)
+            .get();
+        
+        if (snapshot.empty) {
+            console.log('ℹ️ Нет просроченных аккаунтов для удаления');
+            return;
+        }
+        
+        console.log(`🗑️ Найдено ${snapshot.size} просроченных аккаунтов`);
+        
+        for (const doc of snapshot.docs) {
+            const data = doc.data();
+            const userId = data.userId;
+            
+            if (!userId) {
+                // Некорректная запись — просто удаляем
+                await doc.ref.delete();
+                continue;
+            }
+            
+            try {
+                // ★★★ ПРОВЕРЯЕМ ЧЕРЕЗ FIRESTORE, А НЕ AUTH ★★★
+                const userDoc = await firebase.firestore()
+                    .collection('users')
+                    .doc(userId)
+                    .get();
+                
+                if (userDoc.exists) {
+                    const userData = userDoc.data();
+                    
+                    // Если почта подтверждена — удаляем pending-запись
+                    if (userData.emailVerified === true) {
+                        await doc.ref.delete();
+                        localStorage.removeItem('pendingVerification_' + userId);
+                        console.log(`✅ Пользователь ${userId} подтвердил почту, запись удалена`);
+                        continue;
+                    }
+                }
+                
+                // ★★★ УДАЛЯЕМ ДАННЫЕ ИЗ FIRESTORE ★★★
+                console.log(`🗑️ Удаляем просроченный аккаунт: ${userId}`);
+                
+                // Удаляем профиль
+                await firebase.firestore().collection('users').doc(userId).delete();
+                
+                // Удаляем тренировки
+                const workoutsSnap = await firebase.firestore()
+                    .collection('workouts')
+                    .where('userId', '==', userId)
+                    .get();
+                const batch = firebase.firestore().batch();
+                workoutsSnap.forEach(w => batch.delete(w.ref));
+                await batch.commit();
+                
+                // Удаляем уведомления
+                const notifSnap = await firebase.firestore()
+                    .collection('notifications')
+                    .where('to', '==', userId)
+                    .get();
+                const batch2 = firebase.firestore().batch();
+                notifSnap.forEach(n => batch2.delete(n.ref));
+                await batch2.commit();
+                
+                // Помечаем pending как обработанный (не удаляем сразу,
+                // чтобы Cloud Function могла удалить из Auth)
+                await doc.ref.update({
+                    processed: true,
+                    processedAt: firebase.firestore.FieldValue.serverTimestamp()
+                });
+                
+                localStorage.removeItem('pendingVerification_' + userId);
+                
+                console.log(`✅ Данные аккаунта ${userId} удалены (почта не подтверждена)`);
+                
+            } catch (error) {
+                console.error(`❌ Ошибка удаления аккаунта ${userId}:`, error);
+                // Не удаляем pending-запись — попробуем в следующий раз
+            }
+        }
+        
+    } catch (error) {
+        console.error('❌ Ошибка проверки просроченных аккаунтов:', error);
+    }
+}
+
+/**
+ * Обновляет таймер удаления при повторной отправке письма
+ */
+function refreshDeletionTimer(user) {
+    if (!user) return;
+    
+    // Обновляем время в localStorage
+    localStorage.setItem('pendingVerification_' + user.uid, String(Date.now()));
+    
+    // ★★★ ОБНОВЛЯЕМ В FIRESTORE ★★★
+    const deleteAt = new Date(Date.now() + 300000);
+    firebase.firestore().collection('pendingDeletions').doc(user.uid).update({
+        deleteAt: deleteAt,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }).catch(() => {
+        // Если документа нет - создаём
+        firebase.firestore().collection('pendingDeletions').doc(user.uid).set({
+            userId: user.uid,
+            email: user.email,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            deleteAt: deleteAt,
+            pendingVerification: true
+        });
+    });
+    
+    console.log('🔄 Таймер удаления обновлён (сохранено в Firestore)');
+}
+
+// =================== ВХОД (ПОШАГОВЫЙ) ===================
+
+// Хранилище данных входа
+let loginData = {
+    email: '',
+    password: ''
+};
+
+// Шаг 1: Почта
+document.getElementById('loginFormStep1')?.addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    const emailInput = document.getElementById('loginEmail');
+    const email = emailInput.value.trim();
+    
+    if (!email) {
+        emailInput.classList.add('error');
+        showToast('⚠️ Введите вашу почту');
+        return;
+    }
+    
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        emailInput.classList.add('error');
+        showToast('⚠️ Неверный формат email');
+        return;
+    }
+    
+    emailInput.classList.remove('error');
+    loginData.email = email;
+    
+    const forgotLink = document.getElementById('forgotPasswordLink');
+    if (forgotLink) {
+        forgotLink.style.visibility = 'hidden';
+    }
+    
+    switchToPage('page-login-password');
+    document.getElementById('loginPassword').focus();
+});
+
+// Шаг 2: Пароль + вход
+document.getElementById('loginFormStep2')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    
+    const passwordInput = document.getElementById('loginPassword');
+    const password = passwordInput.value;
+    const btn = document.getElementById('loginStep2Btn');
+    
+    if (!password) {
+        passwordInput.classList.add('error');
+        showToast('⚠️ Введите пароль');
+        return;
+    }
+    passwordInput.classList.remove('error');
+    
+    loginData.password = password;
+    
+    btn.disabled = true;
+    
+    try {
+        const result = await firebase.auth().signInWithEmailAndPassword(
+            loginData.email,
+            loginData.password
+        );
+        
+if (!result.user.emailVerified) {
+    showToast('⚠️ Подтвердите почту! Письмо отправлено');
+    await result.user.sendEmailVerification();
+    btn.disabled = false;
+    return;
+}
+
+// ★★★ ФЛАГ АВТОВХОДА (логин, не регистрация) ★★★
+window._justLoggedIn = true;
+
+switchToPage('page-loading');
+document.getElementById('bottomNav').style.display = 'none';
+
+showToast('✅ Вход выполнен!');
+loginData = { email: '', password: '' };
+        
+        // Ждём загрузки данных
+        setTimeout(() => {
+            // onAuthStateChanged сам переключит на workouts
+        }, 500);
+        
+    } catch (error) {
+        let message = '';
+        let showForgotLink = false;
+        
+        if (error.code === 'auth/invalid-credential' || 
+            error.code === 'auth/user-not-found' || 
+            error.code === 'auth/wrong-password') {
+            message = 'Неверный email или пароль.';
+            showForgotLink = true;
+        } else if (error.code === 'auth/invalid-email') {
+            message = 'Неверный формат email.';
+        } else if (error.code === 'auth/too-many-requests') {
+            message = 'Слишком много попыток. Подождите.';
+            showForgotLink = true;
+        } else if (error.code === 'auth/network-request-failed') {
+            message = 'Проверьте интернет-соединение';
+        } else {
+            message = 'Ошибка входа. Попробуйте позже';
+        }
+        
+if (showForgotLink) {
+    const forgotLink = document.getElementById('forgotPasswordLink');
+    if (forgotLink) {
+        forgotLink.style.visibility = 'visible';
+    }
+}
+        
+        passwordInput.classList.add('error');
+        showToast('❌ ' + message);
+        btn.disabled = false;
+    }
+});
+
+// =================== ВОССТАНОВЛЕНИЕ ПАРОЛЯ (БЕЗ МОДАЛКИ) ===================
+
+async function sendPasswordReset() {
+    if (!loginData.email) {
+        showToast('⚠️ Сначала введите почту');
+        return;
+    }
+    
+    const forgotLink = document.getElementById('forgotPasswordLink');
+    const linkElement = forgotLink?.querySelector('a');
+    
+    if (linkElement) {
+        linkElement.style.pointerEvents = 'none';
+    }
+    
+    try {
+        await firebase.auth().sendPasswordResetEmail(loginData.email);
+        showToast('📧 Письмо для сброса пароля отправлено');
+        
+        if (forgotLink) {
+            forgotLink.style.visibility = 'hidden';
+        }
+        
+    } catch (error) {
+        let message = 'Ошибка отправки';
+        if (error.code === 'auth/invalid-email') {
+            message = 'Неверный формат почты';
+        } else if (error.code === 'auth/too-many-requests') {
+            message = 'Слишком много попыток. Подождите.';
+        }
+        showToast('❌ ' + message);
+    } finally {
+        if (linkElement) {
+            linkElement.style.pointerEvents = 'auto';
+            linkElement.style.opacity = '1';
+            linkElement.textContent = 'Восстановить';
+        }
+    }
+}
+
+// =================== ОБНОВЛЁННЫЕ ФУНКЦИИ НАВИГАЦИИ ===================
+
+function showRegister() {
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = 'none';
+    });
+    const registerPage = document.getElementById('page-register');
+    registerPage.classList.add('page-active');
+    registerPage.style.display = 'block';
+
+    document.getElementById('regName').value = '';
+    document.getElementById('regEmail').value = '';
+    document.getElementById('regPassword').value = '';
+    registerData = { name: '', email: '', password: '' };
+
+    // ★ Сброс чекбокса согласия
+    const consent = document.getElementById('regConsentCheckbox');
+    if (consent) {
+        consent.checked = false;
+        consent.classList.remove('error');
+    }
+
+    const consentData = document.getElementById('regConsentDataCheckbox');   // ← добавили
+if (consentData) {                                                        // ← добавили
+    consentData.checked = false;                                          // ← добавили
+    consentData.classList.remove('error');                                // ← добавили
+}                                                                         // ← добавили
+
+    clearAuthFields();
+}
+
+function showLogin() {
+    // Показываем первый шаг входа
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = 'none';
+    });
+    const loginPage = document.getElementById('page-login');
+    loginPage.classList.add('page-active');
+    loginPage.style.display = 'block';
+    
+    // Очищаем поля
+    document.getElementById('loginEmail').value = '';
+    document.getElementById('loginPassword').value = '';
+    loginData = { email: '', password: '' };
+    clearAuthFields();
+}
+
+// ===================ОЧИСТКА ПОЛЕЙ ВВОДА ===================
+function clearAuthFields() {
+    const loginEmail = document.getElementById('loginEmail');
+    const loginPassword = document.getElementById('loginPassword');
+
+    if (loginEmail) {
+        loginEmail.value = '';
+        loginEmail.classList.remove('error');
+    }
+    if (loginPassword) {
+        loginPassword.value = '';
+        loginPassword.classList.remove('error');
+    }
+
+    const regName = document.getElementById('regName');
+    const regEmail = document.getElementById('regEmail');
+    const regPassword = document.getElementById('regPassword');
+
+    if (regName) {
+        regName.value = '';
+        regName.classList.remove('error');
+    }
+    if (regEmail) {
+        regEmail.value = '';
+        regEmail.classList.remove('error');
+    }
+    if (regPassword) {
+        regPassword.value = '';
+        regPassword.classList.remove('error');
+    }
+}
+
+// ===================ВЫХОД ===================
+async function logout() {
+    showConfirmWithPasswordModal(
+        'Выйти из аккаунта?',
+        'Введите пароль для подтверждения выхода из аккаунта.',
+        function() {
+            if (inviteListener) { inviteListener(); inviteListener = null; }
+            if (window._friendAcceptedListener) {
+                window._friendAcceptedListener();
+                window._friendAcceptedListener = null;
+            }
+            if (sessionListener) { sessionListener(); sessionListener = null; }
+
+            // ★ ДОБАВИТЬ:
+            if (typeof Challenges !== 'undefined') {
+                Challenges.unsubscribeAll();
+            }
+
+            window._userPremium = false;
+            firebase.auth().signOut();
+        },
+        'Выйти'
+    );
+}
+
+function enterApp() {
+    // ★★★ ЗАПУСКАЕМ СЛУШАТЕЛЬ ВЫЗОВОВ ★★★
+    if (typeof startChallengesListener === 'function') {
+        startChallengesListener();
+    }
+
+    // ★★★ ПРОВЕРЯЕМ ПРОСРОЧЕННЫЕ АККАУНТЫ ПРИ ВХОДЕ ★★★
+    checkAndDeleteExpiredAccounts();
+    
+    // Закрываем страницу загрузки
+    const loadingPage = document.getElementById('page-loading');
+    if (loadingPage) {
+        loadingPage.style.display = 'none';
+        loadingPage.classList.remove('page-active');
+    }
+
+    // Переходим на страницу тренировок
+    window.navigateTo('workouts');
+    document.getElementById('bottomNav').style.display = 'block';
+
+    // Проверяем сохранённую тренировку только после входа в основной интерфейс.
+    setTimeout(showResumePersonalTrainingPrompt, 700);
+
+    refreshNotificationData();
+
+    // Раскрываем все блоки (аккордеоны)
+    setTimeout(() => {
+        document.querySelectorAll('.section-block').forEach(block => block.classList.add('open'));
+        saveBlocksState();
+    }, 100);
+
+    // ★★★ ЗАПУСКАЕМ ТУТОРИАЛ ТОЛЬКО ПОСЛЕ НАЖАТИЯ КНОПКИ ★★★
+    const needsTutorial = window._tutorialNeeded && !isTutorialCompleted();
+    if (needsTutorial) {
+        console.log('🎓 Запускаем обучение после нажатия кнопки "Начать тренироваться"');
+        setTimeout(() => startTutorial(), 500);
+    }
+
+    // ★★★ ОФЛАЙН-МОДАЛКА ★★★
+    if (!navigator.onLine) {
+        setTimeout(() => {
+            showOfflineModal();
+        }, 1000);
+    }
+
+    // ★★★ ПРОВЕРЯЕМ ОТЛОЖЕННОЕ ПРИГЛАШЕНИЕ ★★★
+    setTimeout(() => {
+        tryOpenPendingInvite();
+    }, 800);
+    // ★★★ ВОТ ЭТО ДОБАВЛЯЕМ — пробуем показать PWA-баннер ★★★
+    // Ждём 5 секунд — чтобы бета-модалка (если есть) успела появиться и закрыться
+    // Если туториал активен или бета-модалка показана — canShowBanner() вернёт false
+    // Показываем баннер установки при каждом входе (если не установлено)
+setTimeout(() => PWA.tryShowBanner(), 3000);
+
+        // ★★★ МОДАЛКА ОБНОВЛЕНИЙ ★★★
+    // Показываем через 2 секунды после входа, если:
+    // - не видели эту версию
+    // - туториал не активен и его не было в сессии
+    // - нет открытых модалок
+    setTimeout(() => CHANGELOG.tryShow(), 2000);
+}
+
+// ===================ПОВТОРНАЯ ОТПРАВКА ПИСЬМА ===================
+async function resendVerification() {
+    const user = firebase.auth().currentUser;
+    if (!user) { showToast('❌ Вы не авторизованы'); return; }
+    if (user.emailVerified) { showToast('✅ Почта уже подтверждена'); return; }
+    try {
+        await user.sendEmailVerification();
+        showToast('📧 Письмо отправлено на ' + user.email);
+    } catch (error) {
+        if (error.code === 'auth/too-many-requests') {
+            showToast('⚠️ Слишком много попыток. Подождите несколько минут.');
+        } else {
+            showToast('❌ Ошибка: ' + error.message);
+        }
+    }
+}
+
+// ===================ДРУЗЬЯ ===================
+async function getFriendshipStatus(targetUserId) {
+    const user = await getFirebaseUser();
+    if (!user) return 'none';
+    const userDoc = await firebase.firestore().collection('users').doc(user.uid).get();
+    const friends = userDoc.data()?.friends || [];
+    if (friends.includes(targetUserId)) return 'friends';
+    const sentSnapshot = await firebase.firestore()
+        .collection('friendRequests')
+        .where('from', '==', user.uid)
+        .where('to', '==', targetUserId)
+        .where('status', '==', 'pending')
+        .get();
+    if (!sentSnapshot.empty) return 'pending_sent';
+    const receivedSnapshot = await firebase.firestore()
+        .collection('friendRequests')
+        .where('from', '==', targetUserId)
+        .where('to', '==', user.uid)
+        .where('status', '==', 'pending')
+        .get();
+    if (!receivedSnapshot.empty) return 'pending_received';
+    return 'none';
+}
+
+async function searchUsers(query) {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+    if (!query || query.trim().length === 0) return { success: true, data: [] };
+    try {
+        const snapshot = await firebase.firestore()
+            .collection('users')
+            .where('displayName', '>=', query)
+            .where('displayName', '<=', query + '\uf8ff')
+            .limit(20)
+            .get();
+        const results = [];
+        for (const doc of snapshot.docs) {
+            if (doc.id !== user.uid) {
+                const data = doc.data();
+                const status = await getFriendshipStatus(doc.id);
+                results.push({ id: doc.id, ...data, friendshipStatus: status });
+            }
+        }
+        return { success: true, data: results };
+    } catch (error) {
+        console.error('Ошибка поиска:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+async function sendFriendRequest(toUserId) {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+    const status = await getFriendshipStatus(toUserId);
+    if (status !== 'none') return { success: false, error: 'Заявка уже отправлена или вы уже друзья' };
+    try {
+        await firebase.firestore().collection('friendRequests').add({
+            from: user.uid,
+            to: toUserId,
+            status: 'pending',
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        return { success: true };
+    } catch (error) {
+        console.error('Ошибка отправки заявки:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+async function getFriendRequests() {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+    try {
+        const snapshot = await firebase.firestore()
+            .collection('friendRequests')
+            .where('to', '==', user.uid)
+            .where('status', '==', 'pending')
+            .get();
+        
+        const requests = [];
+        for (const doc of snapshot.docs) {
+            const data = doc.data();
+            const fromUser = await getUserProfile(data.from);
+            requests.push({ id: doc.id, from: data.from, fromUser: fromUser.success ? fromUser.data : null, ...data });
+        }
+        return { success: true, data: requests };
+    } catch (error) {
+        console.error('Ошибка получения заявок:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+async function acceptFriendRequest(requestId, fromUserId) {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+    try {
+        // ПРОВЕРЯЕМ, СУЩЕСТВУЕТ ЛИ ЗАЯВКА
+        const requestDoc = await firebase.firestore().collection('friendRequests').doc(requestId).get();
+        if (!requestDoc.exists) {
+            showToast('❌ Заявка уже обработана или удалена');
+            return { success: false, error: 'Заявка не найдена' };
+        }
+        
+        // ПРИНИМАЕМ ЗАЯВКУ
+        await firebase.firestore().collection('friendRequests').doc(requestId).update({ status: 'accepted' });
+        
+        // ДОБАВЛЯЕМ ДРУГА ОБОИМ
+        await firebase.firestore().collection('users').doc(user.uid).update({ 
+            friends: firebase.firestore.FieldValue.arrayUnion(fromUserId) 
+        });
+        await firebase.firestore().collection('users').doc(fromUserId).update({ 
+            friends: firebase.firestore.FieldValue.arrayUnion(user.uid) 
+        });
+        
+        // ОЧИЩАЕМ УВЕДОМЛЕНИЕ О ЗАЯВКЕ
+        const shownRequests = JSON.parse(localStorage.getItem('shownFriendRequests') || '[]');
+        const updated = shownRequests.filter(id => id !== requestId);
+        localStorage.setItem('shownFriendRequests', JSON.stringify(updated));
+        
+        // ПОЛУЧАЕМ ДАННЫЕ ПОЛЬЗОВАТЕЛЕЙ
+        const currentUserProfile = await getUserProfile(user.uid);
+        const currentUserName = currentUserProfile.success ? currentUserProfile.data.displayName : 'Пользователь';
+        
+        const friendProfile = await getUserProfile(fromUserId);
+        const friendName = friendProfile.success ? friendProfile.data.displayName : 'Пользователь';
+        
+        // ===== УВЕДОМЛЕНИЕ ДЛЯ ТОГО, КТО ПРИНЯЛ ЗАЯВКУ =====
+        const shownFriendNotifications = JSON.parse(localStorage.getItem('shownFriendNotifications') || '[]');
+        if (!shownFriendNotifications.includes(fromUserId)) {
+            showNotification('👥', `У вас новый друг — ${friendName}!`, null);
+            shownFriendNotifications.push(fromUserId);
+            localStorage.setItem('shownFriendNotifications', JSON.stringify(shownFriendNotifications));
+        }
+
+        // ★★★ ПРОВЕРЯЕМ ЕЖЕДНЕВНОЕ ЗАДАНИЕ "ОБЩИТЕЛЬНЫЙ" ★★★
+checkDailyTasksAfterAddFriend();
+        
+        // ★★★ ===== ЗАДАНИЕ 4: НОВЫЕ ЗНАКОМСТВА (ДЛЯ ТОГО, КТО ПРИНЯЛ) ===== ★★★
+        const tasksData = JSON.parse(localStorage.getItem('sportapp_tasks') || '{}');
+        if (!tasksData[4]) {
+            tasksData[4] = true;
+            localStorage.setItem('sportapp_tasks', JSON.stringify(tasksData));
+            
+            // ★★★ ОБНОВЛЯЕМ ГЛОБАЛЬНЫЙ МАССИВ tasks ★★★
+            tasks[4] = true;
+            
+            // ★★★ ОБНОВЛЯЕМ UI ★★★
+            updateTasksUI();
+            
+            showToast('✅ Задание "Новые знакомства" выполнено!');
+            addTaskXp();
+        }
+        
+        // ===== УВЕДОМЛЕНИЕ ДЛЯ ТОГО, КТО ОТПРАВИЛ ЗАЯВКУ =====
+        await firebase.firestore().collection('notifications').add({
+            to: fromUserId,
+            from: user.uid,
+            fromName: currentUserName,
+            type: 'friend_accepted',
+            message: `${currentUserName} принял(а) вашу заявку в друзья!`,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            read: false
+        });
+        
+        await renderFriendsInProfile();
+        
+        // ПРОВЕРЯЕМ, ВСЕ ЛИ ЗАДАНИЯ ВЫПОЛНЕНЫ
+        if (checkAllTasksCompleted()) {
+            showNotification(
+                '🎉',
+                'Теперь вам доступны ежедневные задания!',
+                null,
+                true,
+                function() {
+                    window.navigateTo('profile');
+                    TabManager.profile('my');
+                    setTimeout(() => {
+                        showDailyTasks();
+                    }, 300);
+                }
+            );
+        }
+        
+        return { success: true };
+    } catch (error) {
+        console.error('Ошибка принятия заявки:', error);
+        
+        if (error.code === 'not-found') {
+            showToast('❌ Заявка уже была обработана');
+            await renderFriendsInProfile();
+            return { success: false, error: 'Заявка не найдена' };
+        }
+        
+        showToast('❌ Ошибка при принятии заявки');
+        return { success: false, error: error.message };
+    }
+}
+
+function setupFriendAcceptedListener(user) {
+    // ★ Сначала отписываемся от старого слушателя
+    if (window._friendAcceptedListener) {
+        window._friendAcceptedListener();
+        window._friendAcceptedListener = null;
+    }
+
+    // ★ Если пользователя нет — слушать нечего
+    if (!user) return;
+
+    window._friendAcceptedListener = firebase.firestore()
+        .collection('notifications')
+        .where('to', '==', user.uid)
+        .where('type', '==', 'friend_accepted')
+        .where('read', '==', false)
+        .onSnapshot(async (snapshot) => {
+            for (const change of snapshot.docChanges()) {
+                if (change.type === 'added') {
+                    const data = change.doc.data();
+
+                    const notificationId = 'friend_accepted_' + change.doc.id;
+                    if (isNotificationSeen(notificationId)) continue;
+
+                    showNotification(
+                        '👥',
+                        data.message || `${data.fromName} принял(а) вашу заявку в друзья!`,
+                        null
+                    );
+
+                    // ★★★ ===== ЗАДАНИЕ 4: НОВЫЕ ЗНАКОМСТВА (ДЛЯ ОТПРАВИТЕЛЯ) ===== ★★★
+                    const tasksData = JSON.parse(localStorage.getItem('sportapp_tasks') || '{}');
+                    if (!tasksData[4]) {
+                        tasksData[4] = true;
+                        localStorage.setItem('sportapp_tasks', JSON.stringify(tasksData));
+
+                        tasks[4] = true;
+                        updateTasksUI();
+
+                        showToast('✅ Задание "Новые знакомства" выполнено!');
+
+                        try {
+                            const senderProfile = await getUserProfile(user.uid);
+                            if (senderProfile.success) {
+                                const currentXp = senderProfile.data.totalXp || 0;
+                                await updateUserProfile(user.uid, { totalXp: currentXp + 10 });
+                            }
+                        } catch (error) {
+                            console.error('Ошибка начисления XP:', error);
+                        }
+                    }
+
+                    await firebase.firestore()
+                        .collection('notifications')
+                        .doc(change.doc.id)
+                        .update({ read: true });
+
+                    markNotificationSeen(notificationId);
+                }
+            }
+        });
+}
+
+async function rejectFriendRequest(requestId) {
+    try {
+        const requestDoc = await firebase.firestore().collection('friendRequests').doc(requestId).get();
+        const requestData = requestDoc.data();
+        let senderName = 'Пользователь';
+        
+        if (requestData && requestData.from) {
+            const senderProfile = await getUserProfile(requestData.from);
+            if (senderProfile.success) {
+                senderName = senderProfile.data.displayName || 'Пользователь';
+            }
+        }
+        
+        await firebase.firestore().collection('friendRequests').doc(requestId).delete();
+        
+        const shownRequests = JSON.parse(localStorage.getItem('shownFriendRequests') || '[]');
+        const updated = shownRequests.filter(id => id !== requestId);
+        localStorage.setItem('shownFriendRequests', JSON.stringify(updated));
+        
+        await renderFriendsInProfile();
+        
+        showToast(`❌ Заявка от ${senderName} отклонена`);
+        
+        return { success: true };
+    } catch (error) {
+        console.error('Ошибка отклонения заявки:', error);
+        showToast('❌ Ошибка при отклонении заявки');
+        return { success: false, error: error.message };
+    }
+}
+
+async function getFriendsList() {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+
+    try {
+        const userDoc = await firebase.firestore()
+            .collection('users').doc(user.uid).get();
+        const friendIds = userDoc.data()?.friends || [];
+
+        if (friendIds.length === 0) return { success: true, data: [] };
+
+        // ★ Один batch вместо цикла
+        const profilesMap = await getProfilesBatch(friendIds);
+
+        const friends = [];
+        for (const id of friendIds) {
+            if (profilesMap[id]) friends.push({ id, ...profilesMap[id] });
+        }
+        return { success: true, data: friends };
+
+    } catch (error) {
+        console.error('Ошибка получения друзей:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// =================== РЕНДЕР ДРУЗЕЙ В ПРОФИЛЕ (ИСПРАВЛЕННЫЙ) ===================
+async function renderFriendsInProfile() {
+    const searchBtn = document.getElementById('searchFriendBtn') || document.getElementById('searchBtn');
+    const searchInput = document.getElementById('searchInput');
+    const resultsDiv = document.getElementById('searchResults');
+    const requestsDiv = document.getElementById('friendRequests');
+    const friendsDiv = document.getElementById('friendsList');
+    
+    // ★★★ ПОИСК ДРУЗЕЙ ★★★
+    if (searchBtn) {
+        searchBtn.onclick = async () => {
+            const query = searchInput.value.trim();
+            resultsDiv.innerHTML = '';
+            if (!query) {
+                resultsDiv.innerHTML = '<p style="color:var(--slate);font-size:0.9rem;text-align:center;padding:1rem;">Введите имя для поиска</p>';
+                return;
+            }
+            const result = await searchUsers(query);
+            if (!result.success) { 
+                resultsDiv.innerHTML = '<p style="color:var(--slate);font-size:0.9rem;text-align:center;padding:1rem;">Ошибка поиска</p>'; 
+                return; 
+            }
+            if (result.data.length === 0) { 
+                resultsDiv.innerHTML = '<p style="color:var(--slate);font-size:0.9rem;text-align:center;padding:1rem;">Пользователи не найдены</p>'; 
+                return; 
+            }
+            resultsDiv.innerHTML = result.data.map(u => {
+                const initial = (u.displayName || 'П')[0].toUpperCase();
+                const level = getCurrentLevel(u.totalXp || 0).id;
+                const xp = Math.round(u.totalXp || 0);
+                let buttonHtml = '';
+                if (u.friendshipStatus === 'none') {
+                    buttonHtml = `<button class="btn btn-secondary btn-sm" onclick="addFriend('${u.id}', this)">Добавить</button>`;
+                } else if (u.friendshipStatus === 'pending_sent') {
+                    buttonHtml = `<button class="btn btn-secondary btn-sm" disabled style="opacity:0.6;">Ждем ответа</button>`;
+                } else if (u.friendshipStatus === 'pending_received') {
+                    buttonHtml = `<button class="btn btn-secondary btn-sm" disabled style="opacity:0.6;">Входящая заявка</button>`;
+                } else if (u.friendshipStatus === 'friends') {
+                    buttonHtml = `<button class="btn btn-secondary btn-sm" disabled style="opacity:0.6;">В друзьях</button>`;
+                }
+                return `<div class="friend-result-item">
+                    <div class="friend-avatar">${initial}</div>
+                    <div class="friend-result-info">
+                        <strong>${u.displayName || 'Пользователь'}</strong>
+                        <span>Уровень ${level} · ${xp} XP</span>
+                    </div>
+                    ${buttonHtml}
+                </div>`;
+            }).join('');
+        };
+        
+        if (searchInput) {
+            searchInput.addEventListener('keypress', (e) => { 
+                if (e.key === 'Enter') searchBtn.click(); 
+            });
+        }
+    }
+
+    // ★★★ ЗАГРУЖАЕМ ЗАЯВКИ ★★★
+    const requests = await getFriendRequests();
+    if (requests.success && requests.data.length > 0) {
+        const shownRequests = JSON.parse(localStorage.getItem('shownFriendRequests') || '[]');
+        const newRequests = requests.data.filter(r => !shownRequests.includes(r.id));
+        
+        newRequests.forEach(r => {
+            const fromUser = r.fromUser || {};
+            const name = fromUser.displayName || 'Пользователь';
+            showNotification('📧', `У вас новая заявка в друзья от ${name}`, null, true, function() {
+                TabManager.profile('friends');
+                window.navigateTo('profile');
+                setTimeout(() => renderFriendsInProfile(), 300);
+            });
+        });
+        
+        const updatedShown = [...shownRequests, ...newRequests.map(r => r.id)];
+        localStorage.setItem('shownFriendRequests', JSON.stringify(updatedShown));
+        
+        let requestsHtml = requests.data.map(r => {
+            const fromUser = r.fromUser || {};
+            const initial = (fromUser.displayName || 'П')[0].toUpperCase();
+            const level = getCurrentLevel(fromUser.totalXp || 0).id;
+            const xp = Math.round(fromUser.totalXp || 0);
+            return `<div class="friend-request-item" onclick="openFriendRequestProfile('${r.id}','${r.from}')" style="cursor:pointer;">
+                <div class="friend-avatar">${initial}</div>
+                <div class="friend-result-info">
+                    <strong>${fromUser.displayName || 'Пользователь'}</strong>
+                    <span>Уровень ${level} · ${xp} XP</span>
+                </div>
+                <button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>
+            </div>`;
+        }).join('');
+        if (requestsDiv) requestsDiv.innerHTML = requestsHtml;
+    } else {
+        if (requestsDiv) requestsDiv.innerHTML = `
+    <div class="empty-state">
+        <span class="empty-icon">📧</span>
+        <h3 class="empty-title">Нет заявок</h3>
+        <p class="empty-text">Здесь будут отображаться входящие заявки.</p>
+        <button class="btn btn-primary" onclick="focusFriendSearch()">
+            <i class="fa-solid fa-magnifying-glass"></i> Найти друзей
+        </button>
+    </div>`;    }
+    
+    // ★★★ ЗАГРУЖАЕМ ДРУЗЕЙ ★★★
+    const friends = await getFriendsList();
+    let friendsHtml = '';
+    if (friends.success && friends.data.length > 0) {
+        // ★★★ УБИРАЕМ АВТОМАТИЧЕСКОЕ УВЕДОМЛЕНИЕ ПРИ РЕНДЕРЕ ★★★
+        // Уведомления о новых друзьях теперь показываются ТОЛЬКО в acceptFriendRequest
+        
+friendsHtml = friends.data.map(f => {
+    const initial = (f.displayName || 'П')[0].toUpperCase();
+    const level = getCurrentLevel(f.totalXp || 0).id;
+    const xp = Math.round(f.totalXp || 0); // ← ИСПРАВЛЕНО: используем f.totalXp
+    return `<div class="friend-item" onclick="openFriendProfile('${f.id}')" style="cursor:pointer;">
+        <div class="friend-avatar">${initial}</div>
+        <div class="friend-info">
+            <strong>${f.displayName || 'Пользователь'}</strong>
+            <span>Уровень ${level} · ${xp} XP</span>
+        </div>
+        <button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>
+    </div>`;
+}).join('');
+    } else {
+        friendsHtml = `
+    <div class="empty-state">
+        <span class="empty-icon">👥</span>
+        <h3 class="empty-title">Нет друзей</h3>
+        <p class="empty-text">Добавьте друзей, чтобы соревноваться!</p>
+        <button class="btn btn-primary" onclick="focusFriendSearch()">
+            <i class="fa-solid fa-magnifying-glass"></i> Найти друзей
+        </button>
+    </div>`;
+    }
+    if (friendsDiv) friendsDiv.innerHTML = friendsHtml;
+    // ★★★ БОЛЬШЕ НЕ СКРЫВАЕМ БЛОК ★★★
+    // Просто рендерим историю с учётом видимости
+    setTimeout(() => renderFriendsHistory(), 300);
+}
+
+// ===================ОТКРЫТИЕ ПРОФИЛЯ ЗАЯВКИ ===================
+async function openFriendRequestProfile(requestId, fromUserId) {
+    try {
+        const result = await getUserProfile(fromUserId);
+        if (!result.success) {
+            showToast('❌ Не удалось загрузить данные пользователя');
+            return;
+        }
+        
+        const userData = result.data;
+        
+        const achievements = userData.achievements || {};
+        updateAchievementsUI('friendRequestAchievements', achievements);
+        
+        const visible = getAchievementsVisibility();
+        const container = document.getElementById('friendRequestAchievements');
+        if (container) {
+            container.classList.toggle('hidden', !visible);
+        }
+        
+        let workouts = [];
+        let totalSeconds = 0;
+        let totalExercises = 0;
+        
+        try {
+            const workoutsResult = await getUserWorkoutsFromFirestore(fromUserId);
+            if (workoutsResult.success) {
+                workouts = workoutsResult.data.filter(w => !(w.title || '').includes('Зарядка'));
+                totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+                totalExercises = workouts.reduce((sum, w) => {
+                    const completed = w.exercises?.filter(e => e.completed === true).length || 0;
+                    return sum + completed;
+                }, 0);
+            }
+        } catch (error) {
+            console.warn('⚠️ Ошибка загрузки тренировок друга:', error);
+        }
+        
+        const name = userData.displayName || 'Пользователь';
+        document.getElementById('friendRequestName').textContent = name;
+        document.getElementById('friendRequestEmail').textContent = '';
+        document.getElementById('friendRequestAvatar').textContent = name[0].toUpperCase();
+        
+        const xp = userData.totalXp || 0;
+        const currentLevel = getCurrentLevel(xp);
+        const progress = getXpProgress(xp);
+        const nextLevel = getNextLevel(xp);
+        
+        // ★★★ ОКРУГЛЯЕМ XP ДО ЦЕЛОГО ★★★
+        const xpRounded = Math.round(xp);
+        const progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+        
+        document.getElementById('friendRequestLevelLvl').textContent = currentLevel.id + ' LVL';
+        document.getElementById('friendRequestLevelTitle').textContent = currentLevel.name;
+        document.getElementById('friendRequestLevelProgressText').textContent = progressText;
+        document.getElementById('friendRequestLevelFill').style.width = progress + '%';
+        
+        document.getElementById('friendRequestTotalWorkouts').textContent = workouts.length;
+        document.getElementById('friendRequestTotalMinutes').textContent = Math.floor(totalSeconds / 60);
+        document.getElementById('friendRequestTotalExercises').textContent = totalExercises;
+        
+        document.getElementById('friendRequestAcceptBtn').dataset.requestId = requestId;
+        document.getElementById('friendRequestAcceptBtn').dataset.userId = fromUserId;
+        document.getElementById('friendRequestRejectBtn').dataset.requestId = requestId;
+        
+        openModal('friendRequestProfileModal');
+        
+        checkDailyTasksAfterFriendProfile(fromUserId);
+        
+    } catch (error) {
+        console.error('Ошибка загрузки профиля:', error);
+        showToast('❌ Ошибка загрузки профиля');
+    }
+}
+
+// ===================ОБРАБОТЧИКИ КНОПОК ЗАЯВКИ ===================
+document.getElementById('friendRequestAcceptBtn')?.addEventListener('click', async function() {
+    const requestId = this.dataset.requestId;
+    const userId = this.dataset.userId;
+    if (!requestId || !userId) {
+        showToast('❌ Ошибка: данные не найдены');
+        return;
+    }
+    
+    const result = await acceptFriendRequest(requestId, userId);
+    if (result.success) {
+        closeModal('friendRequestProfileModal');
+        await renderFriendsInProfile();
+        showToast('✅ Заявка принята!');
+    } else {
+        showToast('❌ Ошибка при принятии заявки');
+    }
+});
+
+document.getElementById('friendRequestRejectBtn')?.addEventListener('click', async function() {
+    const requestId = this.dataset.requestId;
+    if (!requestId) {
+        showToast('❌ Ошибка: данные не найдены');
+        return;
+    }
+    
+    const result = await rejectFriendRequest(requestId);
+    if (result.success) {
+        closeModal('friendRequestProfileModal');
+        await renderFriendsInProfile();
+        showToast('❌ Заявка отклонена');
+    } else {
+        showToast('❌ Ошибка при отклонении заявки');
+    }
+});
+
+// ===================ДРУЗЬЯ - ГЛОБАЛЬНЫЕ КНОПКИ ===================
+window.addFriend = async function(userId, btnElement) {
+    if (btnElement) { btnElement.textContent = 'Отправка...'; btnElement.disabled = true; btnElement.style.opacity = '0.6'; }
+    const result = await sendFriendRequest(userId);
+    if (!result.success) {
+        if (btnElement) { btnElement.textContent = 'Добавить'; btnElement.disabled = false; btnElement.style.opacity = '1'; }
+        console.error('Ошибка:', result.error);
+        const resultsDiv = document.getElementById('searchResults');
+        resultsDiv.innerHTML += `<p style="color:#EF4444;font-size:0.8rem;">${result.error}</p>`;
+        return;
+    }
+    if (btnElement) { btnElement.textContent = 'Ждем ответа'; btnElement.disabled = true; btnElement.style.opacity = '0.6'; }
+    await renderFriendsInProfile();
+};
+
+window.acceptFriend = async function(requestId, fromUserId) {
+    const result = await acceptFriendRequest(requestId, fromUserId);
+    if (result.success) await renderFriendsInProfile();
+    else console.error('Ошибка принятия:', result.error);
+};
+
+window.rejectFriend = async function(requestId) {
+    const result = await rejectFriendRequest(requestId);
+    if (result.success) await renderFriendsInProfile();
+    else console.error('Ошибка отклонения:', result.error);
+};
+
+window.removeFriend = async function(friendId) {
+    showConfirmModal(
+        'Удалить друга?',
+        'Вы больше не будете видеть его в списке друзей.',
+        async function() {
+            const user = await getFirebaseUser();
+            if (!user) { 
+                showToast('❌ Пользователь не авторизован'); 
+                return; 
+            }
+            try {
+                const friendProfile = await getUserProfile(friendId);
+                const friendName = friendProfile.success ? friendProfile.data.displayName : 'Пользователь';
+                
+                const userDoc = await firebase.firestore().collection('users').doc(user.uid).get();
+                const currentFriends = userDoc.data()?.friends || [];
+                const updatedFriends = currentFriends.filter(id => id !== friendId);
+                await firebase.firestore().collection('users').doc(user.uid).update({ friends: updatedFriends });
+                
+                const friendDoc = await firebase.firestore().collection('users').doc(friendId).get();
+                const friendFriends = friendDoc.data()?.friends || [];
+                const updatedFriendFriends = friendFriends.filter(id => id !== user.uid);
+                await firebase.firestore().collection('users').doc(friendId).update({ friends: updatedFriendFriends });
+                
+                const shownFriendNotifications = JSON.parse(localStorage.getItem('shownFriendNotifications') || '[]');
+                const updatedShown = shownFriendNotifications.filter(id => id !== friendId);
+                localStorage.setItem('shownFriendNotifications', JSON.stringify(updatedShown));
+                
+                const prevFriends = JSON.parse(localStorage.getItem('prevFriendsList') || '[]');
+                const updatedPrev = prevFriends.filter(f => f.id !== friendId);
+                localStorage.setItem('prevFriendsList', JSON.stringify(updatedPrev));
+                
+                await renderFriendsInProfile();
+                showToast(`✅ ${friendName} удалён из друзей`);
+                await updateAchievementsAfterWorkout();
+            } catch (error) {
+                console.error('Ошибка удаления друга:', error);
+                showToast('❌ Ошибка при удалении друга');
+            }
+        },
+        'Удалить'
+    );
+};
+
+// =================== ВСЕ УПРАЖНЕНИЯ ДЛЯ СПИСКА ===================
+function getAllExercises() {
+    // ★★★ ИСПОЛЬЗУЕМ ОТДЕЛЬНЫЙ КАТАЛОГ ★★★
+    if (typeof EXERCISES_CATALOG === 'undefined') {
+        console.warn('EXERCISES_CATALOG не найден, используем пустой список');
+        return [];
+    }
+    
+    // Маппинг категорий на иконки
+    const categoryIconMap = {
+        'Грудь': 'breast',
+        'Спина': 'back',
+        'Ноги': 'legs',
+        'Плечи': 'shoulder',
+        'Пресс': 'press',
+        'Руки': 'bodybuilding',
+        'Всё тело': 'WholeBody',
+        'Кардио': 'cardio',
+        'Растяжка': 'stretching',
+        'Растяжка позвоночника': 'stretching-back',
+        'Зарядка': 'charging',
+        'Пилатес': 'Pilates',
+        'Кроссфит': 'crossfit',
+        'Мужская сила': 'men',
+        'Женское счастье': 'woman'
+    };
+    
+    // ★★★ ПОЛУЧАЕМ ИНВЕНТАРЬ ПОЛЬЗОВАТЕЛЯ ★★★
+    const userInventory = getUserInventoryFromStorage();
+    console.log('📦 Инвентарь пользователя:', userInventory);
+    
+    // ★★★ ФИЛЬТРУЕМ ПО ИНВЕНТАРЮ ★★★
+    const filtered = filterExercisesByInventory(userInventory);
+    console.log('📋 Упражнений после фильтрации:', filtered.length, 'из', EXERCISES_CATALOG.length);
+    
+    return filtered.map(ex => ({
+        ...ex,
+        // Если у упражнения нет icon - берём по категории
+        icon: ex.icon || categoryIconMap[ex.category] || null,
+        category: ex.category || 'Без категории',
+        level: ex.level || '1 LVL'
+    }));
+}
+
+let allExercisesList = [];
+let currentCategoryFilter = 'all';
+let currentSearchQuery = '';
+
+function openExerciseList() {
+    closeModal('addExerciseModal');
+    
+    // ★★★ СОХРАНЯЕМ НАЗВАНИЕ ПЕРЕД УХОДОМ ★★★
+    if (editIsCustom || editWorkoutId === 'new') {
+        const nameInput = document.getElementById('editWorkoutName');
+        if (nameInput) {
+            localStorage.setItem('temp_edit_name', nameInput.value);
+        }
+        localStorage.setItem('temp_edit_exercises', JSON.stringify(editExercises));
+        localStorage.setItem('temp_edit_category', editCategory);
+        localStorage.setItem('temp_edit_level', editLevel);
+        localStorage.setItem('temp_edit_isCustom', editIsCustom);
+        localStorage.setItem('temp_edit_id', editWorkoutId || '');
+        const selectedIcon = document.querySelector('#createExerciseIconPicker .icon-option-active');
+        if (selectedIcon) localStorage.setItem('temp_edit_icon', selectedIcon.dataset.icon);
+    }
+    
+    allExercisesList = getAllExercises();
+    currentCategoryFilter = 'all';
+    currentSearchQuery = '';
+    document.getElementById('exerciseSearchInput').value = '';
+    window.navigateTo('exercise-list');
+}
+
+// ===================РЕНДЕР СТРАНИЦЫ СПИСКА УПРАЖНЕНИЙ ===================
+function renderExerciseListPage() {
+    const premium = hasPremium();
+
+    // ★ Обновляем активное состояние + подсветку премиума
+    document.querySelectorAll('#exerciseCategoryFilter .icon-option').forEach(el => {
+        el.classList.toggle('icon-option-active', el.dataset.category === currentCategoryFilter);
+
+        // ★ Помечаем премиум-категории классом locked, если нет премиума
+        if (el.classList.contains('icon-option-premium')) {
+            el.classList.toggle('locked', !premium);
+        }
+    });
+
+    // ★ Обработчик клика
+    document.querySelectorAll('#exerciseCategoryFilter .icon-option').forEach(el => {
+        el.onclick = function() {
+            document.querySelectorAll('#exerciseCategoryFilter .icon-option').forEach(e => e.classList.remove('icon-option-active'));
+            this.classList.add('icon-option-active');
+            currentCategoryFilter = this.dataset.category;
+            renderExerciseListPageContent();
+        };
+    });
+    
+    // ★★★ НАСТРАИВАЕМ ПОИСК УПРАЖНЕНИЙ ★★★
+    const searchInput = document.getElementById('exerciseSearchInput');
+    const searchBtn = document.getElementById('searchExerciseBtn');
+    
+    if (searchBtn) {
+        searchBtn.onclick = function() {
+            currentSearchQuery = searchInput.value.trim().toLowerCase();
+            renderExerciseListPageContent();
+        };
+    }
+    
+    if (searchInput) {
+        searchInput.oninput = function() {
+            currentSearchQuery = this.value.trim().toLowerCase();
+            renderExerciseListPageContent();
+        };
+    }
+    
+    renderExerciseListPageContent();
+}
+
+function goBackToEditWorkout() {
+    // ★★★ СОХРАНЯЕМ ВСЁ ПЕРЕД ВОЗВРАТОМ ★★★
+    if (editIsCustom || editWorkoutId === 'new') {
+        const nameInput = document.getElementById('editWorkoutName');
+        if (nameInput) {
+            localStorage.setItem('temp_edit_name', nameInput.value);
+        }
+        localStorage.setItem('temp_edit_exercises', JSON.stringify(editExercises));
+        localStorage.setItem('temp_edit_category', editCategory);
+        localStorage.setItem('temp_edit_level', editLevel);
+        localStorage.setItem('temp_edit_isCustom', editIsCustom);
+        localStorage.setItem('temp_edit_id', editWorkoutId || '');
+        const selectedIcon = document.querySelector('#createExerciseIconPicker .icon-option-active');
+        if (selectedIcon) localStorage.setItem('temp_edit_icon', selectedIcon.dataset.icon);
+    }
+    
+    window.navigateTo('workout-edit', {
+        category: editCategory,
+        isCustom: editIsCustom,
+        id: editWorkoutId,
+        level: editLevel,
+        exercises: editExercises
+    });
+}
+
+function renderExerciseListPageContent() {
+    const container = document.getElementById('exerciseListContainer');
+    const searchQuery = currentSearchQuery.toLowerCase();
+    let filtered = allExercisesList;
+    
+    // Фильтр по категории
+    if (currentCategoryFilter !== 'all') {
+        filtered = filtered.filter(ex => ex.category === currentCategoryFilter);
+    }
+    
+    // Поиск по названию
+    if (searchQuery) {
+        filtered = filtered.filter(ex => ex.name.toLowerCase().includes(searchQuery));
+    }
+    
+    // ★★★ ФИЛЬТРУЕМ PREMIUM УПРАЖНЕНИЯ ★★★
+    const premiumCategories = ['Кроссфит', 'Мужская сила', 'Женское счастье', 'ГТО'];
+    const hasPremiumAccess = hasPremium();  // ← проверяем актуальный статус
+    
+    filtered.sort((a, b) => a.name.localeCompare(b.name));
+    
+    if (filtered.length === 0) {
+        let message = 'Упражнения не найдены';
+        if (!hasPremiumAccess && currentCategoryFilter !== 'all' && premiumCategories.includes(currentCategoryFilter)) {
+            message = 'Купите PREMIUM, чтобы открыть их!';
+        }
+        container.innerHTML = `<div class="empty-state"><span class="empty-icon">📋</span><h3 class="empty-title">${message}</h3><p class="empty-text">По вашему запросу ничего не нашлось.</p></div>`;
+        return;
+    }
+    
+container.innerHTML = filtered.map(ex => {
+    const icon = ex.icon || getExerciseIcon(ex.name);
+    const isPremium = premiumCategories.includes(ex.category);
+    const disabled = isPremium && !hasPremiumAccess;
+
+    let detailsText = `${formatSets(ex.sets)} × ${formatReps(ex.reps)}`;
+    if (hasWeight(ex) && ex.weight > 0) {
+        detailsText += ` · ${ex.weight} кг`;
+    }
+
+    return `<div class="item-card exercise-list-card ${disabled ? 'premium-locked' : ''}"
+                 onclick="${disabled ? 'openPremiumModal()' : `addExerciseFromList('${ex.name}', ${ex.sets}, '${ex.reps}')`}">
+        <div class="item-icon">
+            ${icon ? `<img src="images/${icon}.png">` : ''}
+        </div>
+        <div class="item-info">
+            <h3 class="item-title">${ex.name}</h3>
+            <p class="item-desc">${detailsText}</p>
+        </div>
+        ${disabled ? '<span class="premium-badge">PR</span>' : ''}
+        <button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>
+    </div>`;
+}).join('');
+}
+
+// ===================ДОБАВЛЕНИЕ УПРАЖНЕНИЯ ===================
+function openAddExerciseModal() {
+    const maxExercises = getMaxExercisesForLevel(editLevel, editIsCustom);
+    if (editExercises.length >= maxExercises) {
+        showToast(`⚠️ Вы достигли максимума упражнений ${maxExercises}!`);
+        return;
+    }
+    
+    // ★★★ СОХРАНЯЕМ СОСТОЯНИЕ ПЕРЕД ОТКРЫТИЕМ МОДАЛКИ ★★★
+    if (editIsCustom || editWorkoutId === 'new') {
+        const nameInput = document.getElementById('editWorkoutName');
+        if (nameInput) {
+            localStorage.setItem('temp_edit_name', nameInput.value);
+        }
+        localStorage.setItem('temp_edit_exercises', JSON.stringify(editExercises));
+        localStorage.setItem('temp_edit_category', editCategory);
+        localStorage.setItem('temp_edit_level', editLevel);
+        localStorage.setItem('temp_edit_isCustom', editIsCustom);
+        localStorage.setItem('temp_edit_id', editWorkoutId || '');
+        const selectedIcon = document.querySelector('#createExerciseIconPicker .icon-option-active');
+        if (selectedIcon) localStorage.setItem('temp_edit_icon', selectedIcon.dataset.icon);
+    }
+    
+    openModal('addExerciseModal');
+}
+
+function closeAddExerciseModal() {
+    closeModal('addExerciseModal');
+}
+
+// ===================ДОБАВЛЕНИЕ УПРАЖНЕНИЯ ИЗ СПИСКА ===================
+function addExerciseFromList(name, sets, reps) {
+    const repsStr = String(reps || '');
+    const isSeconds = repsStr.includes('сек') || repsStr.includes('с') || repsStr.includes('Секунд');
+    const repsValue = parseInt(repsStr.replace(/[^0-9.]/g, '')) || 0;
+    const repsDisplay = isSeconds ? `${repsValue} секунд` : `${repsValue}`;
+    
+    let icon = null;
+    let weight = 0;
+    let images = []; // ← ДОБАВЛЯЕМ ПЕРЕМЕННУЮ ДЛЯ ВЕСА
+    
+    if (typeof EXERCISES_CATALOG !== 'undefined') {
+        const found = EXERCISES_CATALOG.find(e => e.name === name);
+        if (found) images = Array.isArray(found.images) ? [...found.images] : [];
+        if (found && found.icon) {
+            icon = found.icon;
+            weight = found.weight || 0; // ← ПОЛУЧАЕМ ВЕС ИЗ КАТАЛОГА
+        } else if (found && found.category) {
+            const categoryIconMap = {
+                'Грудь': 'breast',
+                'Спина': 'back',
+                'Ноги': 'legs',
+                'Плечи': 'shoulder',
+                'Пресс': 'press',
+                'Руки': 'bodybuilding',
+                'Всё тело': 'WholeBody',
+                'Кардио': 'cardio',
+                'Растяжка': 'stretching',
+                'Растяжка позвоночника': 'stretching-back',
+                'Зарядка': 'charging',
+                'Пилатес': 'Pilates',
+                'Кроссфит': 'crossfit',
+                'Мужская сила': 'men',
+                'Женское счастье': 'woman'
+            };
+            icon = categoryIconMap[found.category] || null;
+            weight = found.weight || 0; // ← ПОЛУЧАЕМ ВЕС ИЗ КАТАЛОГА
+        }
+    }
+    
+    // ★★★ ДОБАВЛЯЕМ ВЕС В УПРАЖНЕНИЕ ★★★
+    editExercises.push({ 
+        name: name, 
+        sets: parseInt(sets) || 3, 
+        reps: repsDisplay,
+        icon: icon,
+        weight: weight,
+        images: images // Пути к фотографиям из каталога
+    });
+    
+    showToast('✅ Упражнение добавлено');
+
+    if (editIsCustom || editWorkoutId === 'new') {
+        const nameInput = document.getElementById('editWorkoutName');
+        if (nameInput) localStorage.setItem('temp_edit_name', nameInput.value);
+        localStorage.setItem('temp_edit_exercises', JSON.stringify(editExercises));
+        localStorage.setItem('temp_edit_category', editCategory);
+        localStorage.setItem('temp_edit_level', editLevel);
+        localStorage.setItem('temp_edit_isCustom', editIsCustom);
+        localStorage.setItem('temp_edit_id', editWorkoutId || '');
+        
+        const selectedIcon = document.querySelector('#createExerciseIconPicker .icon-option-active');
+        const iconToSave = selectedIcon ? selectedIcon.dataset.icon : 
+                          (localStorage.getItem('temp_edit_icon') || null);
+        localStorage.setItem('temp_edit_icon', iconToSave);
+    }
+
+    window.navigateTo('workout-edit', {
+        category: editCategory,
+        isCustom: editIsCustom,
+        id: editWorkoutId,
+        level: editLevel,
+        exercises: editExercises
+    });
+}
+
+
+// ===================ОФЛАЙН МОДАЛКА ===================
+function showOfflineModal() {
+    openModal('offlineModal');
+}
+
+function closeOfflineModal() {
+    closeModal('offlineModal');
+    const loadingPage = document.getElementById('page-loading');
+    if (loadingPage && loadingPage.classList.contains('page-active')) {
+        enterApp();
+    }
+}
+
+window.addEventListener('offline', function() {
+    const loadingPage = document.getElementById('page-loading');
+    if (loadingPage && loadingPage.classList.contains('page-active')) return;
+    const isInApp = document.getElementById('page-workouts').classList.contains('page-active') ||
+                    document.getElementById('page-stats').classList.contains('page-active') ||
+                    document.getElementById('page-profile').classList.contains('page-active');
+    if (!isInApp) return;
+    if (!isOfflineModalShown) {
+        showOfflineModal();
+        isOfflineModalShown = true;
+    }
+});
+
+window.addEventListener('online', function() {
+    closeOfflineModal();
+    isOfflineModalShown = false;
+    if (typeof syncPendingWorkouts === 'function') syncPendingWorkouts();
+});
+
+// ===================УВЕДОМЛЕНИЕ О РЕЙТИНГЕ ===================
+function checkRankNotification(currentRank, type) {
+    const key = type === 'world' ? LAST_WORLD_RANK_KEY : LAST_FRIENDS_RANK_KEY;
+    const lastRank = parseInt(localStorage.getItem(key) || '0');
+    
+    // Проверяем, улучшился ли рейтинг
+    if (currentRank < lastRank || lastRank === 0) {
+        const rankText = currentRank <= 3 ? '🥇' : currentRank <= 10 ? '⭐' : '📈';
+        const rankName = type === 'world' ? 'мировом' : 'дружеском';
+        
+        const id = `${type}_rank_${currentRank}_${Date.now()}`;
+        if (!isNotificationSeen(id)) {
+            // ★★★ ДЛЯ ОБОИХ ТИПОВ ОТКРЫВАЕМ СТАТИСТИКУ ★★★
+            const okAction = function() {
+                // Переключаемся на вкладку "world" в статистике
+                switchStatsTab('world');
+                window.navigateTo('stats');
+                setTimeout(() => {
+                    loadWorldLeaderboard();
+                    loadFriendsLeaderboard();
+                }, 300);
+            };
+            
+            showNotification(
+                rankText,
+                `В ${rankName} рейтинге вы на ${currentRank}-м месте!`,
+                null,
+                true,  // autoClose
+                okAction
+            );
+            markNotificationSeen(id);
+        }
+    }
+    
+    localStorage.setItem(key, String(currentRank));
+}
+
+// ===================МИРОВОЙ РЕЙТИНГ ===================
+async function loadWorldLeaderboard() {
+    const container = document.getElementById('worldLeaderboard');
+    if (!container) return;
+    container.innerHTML = Skeleton.itemCardList(5);
+    try {
+        const user = await getFirebaseUser();
+        if (!user) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:2rem 0;">Авторизуйтесь, чтобы увидеть рейтинг</div>';
+            return;
+        }
+        const snapshot = await firebase.firestore()
+            .collection('users')
+            .orderBy('totalXp', 'desc')
+            .limit(30)
+            .get();
+        const users = [];
+        snapshot.forEach(doc => { users.push({ id: doc.id, ...doc.data() }); });
+        if (users.length === 0) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:2rem 0;">Пока нет пользователей</div>';
+            return;
+        }
+        
+        const currentRank = users.findIndex(u => u.id === user.uid) + 1;
+        if (currentRank > 0) {
+            checkRankNotification(currentRank, 'world');
+        }
+        
+        const visible = getAchievementsVisibility();
+        
+        container.innerHTML = users.map((userData, index) => {
+            const position = index + 1;
+            const achievements = userData.achievements || {};
+            const isCurrentUser = userData.id === user.uid;
+            const level = getCurrentLevel(userData.totalXp || 0).id;
+            
+            // ★★★ ОКРУГЛЯЕМ XP ДО ЦЕЛОГО ★★★
+            const xpRounded = Math.round(userData.totalXp || 0);
+            
+            let infoHtml = '';
+            if (visible) {
+const achievementIcons = [
+    { id: 'friendly', icon: 'fa-solid fa-user-group' },
+    { id: 'marathoner', icon: 'fa-solid fa-dumbbell' },
+    { id: 'fitnessMaster', icon: 'fa-solid fa-heart-pulse' },
+    { id: 'unstoppable', icon: 'fa-solid fa-fire' },
+    { id: 'ironEndurance', icon: 'fa-solid fa-stopwatch' },
+    { id: 'masterOfStyles', icon: 'fa-solid fa-award' },
+    { id: 'vip', icon: 'fa-solid fa-crown' }
+];
+                infoHtml = achievementIcons.map(a => {
+                    const unlocked = achievements[a.id] === true;
+                    return `<span class="achievement-icon-top ${unlocked ? 'unlocked' : 'locked'}"><i class="${a.icon}"></i></span>`;
+                }).join('');
+            } else {
+                infoHtml = `<span style="font-size:0.6rem; color:var(--slate);">Уровень ${level}</span>`;
+            }
+            
+            return `<div class="item-card ${isCurrentUser ? 'current-user' : ''}">
+                <div class="item-icon" style="width:40px;height:40px;min-width:40px;background:var(--accent-light);border-radius:10px;display:flex;align-items:center;justify-content:center;">
+                    <span style="font-size:1rem;font-weight:700;color:var(--accent);">${position}</span>
+                </div>
+                <div class="item-info">
+                    <h3 class="item-title">${userData.displayName || 'Пользователь'}</h3>
+                    <p class="item-desc">${infoHtml}</p>
+                </div>
+                <div class="item-xp">${xpRounded} XP</div>
+            </div>`;
+        }).join('');
+    } catch (error) {
+        console.error('Ошибка загрузки рейтинга:', error);
+        let message = 'Ошибка загрузки. Проверьте интернет.';
+        if (error.code === 'failed-precondition' && error.message.includes('index')) {
+            message = 'Для рейтинга требуется создать индекс в Firebase. Обратитесь к администратору.';
+        }
+        container.innerHTML = `<div style="text-align:center;color:#EF4444;padding:2rem 0;">${message}</div>`;
+    }
+}
+
+// ===================РЕЙТИНГ ДРУЗЕЙ ===================
+async function loadFriendsLeaderboard() {
+    const container = document.getElementById('friendsLeaderboard');
+    if (!container) {
+        console.warn('Контейнер friendsLeaderboard не найден');
+        return;
+    }
+    
+    container.innerHTML = Skeleton.itemCardList(3);
+    
+    try {
+        const user = await getFirebaseUser();
+        if (!user) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:2rem 0;">Авторизуйтесь, чтобы увидеть рейтинг друзей</div>';
+            return;
+        }
+
+        const friendsResult = await getFriendsList();
+        if (!friendsResult.success) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:2rem 0;">Ошибка загрузки друзей</div>';
+            return;
+        }
+
+        const friends = friendsResult.data || [];
+
+        const userProfileResult = await getUserProfile(user.uid);
+        if (!userProfileResult.success) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:2rem 0;">Ошибка загрузки друзей</div>';
+            return;
+        }
+
+        let allUsers = [
+            { id: user.uid, ...userProfileResult.data, isCurrentUser: true }
+        ];
+        
+        friends.forEach(friend => {
+            allUsers.push({ ...friend, isCurrentUser: false });
+        });
+
+        allUsers.sort((a, b) => (b.totalXp || 0) - (a.totalXp || 0));
+
+        const currentRank = allUsers.findIndex(u => u.id === user.uid) + 1;
+        if (currentRank > 0) {
+            checkRankNotification(currentRank, 'friends');
+        }
+
+        const visible = getAchievementsVisibility();
+
+        let html = allUsers.map((userData, index) => {
+            const position = index + 1;
+            const isCurrentUser = userData.isCurrentUser;
+            const name = userData.displayName || 'Пользователь';
+            const achievements = userData.achievements || {};
+            const level = getCurrentLevel(userData.totalXp || 0).id;
+            
+            // ★★★ ОКРУГЛЯЕМ XP ДО ЦЕЛОГО ★★★
+            const xpRounded = Math.round(userData.totalXp || 0);
+            
+            let infoHtml = '';
+            if (visible) {
+const achievementIcons = [
+    { id: 'friendly', icon: 'fa-solid fa-user-group' },
+    { id: 'marathoner', icon: 'fa-solid fa-dumbbell' },
+    { id: 'fitnessMaster', icon: 'fa-solid fa-heart-pulse' },
+    { id: 'unstoppable', icon: 'fa-solid fa-fire' },
+    { id: 'ironEndurance', icon: 'fa-solid fa-stopwatch' },
+    { id: 'masterOfStyles', icon: 'fa-solid fa-award' },
+    { id: 'vip', icon: 'fa-solid fa-crown' }
+];
+                infoHtml = achievementIcons.map(a => {
+                    const unlocked = achievements[a.id] === true;
+                    return `<span class="achievement-icon-top ${unlocked ? 'unlocked' : 'locked'}"><i class="${a.icon}"></i></span>`;
+                }).join('');
+            } else {
+                infoHtml = `<span style="font-size:0.6rem; color:var(--slate);">Уровень ${level}</span>`;
+            }
+            
+            return `<div class="item-card ${isCurrentUser ? 'current-user' : ''}">
+                <div class="item-icon" style="width:40px;height:40px;min-width:40px;background:var(--accent-light);border-radius:10px;display:flex;align-items:center;justify-content:center;">
+                    <span style="font-size:1rem;font-weight:700;color:var(--accent);">${position}</span>
+                </div>
+                <div class="item-info">
+                    <h3 class="item-title">${name}</h3>
+                    <p class="item-desc">${infoHtml}</p>
+                </div>
+                <div class="item-xp">${xpRounded} XP</div>
+            </div>`;
+        }).join('');
+
+if (friends.length === 0) {
+    html += `
+        <div class="empty-state">
+            <span class="empty-icon">👥</span>
+            <h3 class="empty-title">Нет друзей</h3>
+            <p class="empty-text">Добавьте друзей, чтобы соревноваться!</p>
+            <button class="btn btn-primary" onclick="focusFriendSearch()">
+                <i class="fa-solid fa-magnifying-glass"></i> Найти друзей
+            </button>
+        </div>`;
+}
+
+        container.innerHTML = html;
+
+    } catch (error) {
+        console.error('Ошибка загрузки рейтинга друзей:', error);
+        container.innerHTML = `<div style="text-align:center;color:#EF4444;padding:2rem 0;">Ошибка загрузки. Проверьте интернет.</div>`;
+    }
+}
+
+// ===================ТОСТ ===================
+// =================== ОЧЕРЕДЬ ТОСТОВ ===================
+const TOAST_QUEUE_MAX = 5;              // максимум в очереди
+const TOAST_PAUSE_BETWEEN_MS = 120;     // пауза между тостами
+
+let toastQueue = [];
+let isToastShowing = false;
+
+/**
+ * Показать тост. Если сейчас показывается другой — встаём в очередь.
+ */
+function formatToastMessage(message) {
+    const raw = String(message ?? '').trim().replace(/\s+/g, ' ');
+    if (!raw) return '💪';
+    const leadingEmoji = raw.match(/^\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?/u);
+    if (leadingEmoji) return raw;
+    return `💪 ${raw}`;
+}
+
+function showToast(message, duration = 3000) {
+    message = formatToastMessage(message);
+    // ★★★ НЕ ПОКАЗЫВАЕМ ТОСТЫ НА ЭКРАНАХ АВТОРИЗАЦИИ ★★★
+    const forbiddenPages = [
+        'page-hero',
+        'page-loading',
+        'page-login',
+        'page-login-password',
+        'page-register',
+        'page-register-email',
+        'page-register-password',
+        'page-register-verify',
+        'page-register-gender',
+        'page-register-body',
+        'page-inventory'
+    ];
+    for (const id of forbiddenPages) {
+        const el = document.getElementById(id);
+        if (el && el.classList.contains('page-active')) {
+            console.log('🔇 Тост подавлен на экране ' + id + ':', message);
+            return;
+        }
+    }
+
+    // ★★★ ЗАЩИТА ОТ СПАМА: ограничиваем размер очереди ★★★
+    if (toastQueue.length >= TOAST_QUEUE_MAX) {
+        console.warn('⚠️ Очередь тостов переполнена, сообщение отброшено:', message);
+        return;
+    }
+
+    toastQueue.push({ message, duration });
+    processToastQueue();
+}
+
+/**
+ * Взять следующий тост из очереди и показать его.
+ * Если что-то уже показывается или очередь пуста — ничего не делаем.
+ */
+function processToastQueue() {
+    if (isToastShowing) return;
+    if (toastQueue.length === 0) return;
+
+    isToastShowing = true;
+    const { message, duration } = toastQueue.shift();
+
+    const toast = document.createElement('div');
+    toast.id = 'toast';
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    // ★★★ ДВОЙНОЙ rAF — браузер успеет отрисовать стартовое состояние ★★★
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            toast.classList.add('show');
+        });
+    });
+
+    // ★★★ АВТО-СКРЫТИЕ ★★★
+    const hideTimeout = setTimeout(() => {
+        hideToast(toast);
+    }, duration);
+
+    toast._hideTimeout = hideTimeout;
+}
+
+/**
+ * Плавно скрыть конкретный тост и запустить следующий из очереди.
+ */
+function hideToast(toastEl) {
+    // ★★★ ЗАЩИТА: если элемента уже нет в DOM — просто продолжаем очередь ★★★
+    if (!toastEl || !toastEl.parentNode) {
+        isToastShowing = false;
+        setTimeout(processToastQueue, TOAST_PAUSE_BETWEEN_MS);
+        return;
+    }
+
+    // очищаем таймер авто-скрытия, если он ещё висит
+    clearTimeout(toastEl._hideTimeout);
+
+    // запускаем анимацию исчезновения
+    toastEl.classList.remove('show');
+    toastEl.classList.add('hiding');
+
+    setTimeout(() => {
+        if (toastEl.parentNode) toastEl.remove();
+
+        // ★★★ ТЕКУЩИЙ ТОСТ ЗАВЕРШЁН — ОБРАБАТЫВАЕМ СЛЕДУЮЩИЙ ★★★
+        isToastShowing = false;
+        setTimeout(processToastQueue, TOAST_PAUSE_BETWEEN_MS);
+    }, 280);
+}
+
+// ===================ТУТОРИАЛ ===================
+const TUTORIAL_KEY = 'tutorialCompleted';
+
+function isTutorialCompleted() {
+    return localStorage.getItem(TUTORIAL_KEY) === 'true';
+}
+
+function setTutorialCompleted() {
+    localStorage.setItem(TUTORIAL_KEY, 'true');
+}
+
+let currentTutorialStep = 0;
+let tutorialActive = false;
+
+let _savedEditPagesState = true;
+let _savedEditWorkoutState = true;
+
+function startTutorial() {
+    if (isTutorialCompleted()) {
+        console.log('✅ Обучение уже завершено, пропускаем');
+        return;
+    }
+    
+    if (document.getElementById('tutorialOverlay')) return;
+
+    // ★★★ ВОТ ЭТА СТРОКА — помечаем, что в сессии был туториал ★★★
+    sessionStorage.setItem('tutorialRanThisSession', 'true');
+
+    tutorialActive = true;
+
+    _savedEditPagesState = localStorage.getItem(EDIT_PAGES_KEY) !== 'false';
+    _savedEditWorkoutState = localStorage.getItem(EDIT_WORKOUT_KEY) !== 'false';
+
+    localStorage.setItem(EDIT_PAGES_KEY, 'true');
+    localStorage.setItem(EDIT_WORKOUT_KEY, 'true');
+    updateEditPagesUI(true);
+    updateEditWorkoutUI(true);
+
+    tutorialActive = true;
+    document.addEventListener('click', blockClicksDuringTutorial, true);
+    showTutorialStep(0);
+}
+
+// ★★★ НОВАЯ ФУНКЦИЯ ДЛЯ КНОПКИ ОБУЧЕНИЯ ★★★
+function restartTutorial() {
+    // Сбрасываем флаг завершения
+    localStorage.removeItem(TUTORIAL_KEY);
+    
+    // Сбрасываем в Firestore
+    const user = firebase.auth().currentUser;
+    if (user) {
+        firebase.firestore().collection('users').doc(user.uid).update({
+            tutorialCompleted: false
+        }).catch(() => {});
+    }
+    
+    // Запускаем туториал
+    startTutorial();
+}
+
+function blockClicksDuringTutorial(e) {
+    if (!tutorialActive) return;
+    const tooltip = document.querySelector('.tutorial-tooltip');
+    if (tooltip && tooltip.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    return false;
+}
+
+function createTutorialOverlay(step) {
+    const overlay = document.createElement('div');
+    overlay.id = 'tutorialOverlay';
+    overlay.className = 'tutorial-overlay';
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    // ★★★ УПРАВЛЯЕМ ПУЗЫРЬКОМ НАВИГАЦИИ ★★★
+    const nav = document.getElementById('bottomNav');
+    if (nav) {
+        if (step.id === 1) {
+            nav.classList.add('tutorial-hide-bubble');   // ← шаг 1: прячем
+        } else {
+            nav.classList.remove('tutorial-hide-bubble'); // ← остальные: показываем
+        }
+    }
+
+    let highlightElements = [];
+    if (step.highlight) {
+        if (Array.isArray(step.highlight)) {
+            const elements = [];
+            step.highlight.forEach(sel => {
+                if (sel.startsWith('.')) {
+                    document.querySelectorAll(sel).forEach(el => elements.push(el));
+                } else {
+                    const el = document.querySelector(sel);
+                    if (el) elements.push(el);
+                }
+            });
+            highlightElements = [...new Set(elements)];
+        } else {
+            const elements = document.querySelectorAll(step.highlight);
+            highlightElements = Array.from(elements);
+        }
+        
+        highlightElements.forEach(el => {
+            el.classList.add('tutorial-highlight');
+            
+            // ★★★ ПРОХОДИМ ПО ВСЕМ РОДИТЕЛЯМ И УБИРАЕМ ОБРЕЗАНИЕ ★★★
+            let parent = el.parentElement;
+            while (parent && parent !== document.body) {
+                parent.classList.add('tutorial-parent-visible');
+                parent = parent.parentElement;
+            }
+        });
+        
+        setTimeout(() => {
+            highlightElements.forEach(el => {
+                el.classList.add('tutorial-highlight-active');
+                setTimeout(() => el.classList.add('pulsing'), 100);
+            });
+        }, 50);
+        overlay._highlightElements = highlightElements;
+    }
+
+    let dotsHtml = '';
+    for (let i = 0; i < tutorialSteps.length; i++) {
+        let dotClass = 'tutorial-dot';
+        if (i < currentTutorialStep) {
+            dotClass += ' tutorial-dot-active';
+        } else if (i === currentTutorialStep) {
+            dotClass += ' tutorial-dot-active';
+        }
+        dotsHtml += `<div class="${dotClass}"></div>`;
+    }
+    const isLast = step.isLast || false;
+    const buttonText = isLast ? 'Начать тренироваться' : 'Понятно';
+
+    const tooltip = document.createElement('div');
+    tooltip.className = 'tutorial-tooltip';
+    tooltip.id = 'tutorialTooltip';
+
+    tooltip.style.position = 'fixed';
+    tooltip.style.left = '50%';
+    tooltip.style.transform = 'translateX(-50%)';
+    tooltip.style.zIndex = '10001';
+    tooltip.style.maxWidth = '500px';
+    tooltip.style.width = '90%';
+    tooltip.style.bottom = '30px';
+    tooltip.style.top = 'auto';
+
+    tooltip.innerHTML = `
+        <div class="tutorial-dots">${dotsHtml}</div>
+        <p class="tutorial-text">${step.text}</p>
+        <div class="tutorial-buttons">
+            <button class="btn btn-primary" onclick="nextTutorialStep()">${buttonText}</button>
+        </div>
+    `;
+    document.body.appendChild(tooltip);
+
+    const autoSteps = [null]; //тут числа
+    const isAuto = autoSteps.includes(step.id) && highlightElements.length > 0;
+
+if (isAuto) {
+    const targetEl = highlightElements[0];
+
+    // 1. Проверяем, виден ли уже элемент
+    const rectBefore = targetEl.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const fullyVisible = rectBefore.top >= 0 && rectBefore.bottom <= vh;
+
+    const positionTooltip = () => {
+        const tooltipRect = tooltip.getBoundingClientRect();
+        const tooltipHeight = tooltipRect.height;
+        const rect = targetEl.getBoundingClientRect();
+
+        // Пробуем разместить сверху
+        let topPosition = rect.top - tooltipHeight - 30;
+
+        if (topPosition >= 10) {
+            // Помещается сверху — ставим над элементом
+            tooltip.style.top = topPosition + 'px';
+            tooltip.style.bottom = 'auto';
+        } else {
+            // Не помещается сверху — ставим снизу
+            tooltip.style.top = 'auto';
+            tooltip.style.bottom = '30px';
+        }
+
+        tooltip.classList.add('tutorial-tooltip-active');
+    };
+
+    if (fullyVisible) {
+        // Элемент виден — считаем сразу
+        requestAnimationFrame(() => {
+            requestAnimationFrame(positionTooltip);
+        });
+    } else {
+        // Нужна прокрутка — ждём её завершения
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(positionTooltip, 700);
+    }
+} else {
+    setTimeout(() => {
+        tooltip.classList.add('tutorial-tooltip-active');
+    }, 200);
+}
+
+    setTimeout(() => overlay.classList.add('tutorial-overlay-active'), 50);
+}
+
+function removeTutorialOverlay() {
+    // ★★★ ВОЗВРАЩАЕМ ПУЗЫРЁК НАВИГАЦИИ ★★★
+    const nav = document.getElementById('bottomNav');
+    if (nav) {
+        nav.classList.remove('tutorial-hide-bubble');
+    }
+
+    const overlay = document.getElementById('tutorialOverlay');
+    if (overlay) {
+        overlay.classList.remove('tutorial-overlay-active');
+        if (overlay._highlightElements) {
+            overlay._highlightElements.forEach(el => {
+                el.classList.remove('tutorial-highlight-active', 'pulsing');
+                setTimeout(() => el.classList.remove('tutorial-highlight'), 400);
+            });
+        }
+        setTimeout(() => overlay.remove(), 500);
+    }
+    const tooltip = document.querySelector('.tutorial-tooltip');
+    if (tooltip) {
+        tooltip.classList.remove('tutorial-tooltip-active');
+        setTimeout(() => tooltip.remove(), 400);
+    }
+}
+
+function showTutorialStep(index) {
+    if (index >= tutorialSteps.length) {
+        finishTutorial();
+        return;
+    }
+
+    const step = tutorialSteps[index];
+    currentTutorialStep = index;
+
+    if (step.page) window.navigateTo(step.page);
+
+    const showOverlay = () => createTutorialOverlay(step);
+
+    if (step.action) {
+        setTimeout(async () => {
+            try {
+                await step.action();
+            } catch (error) {
+                console.error('Ошибка подготовки шага обучения:', error);
+            }
+
+            showOverlay();
+        }, 600);
+    } else {
+        setTimeout(showOverlay, 800);
+    }
+}
+
+function nextTutorialStep() {
+    const nextIndex = currentTutorialStep + 1;
+    removeTutorialOverlay();
+    setTimeout(() => showTutorialStep(nextIndex), 400);
+}
+
+async function finishTutorial() {
+    removeTutorialOverlay();
+    setTutorialCompleted(); // ← Сохраняем в localStorage
+    const user = await getFirebaseUser();
+    if (user) await updateUserProfile(user.uid, { tutorialCompleted: true }); // ← Сохраняем в Firestore
+    tutorialActive = false;
+    document.removeEventListener('click', blockClicksDuringTutorial, true);
+
+    localStorage.setItem(EDIT_PAGES_KEY, String(_savedEditPagesState));
+    localStorage.setItem(EDIT_WORKOUT_KEY, String(_savedEditWorkoutState));
+    updateEditPagesUI(_savedEditPagesState);
+    updateEditWorkoutUI(_savedEditWorkoutState);
+
+    setTimeout(showRulesModal, 600);
+}
+
+// =================== УМНЫЙ ШАГ ДЛЯ ТУТОРИАЛА ===================
+
+function getTasksHighlight() {
+    const isDaily = checkAllTasksCompleted();
+    return isDaily 
+        ? ['#daily-tasks-block', '#daily-tasks-block .section-header']
+        : ['#tasks-block', '#tasks-block .section-header'];
+}
+
+function getTasksText() {
+    const isDaily = checkAllTasksCompleted();
+    return isDaily 
+        ? 'Это ваши ежедневные задания.\nВыполняйте их каждый день, чтобы получать дополнительный опыт!\nЗадания обновляются ежедневно.'
+        : 'Это ваши первые задания.\nВыполните все 5 заданий, чтобы открыть ежедневные задания!\nЗа каждое задание вы получаете +10 XP.';
+}
+
+const tutorialSteps = [
+    {
+        id: 1,
+        page: 'feed',
+        highlight: '#feedContainer .feed-post:first-child',
+        text: 'Тренировки не обязательно оставлять только для себя. Публикуйте свои результаты в Ленте, делитесь достижениями и следите за успехами других пользователей.',
+action: async () => {
+    await setFeedFilter('all');
+
+    const images = Array.from(
+        document.querySelectorAll('#feedContainer .feed-post img')
+    );
+
+    await Promise.all(
+        images.map(img => {
+            if (img.complete) return Promise.resolve();
+
+            return new Promise(resolve => {
+                img.addEventListener('load', resolve, { once: true });
+                img.addEventListener('error', resolve, { once: true });
+            });
+        })
+    );
+}
+    },
+    {
+        id: 2,
+        page: 'stats',
+        highlight: '.stats-summary#statsSummary .stat-card',
+        text: 'Следите за своим прогрессом: изучайте историю тренировок, активность и изменения результатов. В мировой статистике можно сравнить свои достижения с другими пользователями.',
+        action: () => {
+            switchStatsTab('personal');
+        }
+    },
+    {
+        id: 3,
+        page: 'workouts',
+        highlight: ['#workoutsBlocksContainer .item-card[data-category="Руки"]'],
+        text: 'Выбирайте готовую тренировку, подходящий уровень сложности и переходите к упражнениям. При необходимости можно изменить тренировку под себя или создать полностью собственную. Заниматься можно одному или вместе с друзьями.',
+        action: () => {
+            activeWorkoutsTab = 'ready';
+            applyWorkoutsTab('ready');
+        }
+    },
+    {
+        id: 4,
+        page: 'programs',
+        highlight: '#freeProgramsList .program-list-card:first-child',
+        text: 'Программы помогают выстроить системные тренировки. Выбирайте готовый план или создавайте свой: определяйте продолжительность, частоту занятий, распределяйте тренировки и дни отдыха.',
+        action: () => {
+            switchProgramTab('ready');
+        }
+    },
+    {
+        id: 5,
+        page: 'profile',
+        highlight: '.profile-card',
+        text: 'Ваш профиль развивается вместе с вами. Получайте XP за активность, повышайте уровень и открывайте достижения. Выполняйте задания, чтобы получать дополнительный опыт.',
+        action: () => {
+            switchProfileTab('my');
+        }
+    },
+    {
+        id: 6,
+        page: 'profile',
+        highlight: '.section-block[data-block-id="friends-search"]',
+        text: 'Добавляйте друзей, следите за их прогрессом и приглашайте их на совместные тренировки. После занятия можно сравнить результаты всех участников.',
+        action: () => {
+            switchProfileTab('friends');
+            renderFriendsInProfile();
+        }
+    },
+    {
+        id: 7,
+        page: 'workouts',
+        highlight: null,
+        text: 'Желаем отличной тренировки! Если не знаете, с чего начать, начните с выполнения заданий.',
+        isLast: true,
+        action: () => {
+            activeWorkoutsTab = 'ready';
+            applyWorkoutsTab('ready');
+        }
+    }
+];
+
+
+// ===================PREMIUM ===================
+// ★★★ Статус PREMIUM хранится в Firestore (поле users/{uid}.premium).
+// Флаг в localStorage больше НЕ используется — его легко подделать.
+// Глобальный кэш заполняется при загрузке профиля (onAuthStateChanged, loadProfile).
+window._userPremium = false;
+
+function hasPremium() {
+    return window._userPremium === true;
+}
+
+let premiumSlideshowRun = null;
+
+window.openPremiumSlideshow = function () {
+    if (premiumSlideshowRun) return premiumSlideshowRun;
+
+    premiumSlideshowRun = (async () => {
+        const dialog = document.getElementById('premiumSlideshow');
+        const stage = document.getElementById('premiumSlideshowStage');
+        const buyButton = document.getElementById('premiumSlideshowBuy');
+        const slideDuration = 3000;
+        const animate = window.matchMedia(
+            '(prefers-reduced-motion: no-preference)'
+        ).matches;
+        const introDuration = animate ? 1000 : 0;
+        const slidePrefix = document.body.classList.contains('theme-dark-mode')
+            ? 'D'
+            : 'L';
+
+        const slides = await Promise.all(
+            Array.from({ length: 6 }, async (_, index) => {
+                const slide = new Image();
+                slide.alt = `PREMIUM — ${index + 1} из 6`;
+                slide.src = `images/PREMIUM/${slidePrefix}-${index + 1}.png`;
+                await slide.decode();
+                return slide;
+            })
+        );
+
+        const totalDuration = slides.length * slideDuration;
+        let currentSlide = 0;
+        let startTime;
+
+        buyButton.disabled = true;
+        buyButton.style.setProperty('--premium-progress', '0%');
+        stage.replaceChildren(slides[0]);
+        dialog.oncancel = event => event.preventDefault();
+        dialog.showModal();
+
+        await new Promise(resolve => {
+            function update(timestamp) {
+                startTime ??= timestamp + introDuration;
+
+                const elapsed = Math.min(
+                    Math.max(timestamp - startTime, 0),
+                    totalDuration
+                );
+                const nextSlide = Math.min(
+                    Math.floor(elapsed / slideDuration),
+                    slides.length - 1
+                );
+
+                if (nextSlide !== currentSlide) {
+                    const previous = slides[currentSlide];
+                    const next = slides[nextSlide];
+
+                    if (animate) {
+                        previous.className = 'premium-slide-exit';
+                        next.className = 'premium-slide-enter';
+                        previous.addEventListener('animationend', () => {
+                            previous.remove();
+                        }, { once: true });
+                        stage.append(next);
+                    } else {
+                        stage.replaceChildren(next);
+                    }
+
+                    currentSlide = nextSlide;
+                }
+
+                buyButton.style.setProperty(
+                    '--premium-progress',
+                    `${(elapsed / totalDuration) * 100}%`
+                );
+
+                if (elapsed < totalDuration) {
+                    requestAnimationFrame(update);
+                } else {
+                    buyButton.disabled = false;
+                }
+            }
+
+            buyButton.onclick = () => {
+                if (buyButton.disabled) return;
+
+                buyButton.onclick = null;
+                dialog.close();
+                stage.replaceChildren();
+                resolve();
+            };
+
+            requestAnimationFrame(update);
+        });
+
+        openPremiumModal();
+    })().finally(() => {
+        premiumSlideshowRun = null;
+    });
+
+    return premiumSlideshowRun;
+};
+
+// В функцию openPremiumModal() добавить:
+function openPremiumModal() {
+    // Сброс выбора тарифа на Годовой
+    selectPremiumTariff('yearly');
+
+    // Обновляем счётчик PREMIUM
+    setTimeout(async () => {
+        await updatePremiumCounter();
+    }, 100);
+
+    openModal('premiumModal');
+}
+
+function closePremiumModal() {
+    closeModal('premiumModal');
+}
+
+function openPremiumActiveModal() {
+    openModal('premiumActiveModal');
+}
+
+function closePremiumActiveModal() {
+    closeModal('premiumActiveModal');
+}
+
+// =================== ОПЛАТА PREMIUM (СБП) ===================
+const PREMIUM_PAYMENT_CONFIG = {
+    // ★★★ ЗАМЕНИ НА СВОИ ДАННЫЕ ★★★
+    // Получи ссылки СБП в банке:
+    //  - оформи самозанятость (НПД)
+    //  - открой приложение банка (Т-Банк, ПСБ, Сбер)
+    //  - найди «Приём платежей по СБП» / «СБП QR»
+    //  - создай 2 ссылки: на 190₽ и на 2040₽
+    monthly: {
+        price: 190,
+        label: 'Ежемесячный',
+        link: 'https://messenger.sbrf.ru/sl/SSlaDz075ty9t5bXW'   // ← вставь ссылку СБП для 190 ₽
+    },
+    yearly: {
+        price: 2040,
+        label: 'Годовой',
+        link: 'https://messenger.sbrf.ru/sl/fQaOeRdQFNg2uVjbq'   // ← вставь ссылку СБП для 2040 ₽
+    }
+};
+
+let _premiumSelectedTariff = 'yearly';
+
+/** Выбор тарифа в основной модалке PREMIUM (по клику на карточку) */
+function selectPremiumTariff(tariff) {
+    _premiumSelectedTariff = tariff;
+
+    document.querySelectorAll('#premiumModal .premium-price-card').forEach(card => {
+        card.classList.toggle('premium-price-card-active', card.dataset.tariff === tariff);
+    });
+}
+
+/** Кнопка «Купить» в основной модалке → открывает окно оплаты */
+function buyPremium() {
+    closePremiumModal();
+    setTimeout(() => openPremiumPaymentModal(), 700);
+}
+
+function openPremiumPaymentModal() {
+    renderPremiumPaymentModal();
+    openModal('premiumPaymentModal');
+}
+
+function renderPremiumPaymentModal() {
+    const cfg = PREMIUM_PAYMENT_CONFIG[_premiumSelectedTariff];
+    if (!cfg) return;
+
+    // Информация о тарифе
+    const infoEl = document.getElementById('premiumPaymentTariffInfo');
+    if (infoEl) {
+        infoEl.textContent = `Тариф: ${cfg.label} · ${cfg.price} ₽`;
+    }
+
+    // QR-код
+    const qrWrapper = document.getElementById('premiumPaymentQr');
+    if (qrWrapper) {
+        qrWrapper.innerHTML = '';
+
+        if (cfg.link) {
+            const img = document.createElement('img');
+            img.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(cfg.link)}`;
+            img.alt = 'QR-код для оплаты';
+            img.onerror = () => {
+                img.remove();
+                const ph = document.createElement('div');
+                ph.className = 'payment-qr-placeholder';
+                ph.textContent = 'Не удалось загрузить QR. Воспользуйтесь кнопкой ниже.';
+                qrWrapper.appendChild(ph);
+            };
+            qrWrapper.appendChild(img);
+        } else {
+            const ph = document.createElement('div');
+            ph.className = 'payment-qr-placeholder';
+            ph.innerHTML = 'QR-код появится после настройки.<br>Оплата ещё не подключена.';
+            qrWrapper.appendChild(ph);
+        }
+    }
+
+    // Кнопка «Оплатить по ссылке»
+    const linkBtn = document.getElementById('premiumPaymentLinkBtn');
+    if (linkBtn) {
+        if (cfg.link) {
+            linkBtn.href = cfg.link;
+            linkBtn.style.display = '';
+        } else {
+            linkBtn.style.display = 'none';
+        }
+    }
+}
+
+window.buyPremium = buyPremium;
+window.selectPremiumTariff = selectPremiumTariff;
+window.openPremiumPaymentModal = openPremiumPaymentModal;
+
+/* function buyPremium() {
+    localStorage.setItem(PREMIUM_KEY, 'true');
+    closePremiumModal();
+    
+    // ★★★ ОБНОВЛЯЕМ ВСЕ UI ЭЛЕМЕНТЫ ★★★
+    updatePremiumUI();
+    updateWeeklyLoadBlocks();
+    
+    // ★★★ ОБНОВЛЯЕМ СТРАНИЦУ ТРЕНИРОВОК (ЕСЛИ ОНА АКТИВНА) ★★★
+    const workoutsPage = document.getElementById('page-workouts');
+    if (workoutsPage && workoutsPage.classList.contains('page-active')) {
+        if (typeof renderExerciseListPageContent === 'function') {
+            renderExerciseListPageContent();
+        }
+        updatePremiumUI();
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ СТАТИСТИКУ (ЕСЛИ ОНА АКТИВНА) ★★★
+    const statsPage = document.getElementById('page-stats');
+    if (statsPage && statsPage.classList.contains('page-active')) {
+        if (typeof loadPremiumStats === 'function') {
+            loadPremiumStats();
+        }
+        updateWeeklyLoadBlocks();
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ СПИСОК УПРАЖНЕНИЙ (ЕСЛИ ОН ОТКРЫТ) ★★★
+    const exerciseListPage = document.getElementById('page-exercise-list');
+    if (exerciseListPage && exerciseListPage.classList.contains('page-active')) {
+        if (typeof allExercisesList !== 'undefined') {
+            allExercisesList = getAllExercises();
+            renderExerciseListPageContent();
+        }
+    }
+    
+    // ★★★ СОХРАНЯЕМ PREMIUM В FIRESTORE И ОБНОВЛЯЕМ СЧЕТЧИК ★★★
+    (async function() {
+        const user = await getFirebaseUser();
+        if (user) {
+            await updateUserProfile(user.uid, { premium: true });
+            console.log('✅ PREMIUM сохранен в Firestore');
+            
+            // ★ Сбрасываем кэш — только что добавился +1 premium
+            Cache.aggregates.delete('premiumCount');
+            await updatePremiumCounter(true);
+        }
+    })();
+    
+    // ★★★ ПОКАЗЫВАЕМ УВЕДОМЛЕНИЕ ★★★
+    showToast('👑 Поздравляем! PREMIUM активирован!');
+    
+    // ★★★ ОТКРЫВАЕМ МОДАЛКУ PREMIUM АКТИВИРОВАН ★★★
+    setTimeout(() => openPremiumActiveModal(), 500);
+} */
+
+function updatePremiumUI() {
+    const premium = hasPremium();
+    const statusEl = document.getElementById('premiumStatus');
+    if (statusEl) {
+        statusEl.textContent = premium ? 'Активирован' : 'Откройте все особые тренировки';
+    }
+    const icon = document.querySelector('.settings-item .fa-crown');
+    if (icon) {
+        icon.className = 'fa-solid fa-crown';
+        icon.style.color = '#F7C948';
+    }
+    document.querySelectorAll('.item-card[data-premium="true"]').forEach(card => {
+        card.style.display = 'flex';
+    });
+    updateWeeklyLoadBlocks();
+}
+
+function updateWeeklyLoadBlocks() {
+    // Просто показываем блок, без проверки Premium
+    const originalBlock = document.getElementById('weekly-load-block');
+    if (originalBlock) {
+        originalBlock.style.display = 'block';
+    }
+}
+
+function checkPremiumAndNavigate(category) {
+    if (!hasPremium()) {
+        openModal('premiumModal');
+        return;
+    }
+    window.navigateTo('level-select', { category: category });
+}
+
+function handlePremiumClick() {
+    if (hasPremium()) {
+        openModal('premiumActiveModal');
+    } else {
+        openModal('premiumModal');
+    }
+}
+
+// ===================ВЫБОР ЦВЕТА ЧЕРЕЗ МОДАЛЬНОЕ ОКНО ===================
+function openColorModal() {
+    // ★★★ ЗАЩИТА ОТ ЗАЛИПШЕГО ФЛАГА ★★★
+    const stored = localStorage.getItem('themeColor') || 'red';
+    if (localStorage.getItem('themeColorCustom') === 'true' && !stored.startsWith('#')) {
+        localStorage.removeItem('themeColorCustom');
+        document.body.style.removeProperty('--accent');
+        document.body.style.removeProperty('--accent-dark');
+        document.body.style.removeProperty('--accent-light');
+    }
+    
+    const currentColor = localStorage.getItem('themeColor') || 'red';
+    const isCustom = localStorage.getItem('themeColorCustom') === 'true';
+    
+    // ★★★ СОХРАНЯЕМ ТЕКУЩИЙ ЦВЕТ КАК ВРЕМЕННЫЙ ★★★
+    tempColor = currentColor;
+    
+    // ★★★ УБИРАЕМ КАСТОМНЫЕ CSS-ПЕРЕМЕННЫЕ ★★★
+    document.body.style.removeProperty('--accent');
+    document.body.style.removeProperty('--accent-dark');
+    document.body.style.removeProperty('--accent-light');
+    
+    // ★★★ ПРИМЕНЯЕМ СТАНДАРТНЫЙ ЦВЕТ ЧЕРЕЗ КЛАСС ★★★
+    if (!isCustom) {
+        document.body.className = 'theme-' + currentColor;
+    } else {
+        applyColorToTheme(currentColor);
+    }
+    
+    const isDarkMode = localStorage.getItem('appThemeMode') === 'dark' || 
+                      (localStorage.getItem('appThemeMode') === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (isDarkMode) {
+        document.body.classList.add('theme-dark-mode');
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ АКТИВНУЮ КНОПКУ ★★★
+    updateColorButtons(currentColor);      // ← ДОБАВИТЬ ЭТУ СТРОКУ
+    updateColorStatus(currentColor);
+    
+    // ★★★ ОБНОВЛЯЕМ ПАЛИТРУ ★★★
+    const picker = document.getElementById('customColorPicker');
+    if (picker) {
+        picker.value = currentColor.startsWith('#') ? currentColor : '#DC143C';
+    }
+    
+    openModal('colorModal');
+}
+
+function closeColorModal() {
+    closeModal('colorModal');
+}
+
+document.querySelectorAll('.color-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const color = this.dataset.color;
+        document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('color-btn-active'));
+        this.classList.add('color-btn-active');
+        selectColor(color);  // ← ИСПРАВЛЕНО
+        updateColorStatus(color);
+    });
+});
+
+// ===================НАСТРОЙКИ РЕДАКТИРОВАНИЯ ===================
+const EDIT_PAGES_KEY = 'editPagesEnabled';
+const EDIT_WORKOUT_KEY = 'editWorkoutEnabled';
+
+function loadEditSettings() {
+    const pagesEnabled = localStorage.getItem(EDIT_PAGES_KEY) !== 'false';
+    updateEditPagesUI(pagesEnabled);
+
+    const workoutEnabled = localStorage.getItem(EDIT_WORKOUT_KEY) !== 'false';
+    updateEditWorkoutUI(workoutEnabled);
+}
+
+function updateEditPagesUI(enabled) {
+    const statusEl = document.getElementById('editPagesStatus');
+    if (statusEl) statusEl.textContent = enabled ? 'Включено' : 'Выключено';
+
+    const editStatsBtn = document.getElementById('editStatsBtn');
+    const editWorkoutsBtn = document.getElementById('editWorkoutsBtn');
+    
+    if (editStatsBtn) editStatsBtn.style.display = enabled ? 'block' : 'none';
+    if (editWorkoutsBtn) editWorkoutsBtn.style.display = enabled ? 'block' : 'none';
+}
+
+// ★★★ ФУНКЦИЯ ДЛЯ УПРАВЛЕНИЯ ВИДИМОСТЬЮ КНОПКИ РЕДАКТИРОВАНИЯ ДРУЗЕЙ ★★★
+function updateFriendsEditButtonVisibility() {
+    const pagesEnabled = localStorage.getItem(EDIT_PAGES_KEY) !== 'false';
+    const editFriendsBtn = document.getElementById('editFriendsBtn');
+    if (!editFriendsBtn) return;
+    
+    if (!pagesEnabled) {
+        editFriendsBtn.style.display = 'none';
+        return;
+    }
+    
+    const friendsTab = document.getElementById('profileTab-friends');
+    if (friendsTab && friendsTab.classList.contains('profile-tab-content-active')) {
+        editFriendsBtn.style.display = 'block';
+    } else {
+        editFriendsBtn.style.display = 'none';
+    }
+}
+
+function updateEditWorkoutUI(enabled) {
+    const statusEl = document.getElementById('editWorkoutStatus');
+    if (statusEl) statusEl.textContent = enabled ? 'Включено' : 'Выключено';
+
+    const editWorkoutBtn = document.getElementById('editWorkoutBtn');
+    if (editWorkoutBtn) {
+        const pageWorkoutDetail = document.getElementById('page-workout-detail');
+        if (pageWorkoutDetail && pageWorkoutDetail.classList.contains('page-active')) {
+            const isPremium = window._currentIsPremium || false;
+            if (!enabled || isPremium) {
+                editWorkoutBtn.style.display = 'none';
+            } else {
+                editWorkoutBtn.style.display = 'block';
+            }
+        }
+    }
+}
+
+function toggleEditPages() {
+    const current = localStorage.getItem(EDIT_PAGES_KEY) !== 'false';
+    const newState = !current;
+    showConfirmModal(
+        newState ? 'Включить ред. страниц?' : 'Выключить ред. страниц?',
+        newState
+            ? 'Кнопки "Редактировать страницу" снова появятся в статистике и тренировках.'
+            : 'Кнопки "Редактировать страницу" будут скрыты в статистике и тренировках.',
+        function() {
+            localStorage.setItem(EDIT_PAGES_KEY, String(newState));
+            updateEditPagesUI(newState);
+            showToast(`✅ Редактирование страниц ${newState ? 'включено' : 'выключено'}`);
+        },
+        newState ? 'Включить' : 'Выключить'
+    );
+}
+
+function toggleEditWorkout() {
+    const current = localStorage.getItem(EDIT_WORKOUT_KEY) !== 'false';
+    const newState = !current;
+    showConfirmModal(
+        newState ? 'Включить ред. тренировок?' : 'Выключить ред. тренировок?',
+        newState
+            ? 'Кнопка "Редактировать тренировку" снова появится на странице деталей тренировки.'
+            : 'Кнопка "Редактировать тренировку" будет скрыта на странице деталей тренировки.',
+        function() {
+            localStorage.setItem(EDIT_WORKOUT_KEY, String(newState));
+            updateEditWorkoutUI(newState);
+            showToast(`✅ Редактирование тренировок ${newState ? 'включено' : 'выключено'}`);
+        },
+        newState ? 'Включить' : 'Выключить'
+    );
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    console.log('SportApp загружен!');
+
+        initFeedSearch();          // ★ добавили
+
+        // ★★★ ПРИ СТАРТЕ — КНОПКИ СКРЫТЫ ★★★
+    hideHeroButtons();
+    
+    // 1. Очистка сессионных данных
+    shownThisSession.clear();
+    
+    // 2. PREMIUM UI
+    updatePremiumUI();
+    
+    // 3. Синхронизация при наличии интернета
+    if (navigator.onLine) {
+        syncPendingWorkouts();
+    }
+    
+    // ★★★ 4. ВОССТАНАВЛИВАЕМ КАСТОМНЫЙ ЦВЕТ ★★★
+    const savedColor = localStorage.getItem('themeColor');
+    const isCustom = localStorage.getItem('themeColorCustom') === 'true';
+    
+    if (isCustom && savedColor && savedColor.startsWith('#')) {
+        applyColorToTheme(savedColor);
+    } else {
+        document.body.className = 'theme-' + (savedColor || 'red');
+    }
+    
+    // ★★★ 5. ОБНОВЛЯЕМ СТАТУС ЦВЕТА ★★★
+    const currentColor = localStorage.getItem('themeColor') || 'red';
+    updateColorStatus(currentColor);
+
+    // 6. Настройки редактирования
+    loadEditSettings();
+    
+    // 7. Аккордеон
+    initAccordion();
+
+    // 8. Состояние блоков
+    setTimeout(loadBlocksState, 1000);
+
+    // 10. Применить сохраненный порядок
+    applySavedWorldStatsOrder();
+    
+    // 11. Применяем сохранённые вкладки
+    setTimeout(() => {
+        TabManager.applyAll();
+    }, 100);
+
+        // ★ Инициализация карусели
+    setTimeout(initAutoCarousel, 500);
+
+    // ★★★ 12. ИНИЦИАЛИЗИРУЕМ ТЕМУ ★★★
+    updateThemeUI();
+    setupSystemThemeListener();
+
+    // Загрузка настройки видимости достижений
+    loadAchievementsVisibility();
+
+    updateLanguageUI();
+
+    updateInventoryStatus();
+    
+    // ★★★ 13. ИНИЦИАЛИЗИРУЕМ ВЫБОР ВРЕМЕНИ ОТДЫХА ★★★
+    initRestTimePicker();
+
+    updateWeeklyLoadBlocks();
+
+    // Загрузка кулдауна поддержки
+setTimeout(() => loadSupportCooldown(), 2500);
+
+        // ★★★ ОБНОВЛЯЕМ СЧЕТЧИК ПРИ ЗАГРУЗКЕ ★★★
+    setTimeout(async () => {
+        await updatePremiumCounter();
+    }, 3000);
+
+        // ★★★ ПРОВЕРЯЕМ ПРОСРОЧЕННЫЕ АККАУНТЫ ПРИ ЗАГРУЗКЕ ★★★
+    setTimeout(async () => {
+        await checkAndDeleteExpiredAccounts();
+    }, 15000);
+    
+// Проверяем раз в 5 минут, плюс cooldown в самой функции
+setInterval(() => {
+    checkAndDeleteExpiredAccounts();
+}, 5 * 60 * 1000);
+
+    // ★★★ HEARTBEAT: ОБНОВЛЯЕМ lastSeenAt КАЖДЫЕ 5 МИНУТ ★★★
+let _lastHeartbeat = 0;
+const HEARTBEAT_INTERVAL = 10 * 60 * 1000;
+
+async function _sendHeartbeat() {
+    if (document.hidden) return;
+    const now = Date.now();
+    if (now - _lastHeartbeat < HEARTBEAT_INTERVAL - 30_000) return;
+    _lastHeartbeat = now;
+    try {
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+        await firebase.firestore().collection('users').doc(user.uid).set({
+            lastSeenAt: firebase.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+    } catch (e) {}
+}
+
+setInterval(_sendHeartbeat, HEARTBEAT_INTERVAL);
+
+// Обновляем при возврате на вкладку — но не чаще 10 минут
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    _sendHeartbeat();
+});
+});
+
+// ===================МОДАЛЬНОЕ ОКНО ПОДТВЕРЖДЕНИЯ С ПАРОЛЕМ ===================
+function showConfirmWithPasswordModal(title, message, onConfirm, confirmText = 'Да') {
+    const oldModal = document.getElementById('confirmModal');
+    if (oldModal) oldModal.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'confirmModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">${title}</div>
+            <p class="modal-text">${message}</p>
+            <div class="form-group" style="text-align:left; margin-bottom:0.5rem;">
+                <label class="form-label">Введите пароль</label>
+                <input type="password" id="confirmPassword" class="form-input" placeholder="Пароль" autocomplete="new-password" />
+            </div>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-danger" id="confirmYes" style="flex:1;">${confirmText}</button>
+                <button class="btn btn-primary" id="confirmNo" style="flex:1;">Нет</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+
+document.getElementById('confirmYes').addEventListener('click', async function() {
+    const passwordInput = document.getElementById('confirmPassword');
+    const password = passwordInput.value.trim();
+    if (!password) {
+        showToast('⚠️ Введите пароль');
+        passwordInput.classList.add('error');
+        return;
+    }
+    passwordInput.classList.remove('error');
+
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Пользователь не авторизован');
+        closeModal('confirmModal');
+        return;
+    }
+
+    try {
+        const credential = firebase.auth.EmailAuthProvider.credential(user.email, password);
+        await user.reauthenticateWithCredential(credential);
+        closeModal('confirmModal');
+        if (typeof onConfirm === 'function') onConfirm();
+    } catch (error) {
+        console.error('Ошибка аутентификации:', error);
+        showToast('❌ Неверный пароль');
+        closeModal('confirmModal');
+    }
+});
+
+document.getElementById('confirmNo').addEventListener('click', function() {
+    closeModal('confirmModal');
+});
+}
+
+// ===================МОДАЛЬНОЕ ОКНО ПОДТВЕРЖДЕНИЯ (БЕЗ ПАРОЛЯ) ===================
+function showConfirmModal(title, message, onConfirm, confirmText = 'Да') {
+    const oldModal = document.getElementById('confirmModal');
+    if (oldModal) oldModal.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'confirmModal';
+    overlay.innerHTML = `
+        <div class="modal-content">
+            <div class="modal-title">${title}</div>
+            <p class="modal-text">${message}</p>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-danger" id="confirmYes" style="flex:1;">${confirmText}</button>
+                <button class="btn btn-primary" id="confirmNo" style="flex:1;">Нет</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+
+document.getElementById('confirmYes').addEventListener('click', function() {
+    closeModal('confirmModal');           // ← было overlay.remove()
+    if (typeof onConfirm === 'function') onConfirm();
+});
+
+document.getElementById('confirmNo').addEventListener('click', function() {
+    closeModal('confirmModal');           // ← было overlay.remove()
+});
+}
+
+// ===================НЕВОЗВРАТНЫЕ НАСТРОЙКИ ===================
+function confirmResetProgress() {
+    showConfirmWithPasswordModal(
+        'Сбросить прогресс?',
+        'Это действие безвозвратно удалит статистику тренировок и обнулит прогресс.',
+        resetProgress,
+        'Сбросить'
+    );
+}
+
+async function resetProgress() {
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Пользователь не авторизован');
+        return;
+    }
+
+    try {
+        showToast('✅ Прогресс сброшен');
+        
+        // ★★★ 1. Удаляем ВСЕ тренировки пользователя из Firestore ★★★
+        const workoutsResult = await getUserWorkoutsFromFirestore(user.uid);
+        if (workoutsResult.success) {
+            const workouts = workoutsResult.data;
+            for (const workout of workouts) {
+                await firebase.firestore().collection('workouts').doc(workout.id).delete();
+            }
+            console.log(`✅ Удалено ${workouts.length} выполненных тренировок`);
+        }
+
+        // ★★★ 2. Удаляем ВСЕ активные сессии, где пользователь участник ★★★
+        try {
+            const sessionsSnapshot = await firebase.firestore()
+                .collection('trainingSessions')
+                .where('participants', 'array-contains', { id: user.uid })
+                .get();
+            
+            const sessionDeletions = [];
+            sessionsSnapshot.forEach(doc => {
+                sessionDeletions.push(doc.ref.delete());
+                console.log(`🗑️ Удалена сессия: ${doc.id}`);
+            });
+            
+            if (sessionDeletions.length > 0) {
+                await Promise.all(sessionDeletions);
+                console.log(`✅ Удалено ${sessionDeletions.length} активных сессий`);
+            } else {
+                console.log('ℹ️ Нет активных сессий для удаления');
+            }
+        } catch (error) {
+            console.warn('⚠️ Ошибка при удалении сессий:', error);
+        }
+
+// ★★★ 3. Обнуляем XP в профиле ★★★
+await updateUserProfile(user.uid, { totalXp: 0 });
+
+// ★★★ 4. Сбрасываем достижения ★★★
+await updateUserProfile(user.uid, { achievements: {} });
+
+// ★★★ СБРАСЫВАЕМ ЕЖЕМЕСЯЧНЫЕ ЗНАЧКИ ★★★
+await updateUserProfile(user.uid, { monthlyBadges: {} });
+        
+        // ★★★ 5. Очищаем уведомления о достижениях ★★★
+        for (const ach of ACHIEVEMENTS_CONFIG) {
+            localStorage.removeItem('achievement_notified_' + ach.id);
+        }
+
+// ★ PREMIUM больше не хранится в localStorage — он в Firestore,
+// и после перезагрузки автоматически подтянется обратно.
+// Сохраняем только локальные тренировки.
+const keysToPreserve = [
+    'myCustomWorkouts'
+];
+
+        // Получаем значения перед очисткой
+        const preservedData = {};
+        keysToPreserve.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                preservedData[key] = value;
+            }
+        });
+
+        // ★★★ 8. ПОЛНОСТЬЮ ОЧИЩАЕМ localStorage ★★★
+        localStorage.clear();
+
+        // ★★★ СБРАСЫВАЕМ СЧЁТЧИК ТРЕНИРОВОК ★★★
+        localStorage.removeItem(WORKOUTS_COUNT_KEY);
+        localStorage.removeItem(PREMIUM_OFFER_SHOWN_KEY);
+
+// ★★★ 9. ВОССТАНАВЛИВАЕМ ТОЛЬКО PREMIUM И ЛОКАЛЬНЫЕ ТРЕНИРОВКИ ★★★
+for (const [key, value] of Object.entries(preservedData)) {
+    localStorage.setItem(key, value);
+}
+
+// ★★★ ЯВНО УДАЛЯЕМ ПОРЯДКИ СТРАНИЦ ★★★
+localStorage.removeItem('statsLayout');
+localStorage.removeItem('workoutsLayout');
+localStorage.removeItem('worldStatsLayout');
+localStorage.removeItem('blocksState');
+
+        console.log('✅ Сохранены: PREMIUM, локальные тренировки');
+        console.log('🗑️ Удалены: statsLayout, workoutsLayout, worldStatsLayout, themeColor, appThemeMode, themeColorCustom и все остальные настройки');
+
+// ★★★ 10. Перезагружаем страницу ★★★
+setTimeout(() => {
+    window.location.reload();
+}, 500);
+        
+    } catch (error) {
+        console.error('❌ Ошибка сброса прогресса:', error);
+        showToast('❌ Ошибка при сбросе прогресса: ' + error.message);
+    }
+}
+
+function confirmDeleteAccount() {
+    showConfirmWithPasswordModal(
+        'Удалить аккаунт?',
+        'Это действие безвозвратно удалит ваш профиль и все данные.',
+        deleteAccount,
+        'Удалить'
+    );
+}
+
+async function deleteAccount() {
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Пользователь не авторизован');
+        return;
+    }
+
+    try {
+        await firebase.firestore().collection('users').doc(user.uid).delete();
+
+        const workoutsResult = await getUserWorkoutsFromFirestore(user.uid);
+        if (workoutsResult.success) {
+            const workouts = workoutsResult.data;
+            for (const workout of workouts) {
+                await firebase.firestore().collection('workouts').doc(workout.id).delete();
+            }
+        }
+
+        await user.delete();
+
+localStorage.clear();
+
+setTimeout(() => {
+    window.location.reload();
+}, 500);
+
+    } catch (error) {
+        console.error('Ошибка удаления аккаунта:', error);
+        if (error.code === 'auth/requires-recent-login') {
+            showToast('⚠️ Для удаления аккаунта требуется повторный вход.');
+            await firebase.auth().signOut();
+        } else {
+            showToast('❌ Ошибка при удалении аккаунта: ' + error.message);
+        }
+    }
+}
+
+// ===================УНИВЕРСАЛЬНАЯ СИСТЕМА РЕДАКТИРОВАНИЯ СТРАНИЦ ===================
+class PageEditor {
+    constructor(config) {
+        this.pageId = config.pageId;
+        this.storageKey = config.storageKey;
+        this.defaultLayout = config.defaultLayout || {};
+        this.containers = config.containers || [];
+        this.isEditing = false;
+        this.sortableInstances = [];
+        this.backupLayout = null;
+        this.blockedClickHandler = null;
+
+            this.onEnable  = config.onEnable  || null;
+    this.onDisable = config.onDisable || null;
+    this.onSave    = config.onSave    || null;
+
+        this.editBtn = document.getElementById(config.editBtnId);
+        this.saveBtn = document.getElementById(config.saveBtnId);
+        this.cancelBtn = document.getElementById(config.cancelBtnId);
+        this.resetBtn = document.getElementById(config.resetBtnId);
+        this.actionsContainer = document.getElementById(config.actionsId);
+
+        this.init();
+    }
+
+    init() {
+        this.loadLayout();
+        this.bindEvents();
+    }
+
+    bindEvents() {
+        if (this.editBtn) this.editBtn.addEventListener('click', () => this.enableEdit());
+        if (this.saveBtn) this.saveBtn.addEventListener('click', () => this.save());
+        if (this.cancelBtn) this.cancelBtn.addEventListener('click', () => this.cancel());
+        if (this.resetBtn) this.resetBtn.addEventListener('click', () => this.reset());
+    }
+
+    loadLayout() {
+        const saved = localStorage.getItem(this.storageKey);
+        if (saved) {
+            try {
+                const layout = JSON.parse(saved);
+                this.applyLayout(layout);
+                return;
+            } catch (e) {}
+        }
+        this.applyLayout(this.defaultLayout);
+    }
+
+    applyLayout(layout) {
+        this.containers.forEach(container => {
+            const element = document.getElementById(container.id);
+            if (!element) return;
+
+            const items = layout[container.id] || [];
+            if (items.length === 0) return;
+
+            const childMap = {};
+            Array.from(element.children).forEach(child => {
+                const id = child.dataset[container.dataAttr];
+                if (id) childMap[id] = child;
+            });
+
+            items.forEach(id => {
+                if (childMap[id]) {
+                    element.appendChild(childMap[id]);
+                }
+            });
+        });
+    }
+
+    getCurrentLayout() {
+        const layout = {};
+        this.containers.forEach(container => {
+            const element = document.getElementById(container.id);
+            if (!element) return;
+
+            const items = [];
+            Array.from(element.children).forEach(child => {
+                const id = child.dataset[container.dataAttr];
+                if (id) items.push(id);
+            });
+            layout[container.id] = items;
+        });
+        return layout;
+    }
+
+enableEdit() {
+    this.isEditing = true;
+    this.backupLayout = this.getCurrentLayout();
+
+    this.containers.forEach(container => {
+        const element = document.getElementById(container.id);
+        if (element) element.classList.add('editing');
+    });
+
+    this.editBtn.style.display = 'none';
+    this.actionsContainer.style.display = 'flex';
+
+    this.blockNavigation();
+
+    // ★ Сначала рендерим (показываем мусорки), потом Sortable
+    if (typeof this.onEnable === 'function') this.onEnable();
+
+    this.initSortables();
+
+    showToast('✏️ Режим редактирования включен');
+}
+
+
+// ★★★ НОВЫЙ МЕТОД ДЛЯ ПРЕДОТВРАЩЕНИЯ СКРОЛЛА ★★★
+_preventScroll(e) {
+    // Разрешаем скролл только если пользователь не перетаскивает
+    if (!e.target.closest('.sortable-chosen') && !e.target.closest('.sortable-ghost')) {
+        return;
+    }
+    e.preventDefault();
+}
+
+disableEdit(save = false) {
+    this.isEditing = false;
+    
+    // ★★★ ВОССТАНАВЛИВАЕМ СКРОЛЛ ★★★
+    document.body.style.overflow = '';
+    document.body.style.position = '';
+    document.body.style.width = '';
+
+    this.containers.forEach(container => {
+        const element = document.getElementById(container.id);
+        if (element) {
+            element.classList.remove('editing');
+        }
+    });
+
+    this.editBtn.style.display = 'block';
+    this.actionsContainer.style.display = 'none';
+
+    this.unblockNavigation();
+    this.destroySortables();
+
+    if (!save && this.backupLayout) {
+        this.applyLayout(this.backupLayout);
+        this.backupLayout = null;
+        showToast('↩️ Изменения отменены');
+    }
+
+    // ★ Скрываем мусорки, возвращаем стрелки
+    if (typeof this.onDisable === 'function') this.onDisable();
+}
+
+save() {
+    const layout = this.getCurrentLayout();
+    localStorage.setItem(this.storageKey, JSON.stringify(layout));
+    saveLayoutToFirestore(this.storageKey, layout);
+
+    // ★ Сохраняем реальный порядок в массив программ
+    if (typeof this.onSave === 'function') this.onSave(layout);
+
+    this.backupLayout = null;
+    this.disableEdit(true);
+    showToast('✅ Изменения применены');
+}
+
+    cancel() {
+        this.disableEdit(false);
+    }
+
+reset() {
+    showConfirmModal(
+        'Сбросить порядок?',
+        'Вернуть стандартный порядок элементов?',
+        () => {
+            // 1. Удаляем сохранённый лейаут
+            localStorage.removeItem(this.storageKey);
+            
+            // 2. Отключаем режим редактирования
+            this.disableEdit(false);
+            
+            // 3. Применяем дефолтный лейаут
+            this.applyLayout(this.defaultLayout);
+            
+            showToast('🔄 Порядок сброшен к стандартному');
+        },
+        'Сбросить'
+    );
+}
+
+blockNavigation() {
+    document.addEventListener('click', this.blockedClickHandler = (e) => {
+        // ВСЕГДА пропускаем клики по модальным окнам и их элементам
+        if (e.target.closest('.modal-overlay') || 
+            e.target.closest('.modal-content') ||
+            e.target.closest('#confirmModal')) {
+            return;
+        }
+
+        // Разрешаем удаление личной тренировки в режиме редактирования
+if (e.target.closest('.workout-delete')) {
+    return;
+}
+
+        // ★★★ ПРОПУСКАЕМ ВСЕ КНОПКИ РЕДАКТИРОВАНИЯ ★★★
+if (e.target.closest('#editStatsBtn') ||
+    e.target.closest('#editWorkoutsBtn') ||
+    e.target.closest('#editMyProgramsBtn') ||
+    e.target.closest('#editReadyProgramsBtn') ||           // ★
+    e.target.closest('#statsEditActions') ||
+    e.target.closest('#workoutsEditActions') ||
+    e.target.closest('#myProgramsEditActions') ||
+    e.target.closest('#readyProgramsEditActions') ||       // ★
+    e.target.closest('#saveStatsBtn') ||
+    e.target.closest('#saveWorkoutsBtn') ||
+    e.target.closest('#saveMyProgramsBtn') ||
+    e.target.closest('#saveReadyProgramsBtn') ||           // ★
+    e.target.closest('#cancelStatsBtn') ||
+    e.target.closest('#cancelWorkoutsBtn') ||
+    e.target.closest('#cancelMyProgramsBtn') ||
+    e.target.closest('#cancelReadyProgramsBtn') ||         // ★
+    e.target.closest('#resetStatsBtn') ||
+    e.target.closest('#resetWorkoutsBtn') ||
+    e.target.closest('#resetReadyProgramsBtn')) {          // ★
+    return;
+}
+
+        // Разрешаем перетаскивание
+        if (e.target.closest('.section-drag') ||
+            e.target.closest('.sortable-ghost') ||
+            e.target.closest('.sortable-chosen')) {
+            return;
+        }
+
+        // Блокируем навигацию и клики по элементам
+        if (e.target.closest('.nav-item') ||
+            e.target.closest('.tab-btn') ||
+            e.target.closest('.item-card') ||
+            e.target.closest('.btn-primary') ||
+            e.target.closest('.btn-secondary') ||
+            e.target.closest('.btn-danger') ||
+            e.target.closest('.custom-workout .btn-primary') ||
+            e.target.closest('.friend-delete-btn') ||
+            e.target.closest('.workout-delete') ||
+            e.target.closest('#editProfileBtn') ||
+            e.target.closest('.settings-item')) {
+            e.preventDefault();
+            e.stopPropagation();
+            showToast('⚠️ Сначала завершите редактирование страницы');
+            return false;
+        }
+    }, true);
+}
+
+    unblockNavigation() {
+        if (this.blockedClickHandler) {
+            document.removeEventListener('click', this.blockedClickHandler, true);
+            this.blockedClickHandler = null;
+        }
+    }
+
+initSortables() {
+    this.containers.forEach(container => {
+        const element = document.getElementById(container.id);
+        if (!element) return;
+
+let handle = (container.handle !== undefined) ? container.handle : '.section-drag';
+let filter = container.filter || null;
+        
+if (['catalogGridStrength', 'catalogGridFitness', 'catalogGridPremium', 'myWorkoutsList'].includes(container.id)) {
+    filter = '.workout-delete, .workout-delete *';
+    handle = null;
+}
+
+        if (container.id === 'statsSummary') {
+            handle = '.stat-card';
+        }
+        if (container.id === 'exerciseMuscleStats' || container.id === 'categoriesStats') {
+            handle = '.stat-item';
+        }
+
+        const s = new Sortable(element, {
+            animation: 150,
+            handle: handle,
+            ghostClass: 'sortable-ghost',
+            chosenClass: 'sortable-chosen',
+            forceFallback: true,
+            filter: filter,
+            preventOnFilter: false,
+            delay: 300,
+            delayOnTouchOnly: true,
+            touchStartThreshold: 10,
+            scroll: true,
+            scrollSensitivity: 50,
+            scrollSpeed: 15,
+            bubbleScroll: true
+        });
+        this.sortableInstances.push(s);
+    });
+}
+
+    destroySortables() {
+        this.sortableInstances.forEach(s => s.destroy());
+        this.sortableInstances = [];
+    }
+}
+
+async function saveLayoutToFirestore(layoutKey, layout) {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    try {
+        const doc = await firebase.firestore().collection('users').doc(user.uid).get();
+        const layouts = doc.exists ? (doc.data().layouts || {}) : {};
+        layouts[layoutKey] = layout;
+        
+        await firebase.firestore().collection('users').doc(user.uid).set({
+            layouts: layouts
+        }, { merge: true });
+    } catch (error) {
+        console.error('❌ Ошибка сохранения раскладки:', error);
+    }
+}
+
+async function loadLayoutsFromFirestore() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    try {
+        const doc = await firebase.firestore().collection('users').doc(user.uid).get();
+        if (!doc.exists) return;
+        const layouts = doc.data().layouts || {};
+        
+        // Применяем к localStorage
+        for (const key in layouts) {
+            localStorage.setItem(key, JSON.stringify(layouts[key]));
+        }
+        console.log('✅ Раскладки загружены из Firestore');
+    } catch (error) {
+        console.error('❌ Ошибка загрузки раскладок:', error);
+    }
+}
+
+// ===================ЕДИНЫЙ РЕДАКТОР СТАТИСТИКИ ===================
+window.statsEditor = new PageEditor({
+    pageId: 'page-stats',
+    storageKey: 'statsLayout',
+    editBtnId: 'editStatsBtn',
+    saveBtnId: 'saveStatsBtn',
+    cancelBtnId: 'cancelStatsBtn',
+    resetBtnId: 'resetStatsBtn',
+    actionsId: 'statsEditActions',
+    containers: [
+        // Личная статистика
+        { id: 'statsSummary', dataAttr: 'statId', handle: '.stat-card' },
+        { id: 'statsBlocksContainer', dataAttr: 'blockId', handle: '.section-drag' },
+        { id: 'exerciseMuscleStats', dataAttr: 'muscleName', handle: '.stat-item' },
+        { id: 'categoriesStats', dataAttr: 'categoryName', handle: '.stat-item' },
+        // Мировая статистика
+        { id: 'globalStatsContainer', dataAttr: 'statId', handle: '.stat-card' },  // ★ ДОБАВИЛИ
+        { id: 'worldStatsBlocksContainer', dataAttr: 'blockId', handle: '.section-drag' }
+    ],
+    defaultLayout: {
+        statsSummary: ['minutes', 'workouts', 'exercises'],
+statsBlocksContainer: ['muscles', 'categories', 'calendar', 'weekly-load', 'body-progress', 'history', 'monthly-badges', 'world-leaderboard', 'friends-leaderboard'],        exerciseMuscleStats: ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы'],
+        exerciseMuscleStats: ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы'],
+        categoriesStats: ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'],
+        globalStatsContainer: ['minutes', 'workouts', 'exercises'],  // ★ ДОБАВИЛИ
+        worldStatsBlocksContainer: ['community-achievements', 'world-leaderboard', 'friends-leaderboard']
+    }
+});
+// ===================ЕДИНЫЙ РЕДАКТОР тренировок ===================
+window.workoutsEditor = new PageEditor({
+    pageId: 'page-workouts',
+    storageKey: 'workoutsLayout',
+    editBtnId: 'editWorkoutsBtn',
+    saveBtnId: 'saveWorkoutsBtn',
+    cancelBtnId: 'cancelWorkoutsBtn',
+    resetBtnId: 'resetWorkoutsBtn',
+    actionsId: 'workoutsEditActions',
+    containers: [
+        { id: 'workoutsBlocksContainer', dataAttr: 'blockId', handle: '.section-drag' },
+        { id: 'catalogGridStrength', dataAttr: 'category' },
+        { id: 'catalogGridFitness', dataAttr: 'category' },
+        { id: 'catalogGridPremium', dataAttr: 'category' },
+        { id: 'myWorkoutsList', dataAttr: 'workoutId', filter: '.workout-delete' }
+    ],
+    defaultLayout: getDefaultWorkoutsLayout(),
+    onEnable: () => {
+        renderMyWorkouts();
+    },
+    onDisable: () => {
+        renderMyWorkouts();
+    }
+});
+
+// =================== РЕДАКТОР «МОИ ПРОГРАММЫ» ===================
+window.myProgramsEditor = new PageEditor({
+    pageId: 'page-programs',
+    storageKey: 'myProgramsLayout',
+    editBtnId: 'editMyProgramsBtn',
+    saveBtnId: 'saveMyProgramsBtn',
+    cancelBtnId: 'cancelMyProgramsBtn',
+    actionsId: 'myProgramsEditActions',
+    containers: [
+        { id: 'myProgramsList', dataAttr: 'programId', filter: '.program-delete', handle: null }
+    ],
+    defaultLayout: { myProgramsList: [] },
+onEnable: () => {
+    // Сохраняем исходный список до начала редактирования
+    _myProgramsEditBackup = JSON.parse(
+        JSON.stringify(getMyPrograms())
+    );
+
+    renderMyPrograms();
+},
+
+onDisable: () => {
+    // Если резервная копия осталась - значит нажали «Отмена»
+    if (_myProgramsEditBackup) {
+        saveMyPrograms(_myProgramsEditBackup);
+        _myProgramsEditBackup = null;
+    }
+
+    renderMyPrograms();
+},
+
+onSave: (layout) => {
+    const order = layout.myProgramsList || [];
+    const list = getMyPrograms();
+    const byId = {};
+
+    list.forEach(p => byId[p.id] = p);
+
+    const reordered = order
+        .map(id => byId[id])
+        .filter(Boolean);
+
+    list.forEach(p => {
+        if (!order.includes(p.id)) {
+            reordered.push(p);
+        }
+    });
+
+    saveMyPrograms(reordered);
+
+    // Удаление теперь окончательно сохранено
+    _myProgramsEditBackup = null;
+}
+});
+
+// =================== РЕДАКТОР «ГОТОВЫЕ ПРОГРАММЫ» ===================
+window.readyProgramsEditor = new PageEditor({
+    pageId: 'page-programs',
+    storageKey: 'readyProgramsLayout',
+    editBtnId: 'editReadyProgramsBtn',
+    saveBtnId: 'saveReadyProgramsBtn',
+    cancelBtnId: 'cancelReadyProgramsBtn',
+    resetBtnId: 'resetReadyProgramsBtn',
+    actionsId: 'readyProgramsEditActions',
+    containers: [
+        // ★ Сортируем только блоки внутри обёртки
+        { id: 'programsReadyBlocks',  dataAttr: 'blockId',   handle: '.section-drag' },
+        // ★ Сортируем карточки внутри каждого блока
+        { id: 'freeProgramsList',     dataAttr: 'programId', handle: null },
+        { id: 'premiumProgramsList',  dataAttr: 'programId', handle: null }
+    ],
+    defaultLayout: {
+        programsReadyBlocks: ['programs-free', 'programs-premium'],  // ★ ключ = id обёртки
+        freeProgramsList: [],
+        premiumProgramsList: []
+    },
+    onEnable:  () => renderReadyPrograms(),
+    onDisable: () => renderReadyPrograms(),
+    onSave: (layout) => {
+        const freeIds    = layout.freeProgramsList    || [];
+        const premiumIds = layout.premiumProgramsList || [];
+        const order = [...freeIds, ...premiumIds];
+
+        const byId = {};
+        PRESET_PROGRAMS.forEach(p => byId[p.id] = p);
+
+        const reordered = order.map(id => byId[id]).filter(Boolean);
+        PRESET_PROGRAMS.forEach(p => {
+            if (!order.includes(p.id)) reordered.push(p);
+        });
+
+        // Переставляем PRESET_PROGRAMS in-place
+        PRESET_PROGRAMS.length = 0;
+        PRESET_PROGRAMS.push(...reordered);
+    }
+});
+
+document.getElementById('resetWorkoutsBtn')?.addEventListener('click', function() {
+    showConfirmModal(
+        'Сбросить порядок?',
+        'Вернуть стандартный порядок элементов на странице тренировок?',
+        function() {
+            const defaultLayout = getDefaultWorkoutsLayout();
+            saveWorkoutsLayout(defaultLayout);
+            applySavedWorkoutsOrder();
+            if (window.workoutsEditor) {
+                window.workoutsEditor.destroySortables();
+                window.workoutsEditor.initSortables();
+            }
+            showToast('🔄 Порядок сброшен к стандартному');
+        },
+        'Сбросить'
+    );
+});
+
+document.getElementById('resetStatsBtn')?.addEventListener('click', function() {
+    showConfirmModal(
+        'Сбросить порядок?',
+        'Вернуть стандартный порядок элементов на странице статистики?',
+        function() {
+            const defaultLayout = getDefaultStatsLayout();
+            saveStatsLayout(defaultLayout);
+            applySavedStatsOrder();
+            if (window.statsEditor) {
+                window.statsEditor.destroySortables();
+                window.statsEditor.initSortables();
+            }
+            showToast('🔄 Порядок сброшен к стандартному');
+        },
+        'Сбросить'
+    );
+});
+
+// ===================АККОРДЕОН ===================
+function initAccordion() {
+    document.querySelectorAll('.section-block').forEach(block => {
+        const header = block.querySelector('.section-header');
+        if (!header) return;
+
+        if (header._accordionHandler) {
+            header.removeEventListener('click', header._accordionHandler);
+        }
+
+        const handler = function(e) {
+            if (e.target.closest('.section-drag')) return;
+            block.classList.toggle('open');
+        };
+
+        header._accordionHandler = handler;
+        header.addEventListener('click', handler);
+    });
+}
+
+// ===================ОТКРЫТИЕ ВСЕХ БЛОКОВ ДЛЯ НОВЫХ ПОЛЬЗОВАТЕЛЕЙ ===================
+function initProfileBlocks() {
+    const isNewUser = localStorage.getItem('profileBlocksInitialized') !== 'true';
+    if (isNewUser) {
+        setTimeout(() => {
+            const blocks = document.querySelectorAll('.section-block');
+            blocks.forEach(block => block.classList.add('open'));
+            localStorage.setItem('profileBlocksInitialized', 'true');
+            saveBlocksState();
+        }, 500);
+    } else {
+        setTimeout(loadBlocksState, 500);
+    }
+}
+
+// ===================СОХРАНЕНИЕ СОСТОЯНИЯ БЛОКОВ ===================
+function saveBlocksState() {
+    const blocks = document.querySelectorAll('.section-block');
+    const state = {};
+    blocks.forEach((block, index) => {
+        const id = block.dataset.blockId || index;
+        state[id] = block.classList.contains('open');
+    });
+    localStorage.setItem('blocksState', JSON.stringify(state));
+    
+    // ★★★ В FIRESTORE ★★★
+    syncSaveToFirestore('blocksState', state);
+}
+
+async function loadBlocksState() {
+    const saved = await syncLoadWithFallback('blocksState', 'blocksState', null);
+    if (!saved) return;
+    
+    try {
+        const state = typeof saved === 'string' ? JSON.parse(saved) : saved;
+        const blocks = document.querySelectorAll('.section-block');
+        blocks.forEach((block, index) => {
+            const id = block.dataset.blockId || index;
+            if (state[id] === true) {
+                block.classList.add('open');
+            }
+        });
+    } catch (e) {}
+}
+
+window.addEventListener('load', function() {
+    setTimeout(loadBlocksState, 500);
+});
+
+// ===================СТРАНИЦА ФИНИШ ===================
+function showFinishPage(exercisesCount, completedCount, seconds, xpEarned) {
+    // Сохраняем статистику именно этого дня программы.
+    _lastCompletedProgramDay = null;
+    if (_pendingProgramDay) {
+        const { programId, day } = _pendingProgramDay;
+        if (completedCount > 0) {
+            const progress = getProgramProgress(programId);
+            progress.workoutStats = progress.workoutStats || {};
+            progress.workoutStats[day] = {
+                title: sessionWorkoutTitle || 'Тренировка',
+                date: new Date().toISOString(),
+                durationSeconds: seconds,
+                completedCount,
+                totalCount: exercisesCount,
+                xpEarned,
+                exercises: (sessionExercises || []).map((exercise, index) => ({
+                    name: exercise.name,
+                    sets: exercise.sets,
+                    reps: exercise.reps,
+                    completed: sessionCompleted.has(index)
+                }))
+            };
+            saveProgramProgress(programId, progress);
+            completeProgramDay(programId, day);
+            _lastCompletedProgramDay = { programId, day };
+        }
+        _pendingProgramDay = null;
+    }    // ★★★ ЗАПОЛНЯЕМ СТАТИСТИКУ ★★★
+    document.getElementById('finishExercises').textContent = `${completedCount}/${exercisesCount}`;
+    
+    const mins = String(Math.floor(seconds / 60)).padStart(2, '0');
+    const secs = String(seconds % 60).padStart(2, '0');
+    document.getElementById('finishMinutes').textContent = `${mins}:${secs}`;
+    document.getElementById('finishXp').textContent = '+' + xpEarned.toFixed(1) + ' XP';
+    
+    // ★★★ УБИРАЕМ АКТИВНОСТЬ ЗВЁЗД (если они есть) ★★★
+    document.querySelectorAll('#finishStars i').forEach(star => star.classList.remove('active'));
+
+// ★★★ КНОПКА "ПОДЕЛИТЬСЯ" — сохраняет тренировку и открывает модалку поста ★★★
+const shareBtn = document.getElementById('finishShareBtn');
+if (shareBtn) {
+    shareBtn.onclick = function() {
+        finishWorkoutAndShare(completedCount, xpEarned, exercisesCount, seconds);
+    };
+}
+
+    // ★★★ КНОПКА "ЗАКОНЧИТЬ" ★★★
+    const finishBtn = document.getElementById('finishDoneBtn');
+    if (finishBtn) {
+        finishBtn.disabled = false;
+        finishBtn.textContent = 'Закончить';
+
+        finishBtn.onclick = function() {
+            // ★★★ ЕСЛИ 0 УПРАЖНЕНИЙ — НЕ СОХРАНЯЕМ ★★★
+            if (completedCount === 0) {
+                showToast('⚠️ Выполнено 0 упражнений.');
+
+                sessionExercises = [];
+                sessionCompleted = new Set();
+                sessionSkipped = new Set();
+                sessionCompletedSets = {};
+                sessionSeconds = 0;
+                sessionWorkoutTitle = '';
+                sessionCategory = '';
+                sessionWorkoutIcon = null;
+
+                _lastCompletedProgramDay = null;
+                window.navigateTo('workouts');
+                return;
+            }
+
+            if (!preventDoubleClick('finishDoneBtn', 3000)) {
+                showToast('⏳ Подождите, тренировка уже сохраняется...');
+                return;
+            }
+
+            const btn = this;
+            btn.disabled = true;
+            const completedProgramReturn = _lastCompletedProgramDay;
+            _lastCompletedProgramDay = null;
+
+            // ★★★ УВЕЛИЧИВАЕМ СЧЁТЧИК ТРЕНИРОВОК ★★★
+            incrementWorkoutsCount();
+            const showPremium = !completedProgramReturn && shouldShowPremiumOffer();
+
+            // ★★★ XP ИЗ UI ★★★
+            const xpText = document.getElementById('finishXp').textContent;
+            const xpEarned2 = parseFloat(xpText) || 0;
+
+            // ★★★ ОПРЕДЕЛЯЕМ КАТЕГОРИЮ ★★★
+            let finalCategory = sessionCategory;
+            if (!finalCategory || finalCategory === 'Без категории') {
+                const title = sessionWorkoutTitle || '';
+                if (title.includes('Руки')) finalCategory = 'Руки';
+                else if (title.includes('Плечи')) finalCategory = 'Плечи';
+                else if (title.includes('Пресс')) finalCategory = 'Пресс';
+                else if (title.includes('Грудь')) finalCategory = 'Грудь';
+                else if (title.includes('Спина')) finalCategory = 'Спина';
+                else if (title.includes('Ноги')) finalCategory = 'Ноги';
+                else if (title.includes('Кардио')) finalCategory = 'Кардио';
+                else if (title.includes('Растяжка')) finalCategory = 'Гибкость';
+                else if (title.includes('Пилатес') || title.includes('Кроссфит') || title.includes('Всё тело')) finalCategory = 'Всё тело';
+                else if (title.includes('Мужская сила') || title.includes('Женское счастье')) finalCategory = 'Ягодицы';
+                else finalCategory = 'Без категории';
+            }
+
+            const workoutExercises = sessionExercises.map((ex, index) => ({
+                ...ex,
+                icon: ex.icon || null,
+                completed: sessionCompleted.has(index)
+            }));
+
+            const workoutIcon = sessionWorkoutIcon || null;
+
+            const workoutData = {
+                title: sessionWorkoutTitle || 'Тренировка',
+                date: new Date().toISOString(),
+                durationSeconds: sessionSeconds,
+                exercises: workoutExercises,
+                xpEarned: xpEarned2,
+                category: finalCategory,
+                icon: workoutIcon
+            };
+
+            (async function() {
+                try {
+                    const user = await getFirebaseUser();
+                    if (user) {
+                        const result = await saveWorkoutToFirestore(user.uid, workoutData);
+                        if (result.success) {
+                            const profileResult = await getUserProfile(user.uid);
+                            if (profileResult.success) {
+                                const currentXp = profileResult.data.totalXp || 0;
+                                await updateUserProfile(user.uid, { totalXp: currentXp + xpEarned2 });
+                                if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel(); // ★
+                            }
+                            showToast('💾 Тренировка сохранена');
+                            await updateAchievementsAfterWorkout();
+                            await updateProfileStreak();
+                                    // ★★★ ДОБАВИТЬ ЭТУ СТРОКУ ★★★
+                            if (typeof Challenges !== 'undefined') {
+                                Challenges.onWorkoutFinished(user.uid);
+                            }
+                        } else {
+                            addPendingWorkout(workoutData);
+                            showToast('⚠️ Тренировка сохранена локально, синхронизация позже');
+                        }
+                    } else {
+                        addPendingWorkout(workoutData);
+                        showToast('⚠️ Тренировка сохранена локально');
+                    }
+
+            // Сбрасываем переменные
+            sessionExercises = [];
+            sessionCompleted = new Set();
+            sessionSkipped = new Set();
+            sessionCompletedSets = {};
+                    sessionSeconds = 0;
+                    sessionWorkoutTitle = '';
+                    sessionCategory = '';
+                    sessionWorkoutIcon = null;
+
+                    // После программной тренировки возвращаемся к её расписанию
+                    // и открываем статистику только что завершённого дня.
+                    if (completedProgramReturn) {
+                        openProgramDetail(completedProgramReturn.programId);
+                        openProgramWorkoutStats(completedProgramReturn.programId, completedProgramReturn.day);
+                    } else {
+                        window.navigateTo('workouts');
+                    }
+
+                    // ★★★ ПОКАЗЫВАЕМ PREMIUM ★★★
+                    if (showPremium) {
+                        markPremiumOfferShown();
+                        setTimeout(() => {
+                            enqueueModal({ type: 'premium' });
+                        }, 800);
+                    }
+
+                } catch (error) {
+                    console.error('❌ Ошибка сохранения тренировки:', error);
+                    showToast('❌ Ошибка сохранения тренировки');
+                } finally {
+                    btn.disabled = false;
+                }
+            })();
+        };
+    }
+    
+    window.navigateTo('finish');
+}
+
+// ===================ЗВЁЗДЫ ===================
+document.querySelectorAll('#finishStars i').forEach(star => {
+    star.addEventListener('click', function() {
+        const value = parseInt(this.dataset.value);
+        document.querySelectorAll('#finishStars i').forEach(s => {
+            s.classList.toggle('active', parseInt(s.dataset.value) <= value);
+        });
+    });
+});
+
+// =================== ПОЛУЧЕНИЕ ИКОНКИ УПРАЖНЕНИЯ ===================
+const _exerciseIconCache = new Map();
+
+function getExerciseIcon(exerciseName) {
+    // ★ Кэш — не ищем повторно одно и то же имя
+    if (_exerciseIconCache.has(exerciseName)) {
+        return _exerciseIconCache.get(exerciseName);
+    }
+
+    let result = null;
+
+    // ★★★ СНАЧАЛА ИЩЕМ В ОТДЕЛЬНОМ КАТАЛОГЕ ★★★
+    if (typeof EXERCISES_CATALOG !== 'undefined') {
+        const found = EXERCISES_CATALOG.find(e => e.name === exerciseName);
+        if (found && found.icon) {
+            result = found.icon;
+        }
+    }
+
+    // ★★★ ПОТОМ В exercisesData (как fallback) ★★★
+    if (!result) {
+        for (const parent in exercisesData) {
+            if (typeof exercisesData[parent] === 'object') {
+                for (const subCategory in exercisesData[parent]) {
+                    if (typeof exercisesData[parent][subCategory] === 'object') {
+                        if (exercisesData[parent][subCategory]._premium) continue;
+                        for (const level in exercisesData[parent][subCategory]) {
+                            const levelData = exercisesData[parent][subCategory][level];
+                            if (Array.isArray(levelData)) {
+                                const found = levelData.find(e => e.name === exerciseName);
+                                if (found && found.icon) { result = found.icon; break; }
+                            } else if (levelData && typeof levelData === 'object' && levelData._exercises) {
+                                const found = levelData._exercises.find(e => e.name === exerciseName);
+                                if (found && found.icon) { result = found.icon; break; }
+                            }
+                        }
+                        if (result) break;
+                    }
+                }
+                if (result) break;
+            }
+        }
+    }
+
+    // ★★★ ЕСЛИ НЕ НАШЛИ — ОПРЕДЕЛЯЕМ ПО КАТЕГОРИИ ★★★
+    if (!result && typeof EXERCISES_CATALOG !== 'undefined') {
+        const found = EXERCISES_CATALOG.find(e => e.name === exerciseName);
+        if (found && found.category) {
+            const categoryIconMap = {
+                'Грудь': 'breast', 'Спина': 'back', 'Ноги': 'legs',
+                'Плечи': 'shoulder', 'Пресс': 'press', 'Руки': 'bodybuilding',
+                'Всё тело': 'WholeBody', 'Кардио': 'cardio',
+                'Растяжка': 'stretching', 'Растяжка позвоночника': 'stretching-back',
+                'Зарядка': 'charging', 'Пилатес': 'Pilates',
+                'Кроссфит': 'crossfit', 'Мужская сила': 'men',
+                'Женское счастье': 'woman'
+            };
+            result = categoryIconMap[found.category] || null;
+        }
+    }
+
+    _exerciseIconCache.set(exerciseName, result);
+    return result;
+}
+
+// =================== ФУНКЦИЯ ПОЛУЧЕНИЯ КАТЕГОРИИ ПО ИКОНКЕ ===================
+function getCategoryByIcon(icon) {
+    if (!icon) return null;
+    return ICON_TO_CATEGORY[icon] || 'Без категории';
+}
+
+// ===================ПРОФИЛЬ ДРУГА ===================
+let currentFriendId = null;
+let currentFriendData = null;
+
+async function openFriendProfile(friendId) {
+    currentFriendId = friendId;
+    
+    try {
+        const result = await getUserProfile(friendId);
+        if (!result.success) {
+            showToast('❌ Не удалось загрузить данные друга');
+            return;
+        }
+        
+        currentFriendData = result.data;
+        
+        // Заполняем аватар, имя, email
+        const name = currentFriendData.displayName || 'Пользователь';
+        document.getElementById('friendProfileAvatar').textContent = name[0].toUpperCase();
+        document.getElementById('friendProfileName').textContent = name;
+        // email других пользователей не показываем — приватность
+document.getElementById('friendProfileEmail').textContent = '';
+        
+        // Уровень
+        const xp = currentFriendData.totalXp || 0;
+        const currentLevel = getCurrentLevel(xp);
+        const progress = getXpProgress(xp);
+        const nextLevel = getNextLevel(xp);
+        const xpRounded = Math.round(xp);
+        const progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+        
+        document.getElementById('friendLevelLvl').textContent = currentLevel.id + ' LVL';
+        document.getElementById('friendLevelTitle').textContent = currentLevel.name;
+        document.getElementById('friendLevelProgressText').textContent = progressText;
+        document.getElementById('friendLevelFill').style.width = progress + '%';
+        
+        // Достижения
+        const achievements = currentFriendData.achievements || {};
+        updateAchievementsUI('friendAchievements', achievements);
+        const visible = getAchievementsVisibility();
+        const achContainer = document.getElementById('friendAchievements');
+        if (achContainer) achContainer.classList.toggle('hidden', !visible);
+        
+        // Статистика
+        let workouts = [];
+        let totalSeconds = 0;
+        let totalExercises = 0;
+        
+        try {
+            const workoutsResult = await getUserWorkoutsFromFirestore(friendId);
+            if (workoutsResult.success) {
+                workouts = workoutsResult.data.filter(w => !(w.title || '').includes('Зарядка'));
+                totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+                totalExercises = workouts.reduce((sum, w) => {
+                    const completed = w.exercises?.filter(e => e.completed === true).length || 0;
+                    return sum + completed;
+                }, 0);
+            }
+        } catch (error) {
+            console.warn('⚠️ Ошибка загрузки тренировок друга:', error);
+        }
+        
+        document.getElementById('friendTotalWorkouts').textContent = workouts.length;
+        document.getElementById('friendTotalMinutes').textContent = Math.floor(totalSeconds / 60);
+        document.getElementById('friendTotalExercises').textContent = totalExercises;
+        
+        // ★★★ РЕНДЕРИМ КНОПКИ ДЛЯ ПРОСМОТРА ДРУГА ★★★
+        renderFriendProfileActions('friend');
+        
+        openModal('friendProfileModal');
+        
+        checkDailyTasksAfterFriendProfile(friendId);
+        
+    } catch (error) {
+        console.error('Ошибка загрузки профиля друга:', error);
+        showToast('❌ Ошибка загрузки профиля друга');
+    }
+}
+
+async function removeFriendFromList(friendId) {
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Пользователь не авторизован');
+        return false;
+    }
+    
+    try {
+        const friendProfile = await getUserProfile(friendId);
+        const friendName = friendProfile.success ? friendProfile.data.displayName : 'Пользователь';
+        
+        // ★★★ ПРОВЕРЯЕМ, ЕСТЬ ЛИ ДРУГ В СПИСКЕ ★★★
+        const userDoc = await firebase.firestore().collection('users').doc(user.uid).get();
+        const currentFriends = userDoc.data()?.friends || [];
+        
+        if (!currentFriends.includes(friendId)) {
+            showToast('⚠️ Этот пользователь уже не в друзьях');
+            return false;
+        }
+        
+        const updatedFriends = currentFriends.filter(id => id !== friendId);
+        await firebase.firestore().collection('users').doc(user.uid).update({ friends: updatedFriends });
+        
+        const friendDoc = await firebase.firestore().collection('users').doc(friendId).get();
+        const friendFriends = friendDoc.data()?.friends || [];
+        const updatedFriendFriends = friendFriends.filter(id => id !== user.uid);
+        await firebase.firestore().collection('users').doc(friendId).update({ friends: updatedFriendFriends });
+        
+        const shownFriendNotifications = JSON.parse(localStorage.getItem('shownFriendNotifications') || '[]');
+        const updatedShown = shownFriendNotifications.filter(id => id !== friendId);
+        localStorage.setItem('shownFriendNotifications', JSON.stringify(updatedShown));
+        
+        const prevFriends = JSON.parse(localStorage.getItem('prevFriendsList') || '[]');
+        const updatedPrev = prevFriends.filter(f => f.id !== friendId);
+        localStorage.setItem('prevFriendsList', JSON.stringify(updatedPrev));
+        
+        return { success: true, friendName: friendName };
+    } catch (error) {
+        console.error('Ошибка удаления друга:', error);
+        
+        // ★★★ ЕСЛИ ДРУГ УЖЕ УДАЛЁН ★★★
+        if (error.code === 'not-found') {
+            showToast('⚠️ Этот пользователь уже не в друзьях');
+            await renderFriendsInProfile();
+            return false;
+        }
+        
+        showToast('❌ Ошибка при удалении друга');
+        return false;
+    }
+}
+
+// ===================ОБНОВЛЕНИЕ ТОЛЬКО СТРАНИЦ С УВЕДОМЛЕНИЯМИ ===================
+let _lastRefreshND = 0;
+const REFRESH_ND_COOLDOWN = 30_000;
+
+function refreshNotificationData(force = false) {
+    const now = Date.now();
+    if (!force && now - _lastRefreshND < REFRESH_ND_COOLDOWN) return;
+    _lastRefreshND = now;
+
+    // ★ Критично (для UI, что видно сразу)
+    loadProfile();
+
+    // ★ Второстепенно — после отрисовки
+    const deferred = () => {
+        renderFriendsInProfile();
+        loadWorldLeaderboard();
+        loadFriendsLeaderboard();
+    };
+
+    if ('requestIdleCallback' in window) {
+        requestIdleCallback(deferred, { timeout: 2500 });
+    } else {
+        setTimeout(deferred, 300);
+    }
+
+    console.log('✅ refreshNotificationData выполнен');
+}
+
+// =================== ЕДИНЫЙ ОБРАБОТЧИК ВСЕХ КЛИКОВ ===================
+document.addEventListener('click', function(e) {
+    // 1. Сохранение состояния блоков (аккордеон)
+    const header = e.target.closest('.section-header');
+    if (header) {
+        const block = header.closest('.section-block');
+        if (block) {
+            setTimeout(saveBlocksState, 100);
+        }
+    }
+
+// 2. Клик по навигации (нижнее меню)
+const navItem = e.target.closest('.nav-item');
+if (navItem) {
+    setTimeout(refreshNotificationData, 300);
+    return;
+}
+    
+    // 3. Клик по ЛЮБОЙ вкладке (статистика, тренировки, профиль)
+    const tabBtn = e.target.closest('.tab-btn, .profile-tab-btn');
+    if (tabBtn) {
+        const tab = tabBtn.dataset.tab;
+        if (!tab) return;
+        
+        const page = tabBtn.closest('.page');
+        if (!page) return;
+        
+        // ★★★ ПЕРЕКЛЮЧАЕМ ВКЛАДКИ ★★★
+        if (page.id === 'page-workouts') {
+            TabManager.workouts(tab);
+        } else if (page.id === 'page-stats') {
+            switchStatsTab(tab);   // ← ИСПОЛЬЗУЕМ switchStatsTab ВМЕСТО TabManager.stats
+        } else if (page.id === 'page-profile') {
+            TabManager.profile(tab);
+        }
+        
+        // ★★★ ОБНОВЛЯЕМ УВЕДОМЛЕНИЯ ★★★
+        setTimeout(refreshNotificationData, 300);
+        return;
+    }
+    
+    // 4. Кнопка "Завершить тренировку"
+    const finishBtn = e.target.closest('#finishDoneBtn');
+    if (finishBtn) {
+        setTimeout(refreshNotificationData, 1000);
+        return;
+    }
+});
+
+// =================== МОДАЛЬНОЕ ОКНО "ПРАВИЛА" ===================
+
+function showRulesModal() {
+    // Сбрасываем все чекбоксы при открытии
+    const checkboxes = document.querySelectorAll('#rulesModal .rule-checkbox');
+    checkboxes.forEach(cb => cb.checked = false);
+    
+    openModal('rulesModal');
+}
+
+function areAllRulesChecked() {
+    const checkboxes = document.querySelectorAll('#rulesModal .rule-checkbox');
+    let allChecked = true;
+    
+    checkboxes.forEach(cb => {
+        if (!cb.checked) {
+            allChecked = false;
+        }
+    });
+    
+    return allChecked;
+}
+
+function handleRulesAccept() {
+    if (areAllRulesChecked()) {
+        // Все правила приняты - закрываем окно
+        closeModal('rulesModal');
+        showToast('✅ Спасибо за честность! Приятных тренировок!');
+        console.log('✅ Все правила приняты, модальное окно закрыто');
+    } else {
+        // Не все правила приняты - показываем тост
+        showToast('⚠️ Примите все правила, чтобы продолжить');
+        console.log('⚠️ Не все правила приняты');
+    }
+}
+
+// =================== ИНИЦИАЛИЗАЦИЯ ===================
+
+// Привязываем обработчик к кнопке "Принять"
+document.addEventListener('DOMContentLoaded', function() {
+    const acceptBtn = document.getElementById('rulesAcceptBtn');
+    if (acceptBtn) {
+        acceptBtn.addEventListener('click', handleRulesAccept);
+    }
+});
+
+// ★★★ ИСПРАВЛЕНО: переключение ТОЛЬКО по чекбоксу ★★★
+// Убираем обработчик клика по тексту, оставляем только нативный change для чекбоксов
+document.addEventListener('change', function(event) {
+    if (event.target.classList.contains('rule-checkbox')) {
+        // Чекбокс переключился автоматически
+        console.log(`✅ Правило ${event.target.dataset.rule}: ${event.target.checked}`);
+    }
+});
+
+// =================== УПРАВЛЕНИЕ ТЕМОЙ (СВЕТЛАЯ/ТЁМНАЯ/СИСТЕМНАЯ) ===================
+
+// Ключ для localStorage
+const THEME_MODE_KEY = 'appThemeMode';
+
+// ★★★ ПЕРЕМЕННАЯ ДЛЯ ХРАНЕНИЯ ВРЕМЕННОГО ВЫБОРА ★★★
+let tempTheme = null;
+
+// ★★★ СЛУШАТЕЛЬ СИСТЕМНОЙ ТЕМЫ ★★★
+let systemThemeListener = null;
+
+/**
+ * Получить текущую тему пользователя
+ */
+function getThemeMode() {
+    return localStorage.getItem(THEME_MODE_KEY) || 'system';
+}
+
+/**
+ * Получить системную тему (dark/light)
+ */
+function getSystemTheme() {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+/**
+ * Определить, какая тема должна быть применена
+ */
+function getEffectiveTheme() {
+    const mode = getThemeMode();
+    if (mode === 'system') {
+        return getSystemTheme();
+    }
+    return mode;
+}
+
+/**
+ * Обновить UI в зависимости от темы
+ */
+function updateThemeUI() {
+    const mode = getThemeMode();
+    const effectiveTheme = getEffectiveTheme();
+    
+    const themeStatus = document.getElementById('themeStatus');
+    const themeIcon = document.getElementById('themeIcon');
+    const themeIconElement = themeIcon?.querySelector('i');
+    
+    // ★★★ ПРИМЕНЯЕМ КЛАСС К BODY ★★★
+    document.body.classList.remove('theme-dark-mode');
+    if (effectiveTheme === 'dark') {
+        document.body.classList.add('theme-dark-mode');
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ СТАТУС В НАСТРОЙКАХ ★★★
+    if (themeStatus) {
+        if (mode === 'system') {
+            themeStatus.textContent = `Системная`;
+        } else {
+            themeStatus.textContent = mode === 'light' ? 'Светлая' : 'Тёмная';
+        }
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ ИКОНКУ ★★★
+    if (themeIconElement) {
+        if (mode === 'system') {
+            themeIconElement.className = 'fa-solid fa-cloud-sun-rain';
+        } else if (mode === 'light') {
+            themeIconElement.className = 'fa-solid fa-sun';
+        } else {
+            themeIconElement.className = 'fa-solid fa-moon';
+        }
+    }
+}
+
+/**
+ * Настроить слушатель системной темы
+ */
+function setupSystemThemeListener() {
+    // Удаляем старый слушатель, если есть
+    if (systemThemeListener) {
+        systemThemeListener.removeEventListener('change', handleSystemThemeChange);
+        systemThemeListener = null;
+    }
+    
+    // Создаём новый слушатель
+    systemThemeListener = window.matchMedia('(prefers-color-scheme: dark)');
+    systemThemeListener.addEventListener('change', handleSystemThemeChange);
+}
+
+/**
+ * Обработчик изменения системной темы
+ */
+function handleSystemThemeChange(e) {
+    const mode = getThemeMode();
+    // Обновляем UI только если выбрана системная тема
+    if (mode === 'system') {
+        updateThemeUI();
+        console.log(`🔄 Системная тема изменилась: ${e.matches ? 'Тёмная 🌙' : 'Светлая ☀️'}`);
+    }
+}
+
+/**
+ * Открыть модальное окно выбора темы
+ */
+function toggleThemeModal() {
+    const currentTheme = getThemeMode();
+    
+    // ★★★ СОХРАНЯЕМ ТЕКУЩУЮ ТЕМУ КАК ВРЕМЕННУЮ ★★★
+    tempTheme = currentTheme;
+    
+    // Убираем активный класс у всех вариантов
+    document.querySelectorAll('.theme-option').forEach(el => {
+        el.classList.remove('theme-option-active');
+    });
+    
+    // Добавляем активный класс выбранной теме
+    const selectedOption = document.querySelector(`.theme-option[data-theme="${currentTheme}"]`);
+    if (selectedOption) {
+        selectedOption.classList.add('theme-option-active');
+    }
+    
+    openModal('themeModal');
+}
+
+/**
+ * Выбрать тему (временно, без сохранения)
+ */
+function selectTheme(theme) {
+    // ★★★ СОХРАНЯЕМ ТОЛЬКО В ВРЕМЕННУЮ ПЕРЕМЕННУЮ ★★★
+    tempTheme = theme;
+    
+    // Обновляем выделение в модалке
+    document.querySelectorAll('.theme-option').forEach(el => {
+        el.classList.remove('theme-option-active');
+    });
+    
+    const selectedOption = document.querySelector(`.theme-option[data-theme="${theme}"]`);
+    if (selectedOption) {
+        selectedOption.classList.add('theme-option-active');
+    }
+}
+
+/**
+ * ★★★ ПРИМЕНИТЬ ТЕМУ (ПРИ НАЖАТИИ "ГОТОВО") ★★★
+ */
+function applyTheme() {
+    if (tempTheme) {
+        const currentTheme = getThemeMode();
+        
+        // ★★★ ПРОВЕРЯЕМ, ИЗМЕНИЛАСЬ ЛИ ТЕМА ★★★
+        if (tempTheme !== currentTheme) {
+            // Тема реально изменилась - сохраняем
+            localStorage.setItem(THEME_MODE_KEY, tempTheme);
+syncSaveToFirestore('settings', { 
+    themeMode: tempTheme,
+    themeColor: localStorage.getItem('themeColor') || 'red',
+    themeColorCustom: localStorage.getItem('themeColorCustom') === 'true'
+});
+            
+            // ★★★ ОБНОВЛЯЕМ UI ★★★
+            updateThemeUI();
+            
+            // ★★★ НАСТРАИВАЕМ СЛУШАТЕЛЬ ДЛЯ СИСТЕМНОЙ ТЕМЫ ★★★
+            setupSystemThemeListener();
+            
+            // ★★★ ПОКАЗЫВАЕМ ТОСТ ТОЛЬКО ПРИ РЕАЛЬНОМ ИЗМЕНЕНИИ ★★★
+            const themeName = tempTheme === 'system' ? 'Системную' : (tempTheme === 'light' ? 'Светлую' : 'Тёмную');
+            showToast(`✅ Тема изменена на ${themeName}`);
+            console.log(`✅ Применена тема: ${themeName}`);
+        } else {
+            console.log('ℹ️ Тема не изменилась');
+        }
+    }
+    
+    // Закрываем модалку
+    closeModal('themeModal');
+}
+
+// =================== РЕДАКТИРОВАНИЕ ПОЧТЫ И ПАРОЛЯ ===================
+
+/**
+ * Редактирование почты
+ */
+function editEmail() {
+    const user = firebase.auth().currentUser;
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+    
+    const currentEmail = user.email || '';
+    
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'editEmailModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">Изменить почту</div>
+            <p class="modal-text" style="margin-bottom: 1rem;">
+                Введите новый email. На него придёт письмо для подтверждения.
+            </p>
+            <div class="form-group" style="text-align:left; margin-bottom: 1rem;">
+                <label class="form-label">Новая почта</label>
+                <input type="email" id="newEmailInput" class="form-input" placeholder="example@mail.ru" value="${currentEmail}" maxlength="50" />
+            </div>
+            <div class="form-group" style="text-align:left; margin-bottom: 1rem;">
+                <label class="form-label">Пароль для подтверждения</label>
+                <input type="password" id="emailConfirmPassword" class="form-input" placeholder="Введите пароль" maxlength="20" />
+            </div>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-secondary" id="editEmailCancel" style="flex:1;">Отмена</button>
+                <button class="btn btn-primary" id="editEmailSave" style="flex:1;">Сохранить</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+    
+document.getElementById('editEmailCancel').addEventListener('click', function() {
+    closeModal('editEmailModal');
+});
+    
+    document.getElementById('editEmailSave').addEventListener('click', async function() {
+        const newEmail = document.getElementById('newEmailInput').value.trim();
+        const password = document.getElementById('emailConfirmPassword').value.trim();
+        
+        const emailInput = document.getElementById('newEmailInput');
+        const passwordInput = document.getElementById('emailConfirmPassword');
+        
+        emailInput.classList.remove('error');
+        passwordInput.classList.remove('error');
+        
+        let hasError = false;
+        let errorMessage = '';
+        
+        if (!newEmail) {
+            emailInput.classList.add('error');
+            hasError = true;
+            errorMessage = 'Введите email';
+        } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+            emailInput.classList.add('error');
+            hasError = true;
+            errorMessage = 'Неверный формат email';
+        }
+        
+        if (!password) {
+            passwordInput.classList.add('error');
+            hasError = true;
+            if (!errorMessage) errorMessage = 'Введите пароль';
+        }
+        
+        if (hasError) {
+            showToast('⚠️ ' + errorMessage);
+            return;
+        }
+        
+        if (newEmail === currentEmail) {
+            showToast('ℹ️ Почта не изменилась');
+            return;
+        }
+        
+        try {
+            // ★★★ 1. ПЕРЕАУТЕНТИФИКАЦИЯ ★★★
+            const credential = firebase.auth.EmailAuthProvider.credential(user.email, password);
+            await user.reauthenticateWithCredential(credential);
+            
+            // ★★★ 2. СОХРАНЯЕМ СТАРЫЙ EMAIL (на всякий случай) ★★★
+            const oldEmail = user.email;
+            
+            // ★★★ 3. ОТПРАВЛЯЕМ ПИСЬМО ПОДТВЕРЖДЕНИЯ ★★★
+            await user.verifyBeforeUpdateEmail(newEmail);
+            
+            // ★★★ 4. СОХРАНЯЕМ ВРЕМЕННЫЕ ДАННЫЕ ★★★
+            localStorage.setItem('pendingEmailChange', newEmail);
+            localStorage.setItem('pendingEmailChangeTime', String(Date.now()));
+            localStorage.setItem('pendingOldEmail', oldEmail);
+            
+// ★★★ 5. ЗАКРЫВАЕМ ПЕРВУЮ МОДАЛКУ ★★★
+closeModal('editEmailModal');
+
+// ★★★ 6. ПОКАЗЫВАЕМ МОДАЛЬНОЕ ОКНО ПОДТВЕРЖДЕНИЯ ★★★
+showEmailVerificationModal(newEmail);
+            
+        } catch (error) {
+            console.error('Ошибка изменения почты:', error);
+            
+            let message = 'Ошибка изменения почты';
+            
+            switch (error.code) {
+                case 'auth/invalid-credential':
+                case 'auth/wrong-password':
+                    message = 'Неверный пароль';
+                    passwordInput.classList.add('error');
+                    break;
+                case 'auth/email-already-in-use':
+                    message = 'Эта почта уже используется';
+                    emailInput.classList.add('error');
+                    break;
+                case 'auth/requires-recent-login':
+                    message = 'Требуется повторный вход. Выйдите и зайдите снова.';
+                    break;
+                case 'auth/network-request-failed':
+                    message = 'Проверьте интернет-соединение';
+                    break;
+                case 'auth/too-many-requests':
+                    message = 'Слишком много попыток. Подождите.';
+                    break;
+                case 'auth/invalid-email':
+                    message = 'Неверный формат email';
+                    emailInput.classList.add('error');
+                    break;
+                case 'auth/operation-not-allowed':
+                    message = 'Операция запрещена. Обратитесь к администратору.';
+                    break;
+                default:
+                    message = error.message || 'Ошибка изменения почты';
+            }
+            
+            showToast('❌ ' + message);
+        }
+    });
+}
+
+/**
+ * Показать модальное окно подтверждения почты
+ */
+function showEmailVerificationModal(newEmail) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'emailVerificationModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div style="text-align: center; margin-bottom: 0.5rem;">
+                <div style="font-size: 4rem; margin-bottom: 0.5rem;">📧</div>
+                <div class="modal-title">Подтвердите почту</div>
+                <p class="modal-text" style="margin-bottom: 1rem;">
+                    Вам пришло письмо на <strong>${newEmail}</strong>
+                </p>
+            </div>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-secondary" id="emailVerifyCancel" style="flex:1;">Отмена</button>
+                <button class="btn btn-primary" id="emailVerifyConfirm" style="flex:1;">Продолжить</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+    
+    // ★★★ КНОПКА "ОТМЕНА" - ВОЗВРАЩАЕМ СТАРУЮ ПОЧТУ ★★★
+document.getElementById('emailVerifyCancel').addEventListener('click', async function() {
+    const oldEmail = localStorage.getItem('pendingOldEmail');
+    const user = firebase.auth().currentUser;
+
+    if (user && oldEmail) {
+        try {
+            await user.updateEmail(oldEmail);
+            await updateUserProfile(user.uid, { email: oldEmail });
+            document.getElementById('profileEmailDisplay').textContent = oldEmail;
+            showToast('✅ Почта возвращена на ' + oldEmail);
+        } catch (error) {
+            console.error('Ошибка возврата почты:', error);
+            showToast('⚠️ Не удалось вернуть старую почту. Перезайдите в аккаунт.');
+        }
+    }
+
+    localStorage.removeItem('pendingEmailChange');
+    localStorage.removeItem('pendingEmailChangeTime');
+    localStorage.removeItem('pendingOldEmail');
+    closeModal('emailVerificationModal');
+});
+
+document.getElementById('emailVerifyConfirm').addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Проверка...';
+
+    try {
+        const user = firebase.auth().currentUser;
+
+        if (!user) {
+            showToast('❌ Пользователь не найден');
+            btn.disabled = false;
+            btn.textContent = 'Продолжить';
+            return;
+        }
+
+        await user.reload();
+
+        if (user.email === newEmail && user.emailVerified) {
+            try {
+                await updateUserProfile(user.uid, { email: newEmail });
+                document.getElementById('profileEmailDisplay').textContent = newEmail;
+
+                localStorage.removeItem('pendingEmailChange');
+                localStorage.removeItem('pendingEmailChangeTime');
+                localStorage.removeItem('pendingOldEmail');
+
+                closeModal('emailVerificationModal');
+                showToast('✅ Почта успешно изменена на ' + newEmail);
+            } catch (error) {
+                console.error('Ошибка обновления профиля:', error);
+                showToast('❌ Ошибка обновления профиля');
+                btn.disabled = false;
+                btn.textContent = 'Продолжить';
+            }
+        } else {
+            showToast('⚠️ Подтвердите почту! Проверьте письмо');
+            btn.disabled = false;
+            btn.textContent = 'Продолжить';
+        }
+    } catch (error) {
+        console.error('Ошибка проверки почты:', error);
+        showToast('❌ Ошибка проверки почты');
+        btn.disabled = false;
+        btn.textContent = 'Продолжить';
+    }
+});
+}
+
+/**
+ * Редактирование пароля
+ */
+function editPassword() {
+    const user = firebase.auth().currentUser;
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+    
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'editPasswordModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">Изменить пароль</div>
+            <p class="modal-text" style="margin-bottom: 1rem;">
+                Введите текущий пароль и новый пароль.
+            </p>
+            <div class="form-group" style="text-align:left; margin-bottom: 0.8rem;">
+                <label class="form-label">Текущий пароль</label>
+                <input type="password" id="currentPasswordInput" class="form-input" placeholder="Введите текущий пароль" maxlength="20" />
+            </div>
+            <div class="form-group" style="text-align:left; margin-bottom: 0.8rem;">
+                <label class="form-label">Новый пароль</label>
+                <input type="password" id="newPasswordInput" class="form-input" placeholder="Минимум 6 символов" maxlength="20" />
+            </div>
+            <div class="form-group" style="text-align:left; margin-bottom: 1rem;">
+                <label class="form-label">Подтвердите новый пароль</label>
+                <input type="password" id="confirmPasswordInput" class="form-input" placeholder="Повторите новый пароль" maxlength="20" />
+            </div>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-secondary" id="editPasswordCancel" style="flex:1;">Отмена</button>
+                <button class="btn btn-primary" id="editPasswordSave" style="flex:1;">Сохранить</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+    
+document.getElementById('editPasswordCancel').addEventListener('click', function() {
+    closeModal('editPasswordModal');
+});
+    
+    document.getElementById('editPasswordSave').addEventListener('click', async function() {
+        const currentPassword = document.getElementById('currentPasswordInput').value.trim();
+        const newPassword = document.getElementById('newPasswordInput').value.trim();
+        const confirmPassword = document.getElementById('confirmPasswordInput').value.trim();
+        
+        const currentInput = document.getElementById('currentPasswordInput');
+        const newInput = document.getElementById('newPasswordInput');
+        const confirmInput = document.getElementById('confirmPasswordInput');
+        
+        [currentInput, newInput, confirmInput].forEach(inp => inp.classList.remove('error'));
+        
+        let hasError = false;
+        let errorMessage = '';
+        
+        if (!currentPassword) {
+            currentInput.classList.add('error');
+            hasError = true;
+            errorMessage = 'Введите текущий пароль';
+        }
+        
+        if (!newPassword || newPassword.length < 6) {
+            newInput.classList.add('error');
+            hasError = true;
+            if (!errorMessage) errorMessage = 'Пароль должен быть минимум 6 символов';
+        }
+        
+        if (newPassword !== confirmPassword) {
+            confirmInput.classList.add('error');
+            hasError = true;
+            if (!errorMessage) errorMessage = 'Пароли не совпадают';
+        }
+        
+        if (newPassword === currentPassword) {
+            newInput.classList.add('error');
+            hasError = true;
+            if (!errorMessage) errorMessage = 'Новый пароль совпадает с текущим';
+        }
+        
+        if (hasError) {
+            showToast('⚠️ ' + errorMessage);
+            return;
+        }
+        
+        try {
+            const credential = firebase.auth.EmailAuthProvider.credential(user.email, currentPassword);
+            await user.reauthenticateWithCredential(credential);
+            await user.updatePassword(newPassword);
+            
+showToast('✅ Пароль обновлён!');
+closeModal('editPasswordModal');
+            
+        } catch (error) {
+            console.error('Ошибка изменения пароля:', error);
+            console.log('Код ошибки:', error.code);
+            console.log('Сообщение:', error.message);
+            
+            let message = 'Ошибка изменения пароля';
+            
+            // ★★★ ОБНОВЛЁННАЯ ОБРАБОТКА ОШИБОК ★★★
+            switch (error.code) {
+                case 'auth/invalid-credential':
+                case 'auth/wrong-password':
+                    message = 'Неверный текущий пароль';
+                    currentInput.classList.add('error');
+                    break;
+                case 'auth/requires-recent-login':
+                    message = 'Требуется повторный вход. Выйдите и зайдите снова.';
+                    break;
+                case 'auth/weak-password':
+                    message = 'Пароль слишком простой. Минимум 6 символов.';
+                    newInput.classList.add('error');
+                    break;
+                case 'auth/network-request-failed':
+                    message = 'Проверьте интернет-соединение';
+                    break;
+                case 'auth/too-many-requests':
+                    message = 'Слишком много попыток. Подождите.';
+                    break;
+                case 'auth/user-not-found':
+                    message = 'Пользователь не найден';
+                    break;
+                default:
+                    message = error.message || 'Ошибка изменения пароля';
+            }
+            
+            showToast('❌ ' + message);
+        }
+    });
+}
+// =================== ДОСТИЖЕНИЯ ===================
+
+// =================== ХЕЛПЕР: РОДИТЕЛЬСКАЯ КАТЕГОРИЯ ПО ИКОНКЕ ===================
+const ICON_TO_PARENT = {
+    // Силовые
+    'bodybuilding': 'strength',
+    'shoulder':     'strength',
+    'press':        'strength',
+    'breast':       'strength',
+    'back':         'strength',
+    'legs':         'strength',
+    'WholeBody':    'strength',
+    // Фитнес
+    'cardio':       'fitness',
+    'stretching':   'fitness',
+    'charging':     'fitness',
+    'Pilates':      'fitness',
+    'stretching-back': 'fitness',
+    // Особые (считаем premium, не попадают в силовые/фитнес)
+    'crossfit':     'premium',
+    'men':          'premium',
+    'woman':        'premium'
+};
+
+function getParentCategory(icon) {
+    if (!icon) return null;
+    return ICON_TO_PARENT[icon] || null;
+}
+
+const ACHIEVEMENTS_CONFIG = [
+    {
+        id: 'friendly',
+        icon: 'fa-solid fa-user-group',
+        name: 'Дружелюбный',
+        description: 'Добавить 10 человек в друзья',
+        check: async (userId, profile, workouts) => {
+            const friends = profile.friends || [];
+            return friends.length >= 10;
+        }
+    },
+    {
+        id: 'marathoner',
+        icon: 'fa-solid fa-dumbbell',
+        name: 'Марафонец',
+        description: 'Выполнить 100 силовых тренировок',
+        check: async (userId, profile, workouts) => {
+            const filtered = workouts.filter(w => {
+                const icon = getWorkoutIcon(w);
+                return getParentCategory(icon) === 'strength';
+            });
+            return filtered.length >= 100;
+        }
+    },
+    {
+        id: 'fitnessMaster',
+        icon: 'fa-solid fa-heart-pulse',
+        name: 'Фитнес-мастер',
+        description: 'Выполнить 100 фитнес-тренировок',
+        check: async (userId, profile, workouts) => {
+            const filtered = workouts.filter(w => {
+                const icon = getWorkoutIcon(w);
+                return getParentCategory(icon) === 'fitness';
+            });
+            return filtered.length >= 100;
+        }
+    },
+    {
+        id: 'unstoppable',
+        icon: 'fa-solid fa-fire',
+        name: 'Неудержимый',
+        description: 'Выполнить 21 дневную серию тренировок',
+        check: async (userId, profile, workouts) => {
+            const streak = profile.streakDays || 0;
+            return streak >= 21;
+        }
+    },
+    {
+        id: 'ironEndurance',
+        icon: 'fa-solid fa-stopwatch',
+        name: 'Железная выдержка',
+        description: 'Тренироваться 1000 минут суммарно',
+        check: async (userId, profile, workouts) => {
+            const totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+            const minutes = Math.floor(totalSeconds / 60);
+            return minutes >= 1000;
+        }
+    },
+    {
+        id: 'masterOfStyles',
+        icon: 'fa-solid fa-award',
+        name: 'Мастер всех стилей',
+        description: 'Выполнить 10 тренировок в каждой категории',
+        check: async (userId, profile, workouts) => {
+            const categories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+            const counts = {};
+            categories.forEach(c => counts[c] = 0);
+            workouts.forEach(w => {
+                const icon = getWorkoutIcon(w);
+                const cat = getCategoryByIcon(icon);
+                if (cat && counts[cat] !== undefined) {
+                    counts[cat] = (counts[cat] || 0) + 1;
+                }
+            });
+            return categories.every(c => (counts[c] || 0) >= 10);
+        }
+    },
+    {
+        id: 'vip',
+        icon: 'fa-solid fa-crown',
+        name: 'PREMIUM',
+        description: 'Купить PREMIUM',
+        check: async (userId, profile, workouts) => {
+            return profile.premium === true;
+        }
+    }
+];
+
+// =================== ДОСТИЖЕНИЯ ===================
+async function checkAllAchievements(userId) {
+    try {
+        // Получаем профиль и тренировки
+        const profileResult = await getUserProfile(userId);
+        if (!profileResult.success) return null;
+        const profile = profileResult.data;
+        const workoutsResult = await getUserWorkoutsFromFirestore(userId);
+        const workouts = workoutsResult.success ? workoutsResult.data : [];
+
+        // Проверяем каждое достижение
+        const results = {};
+        for (const ach of ACHIEVEMENTS_CONFIG) {
+            const unlocked = await ach.check(userId, profile, workouts);
+            results[ach.id] = unlocked;
+        }
+
+        // Обновляем Firestore
+        const currentAchievements = profile.achievements || {};
+        let changed = false;
+        let newUnlocked = [];
+        for (const id in results) {
+            if (currentAchievements[id] !== results[id]) {
+                changed = true;
+                // Если стало true (было false) - новое достижение
+                if (results[id] === true && currentAchievements[id] !== true) {
+                    newUnlocked.push(id);
+                }
+                currentAchievements[id] = results[id];
+            }
+        }
+        if (changed) {
+            await updateUserProfile(userId, { achievements: currentAchievements });
+            
+    // ★★★ ПОКАЗЫВАЕМ УВЕДОМЛЕНИЯ И СОХРАНЯЕМ СОБЫТИЯ ДЛЯ НОВЫХ ДОСТИЖЕНИЙ ★★★
+    for (const id of newUnlocked) {
+        const ach = ACHIEVEMENTS_CONFIG.find(a => a.id === id);
+        if (ach) {
+            // Сохраняем событие о новом достижении
+            await saveUserEvent(userId, 'achievement_unlocked', {
+                achievementId: ach.id,
+                achievementName: ach.name,
+                achievementIcon: ach.icon
+            });
+            
+            // Показываем уведомление
+            showAchievementNotification(id);
+        }
+    }
+        }
+
+        return results;
+    } catch (error) {
+        console.error('Ошибка проверки достижений:', error);
+        return null;
+    }
+}
+
+function renderAchievements() {
+    const user = firebase.auth().currentUser;
+    if (!user) return;
+
+    const visible = getAchievementsVisibility();
+    const container = document.getElementById('achievementsContainer');
+    if (container) {
+        container.classList.toggle('hidden', !visible);
+    }
+    if (!visible) return;
+
+    getUserProfile(user.uid).then(result => {
+        if (!result.success) return;
+        const achievements = result.data.achievements || {};
+        const icons = document.querySelectorAll('.achievement-icon');
+        icons.forEach(el => {
+            const id = el.dataset.achievement;
+            const unlocked = achievements[id] === true;
+            el.classList.remove('unlocked', 'locked');
+            el.classList.add(unlocked ? 'unlocked' : 'locked');
+        });
+    });
+}
+
+function openAchievementsModal() {
+    const user = firebase.auth().currentUser;
+    if (!user) {
+        showToast('⚠️ Авторизуйтесь, чтобы увидеть достижения');
+        return;
+    }
+    getUserProfile(user.uid).then(async (result) => {
+        if (!result.success) return;
+        const profile = result.data;
+        const achievements = profile.achievements || {};
+        const workoutsResult = await getUserWorkoutsFromFirestore(user.uid);
+        const workouts = workoutsResult.success ? workoutsResult.data : [];
+
+        // Собираем прогресс для каждого достижения
+        const progressList = [];
+        for (const ach of ACHIEVEMENTS_CONFIG) {
+            let progress = '';
+            let isUnlocked = achievements[ach.id] === true;
+            // Для каждого достижения вычисляем прогресс (для отображения в модалке)
+switch (ach.id) {
+    case 'friendly': {
+        const friends = profile.friends || [];
+        progress = `${friends.length}/10`;
+        break;
+    }
+case 'marathoner': {
+    const filtered = workouts.filter(w => getParentCategory(getWorkoutIcon(w)) === 'strength');
+    progress = `${filtered.length}/100`;
+    break;
+}
+case 'fitnessMaster': {
+    const filtered = workouts.filter(w => getParentCategory(getWorkoutIcon(w)) === 'fitness');
+    progress = `${filtered.length}/100`;
+    break;
+}
+case 'vip': {
+    progress = profile.premium === true ? '✓' : '—';
+    break;
+}
+    case 'unstoppable': {
+        const streak = profile.streakDays || 0;
+        progress = `${streak}/21`;  // ← ИЗМЕНЕНО (было /14)
+        break;
+    }
+    case 'ironEndurance': {
+        const totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+        const minutes = Math.floor(totalSeconds / 60);
+        progress = `${minutes}/1000`;
+        break;
+    }
+    case 'masterOfStyles': {
+        const categories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+        const counts = {};
+        categories.forEach(c => counts[c] = 0);
+        workouts.forEach(w => {
+            const icon = getWorkoutIcon(w);
+            const cat = getCategoryByIcon(icon);
+            if (cat && counts[cat] !== undefined) {
+                counts[cat] = (counts[cat] || 0) + 1;
+            }
+        });
+        const done = categories.filter(c => (counts[c] || 0) >= 10).length;
+        progress = `${done}/${categories.length}`;
+        break;
+    }
+    default: progress = '';
+}
+            progressList.push({
+                ...ach,
+                unlocked: isUnlocked,
+                progress: progress
+            });
+        }
+
+// Рендерим модалку
+const list = document.getElementById('achievementsList');
+if (!list) return;
+list.innerHTML = progressList.map(ach => `
+    <div class="achievement-modal-item">
+        <div class="achievement-modal-icon ${ach.unlocked ? 'unlocked' : 'locked'}">
+            <i class="${ach.icon}"></i>
+        </div>
+        <div class="achievement-modal-info">
+            <div class="achievement-modal-name">${ach.name}</div>
+            <div class="achievement-modal-desc">${ach.description}</div>
+        </div>
+        <div class="achievement-modal-progress">
+            <div class="achievement-modal-progress-text ${ach.unlocked ? 'unlocked' : 'locked'}">
+                ${ach.progress}
+            </div>
+        </div>
+    </div>
+`).join('');
+
+        openModal('achievementsModal');
+    });
+}
+
+// Обёртка для вызова проверки достижений после завершения тренировки
+async function updateAchievementsAfterWorkout() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    await checkAllAchievements(user.uid);
+    renderAchievements();
+}
+
+// =================== УВЕДОМЛЕНИЕ О ДОСТИЖЕНИИ ===================
+function showAchievementNotification(achievementId) {
+    const ach = ACHIEVEMENTS_CONFIG.find(a => a.id === achievementId);
+    if (!ach) return;
+    
+    // Проверяем, не показывали ли уже уведомление для этого достижения
+    const notificationKey = 'achievement_notified_' + achievementId;
+    if (localStorage.getItem(notificationKey) === 'true') return;
+    
+    // Показываем уведомление
+    showNotification(
+        '🏆',
+        `Новое достижение: ${ach.name}!`,
+        null,
+        true,
+        function() {
+            window.navigateTo('profile');
+            TabManager.profile('my');
+        }
+    );
+    
+    // Отмечаем, что уведомление показано
+    localStorage.setItem(notificationKey, 'true');
+}
+
+// =================== НАСТРОЙКА: СКРЫТИЕ ДОСТИЖЕНИЙ ===================
+const ACHIEVEMENTS_VISIBILITY_KEY = 'achievementsVisible';
+
+function getAchievementsVisibility() {
+    return localStorage.getItem(ACHIEVEMENTS_VISIBILITY_KEY) !== 'false';
+}
+
+function updateAchievementsVisibilityUI(visible) {
+    const statusEl = document.getElementById('achievementsStatus');
+    if (statusEl) {
+        statusEl.textContent = visible ? 'Показаны' : 'Скрыты';
+    }
+    const container = document.getElementById('achievementsContainer');
+    if (container) {
+        container.classList.toggle('hidden', !visible);
+    }
+}
+
+function loadAchievementsVisibility() {
+    const visible = getAchievementsVisibility();
+    updateAchievementsVisibilityUI(visible);
+}
+
+function toggleAchievementsVisibility() {
+    const current = getAchievementsVisibility();
+    const newState = !current;
+
+    showConfirmModal(
+        newState ? 'Показать достижения?' : 'Скрыть достижения?',
+        newState
+            ? 'Достижения снова будут видны в вашем профиле и в рейтингах пользователей.'
+            : 'Достижения будут скрыты из вашего профиля и из рейтингов пользователей.',
+        function() {
+            localStorage.setItem(ACHIEVEMENTS_VISIBILITY_KEY, String(newState));
+            updateAchievementsVisibilityUI(newState);
+
+            // ★★★ В FIRESTORE ★★★
+            syncSaveToFirestore('achievementsVisible', newState);
+
+            showToast(`✅ Достижения ${newState ? 'показаны' : 'скрыты'}`);
+        },
+        newState ? 'Показать' : 'Скрыть'
+    );
+}
+
+// =================== ОБНОВЛЕНИЕ ДОСТИЖЕНИЙ В ЛЮБОМ КОНТЕЙНЕРЕ ===================
+function updateAchievementsUI(containerId, achievements) {
+    const container = document.getElementById(containerId);
+    if (!container) {
+        console.warn('Контейнер ' + containerId + ' не найден');
+        return;
+    }
+    // Получаем все иконки достижений внутри контейнера
+    const icons = container.querySelectorAll('.achievement-icon');
+    icons.forEach(el => {
+        const id = el.dataset.achievement;
+        const unlocked = achievements && achievements[id] === true;
+        el.classList.remove('unlocked', 'locked');
+        el.classList.add(unlocked ? 'unlocked' : 'locked');
+    });
+}
+
+function openLevelInfoModal() {
+    const user = firebase.auth().currentUser;
+    if (!user) {
+        showToast('❌ Авторизуйтесь');
+        return;
+    }
+    getUserProfile(user.uid).then(result => {
+        if (!result.success) return;
+        const profile = result.data;
+        const xp = profile.totalXp || 0;
+        const currentLevel = getCurrentLevel(xp);
+        const progress = getXpProgress(xp);
+        const nextLevel = getNextLevel(xp);
+        
+        // ★★★ ОКРУГЛЯЕМ XP ДО ЦЕЛОГО ★★★
+        const xpRounded = Math.round(xp);
+        const progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+
+        document.getElementById('levelInfoLvl').textContent = currentLevel.id + ' LVL';
+        document.getElementById('levelInfoTitle').textContent = currentLevel.name;
+        document.getElementById('levelInfoProgress').textContent = progressText;
+        document.getElementById('levelInfoFill').style.width = progress + '%';
+
+        openModal('levelInfoModal');
+    });
+}
+
+document.getElementById('levelInfoOkBtn')?.addEventListener('click', function() {
+    closeModal('levelInfoModal');
+    openAchievementsModal();
+});
+
+function updateDailyModalIcons() {
+    for (let i = 1; i <= 3; i++) {
+        const icon = document.getElementById('modalDailyIcon' + i);
+        if (icon) {
+            if (dailyTasks[i]) {
+                icon.className = 'fa-regular fa-square-check';
+            } else {
+                icon.className = 'fa-regular fa-square';
+            }
+        }
+    }
+}
+
+// ===== ПЕРВЫЕ ЗАДАНИЯ =====
+const tasks = {
+    1: false,  // Первый шаг
+    2: false,  // Статистика
+    3: false,  // Индивидуальность
+    4: false,  // Новые знакомства
+    5: false   // Оформление
+};
+
+// Ключ для localStorage
+const TASKS_STORAGE_KEY = 'sportapp_tasks';
+
+async function loadTasks() {
+    // Загружаем из Firestore с fallback на localStorage
+    const firestoreTasks = await syncLoadWithFallback('firstTasks', TASKS_STORAGE_KEY, null);
+    
+    if (firestoreTasks) {
+        let parsed = firestoreTasks;
+        if (typeof firestoreTasks === 'string') {
+            try { parsed = JSON.parse(firestoreTasks); } catch (e) {}
+        }
+        for (const key in parsed) {
+            if (tasks.hasOwnProperty(key)) {
+                tasks[key] = parsed[key];
+            }
+        }
+    }
+    
+    // Логика отображения
+    if (checkAllTasksCompleted()) {
+        showDailyTasks();
+        hideTasks();
+    } else {
+        showTasks();
+        hideDailyTasks();
+    }
+    
+    updateTasksUI();
+}
+
+// app.js
+function hideTasks() {
+    const tasksBlock = document.getElementById('tasks-block');
+    if (tasksBlock) {
+        tasksBlock.style.display = 'none';
+    }
+}
+
+function hideDailyTasks() {
+    const dailyTasksBlock = document.getElementById('daily-tasks-block');
+    if (dailyTasksBlock) {
+        dailyTasksBlock.style.display = 'none';
+    }
+}
+
+function showTasks() {
+    const tasksBlock = document.getElementById('tasks-block');
+    const dailyTasksBlock = document.getElementById('daily-tasks-block');
+    
+    if (tasksBlock) {
+        tasksBlock.style.display = 'block';
+        tasksBlock.classList.add('open');
+    }
+    
+    if (dailyTasksBlock) {
+        dailyTasksBlock.style.display = 'none';
+    }
+    
+    saveBlocksState();
+}
+
+function showDailyTasks() {
+    const tasksBlock = document.getElementById('tasks-block');
+    const dailyTasksBlock = document.getElementById('daily-tasks-block');
+    
+    if (tasksBlock) {
+        tasksBlock.style.display = 'none';
+    }
+    
+    if (dailyTasksBlock) {
+        dailyTasksBlock.style.display = 'block';
+        dailyTasksBlock.classList.add('open');
+    }
+    
+    renderDailyTasks();
+    saveBlocksState();
+}
+
+function saveTasks() {
+    // 1. Локально (быстро)
+    localStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks));
+    
+    // 2. В Firestore (асинхронно)
+    syncSaveToFirestore('firstTasks', tasks);
+}
+
+function toggleTask(taskId) {
+    // ★★★ ПРОВЕРЯЕМ, НЕ ВЫПОЛНЕНО ЛИ УЖЕ ЗАДАНИЕ ★★★
+    if (tasks[taskId]) {
+        showToast('ℹ️ Задание уже выполнено');
+        return;
+    }
+    
+    // ★★★ ОТКРЫВАЕМ МОДАЛКУ С ПОДСКАЗКОЙ ★★★
+    openTaskHelpModal(taskId);
+}
+
+// Обновить интерфейс ежедневных заданий
+function updateDailyUI() {
+    for (let i = 1; i <= 3; i++) {
+        const icon = document.getElementById('dailyTaskIcon' + i);
+        if (icon) {
+            if (dailyTasks[i]) {
+                icon.className = 'fa-regular fa-square-check';
+                icon.style.color = 'var(--accent)';
+            } else {
+                icon.className = 'fa-regular fa-square';
+                icon.style.color = 'var(--light-grey)';
+            }
+        }
+    }
+}
+
+function updateTasksUI() {
+    for (let i = 1; i <= 5; i++) {
+        const icon = document.getElementById('taskIcon' + i);
+        if (icon) {
+            if (tasks[i]) {
+                icon.className = 'fa-regular fa-square-check';
+                icon.style.color = '';
+            } else {
+                icon.className = 'fa-regular fa-square';
+                icon.style.color = '';
+            }
+        }
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ КАРУСЕЛЬ ★★★
+    if (typeof refreshAutoCarousel === 'function') {
+        refreshAutoCarousel();
+    }
+}
+
+// Начисление XP за задание
+async function addTaskXp() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    try {
+        const profileResult = await getUserProfile(user.uid);
+        if (profileResult.success) {
+            const currentXp = profileResult.data.totalXp || 0;
+            await updateUserProfile(user.uid, { totalXp: currentXp + 10 });
+        }
+    } catch (error) {
+        console.error('Ошибка начисления XP:', error);
+    }
+    
+    // ★★★ ПРОВЕРЯЕМ, ВСЕ ЛИ ЗАДАНИЯ ВЫПОЛНЕНЫ ★★★
+    if (checkAllTasksCompleted()) {
+        // Все первые задания выполнены → показываем ЕЖЕДНЕВНЫЕ
+        showDailyTasks();
+        hideTasks();
+        
+        // ★★★ ПОКАЗЫВАЕМ УВЕДОМЛЕНИЕ ★★★
+        showNotification(
+            '🎉',
+            'Теперь вам доступны ежедневные задания!',
+            null,
+            true,
+            function() {
+                window.navigateTo('profile');
+                TabManager.profile('my');
+                setTimeout(function() {
+                    showDailyTasks();
+                }, 300);
+            }
+        );
+    }
+}
+
+// Проверка всех заданий (для отладки)
+function checkAllTasksCompleted() {
+    return Object.values(tasks).every(function(v) { return v === true; });
+}
+
+// ===== ЕЖЕДНЕВНЫЕ ЗАДАНИЯ =====
+// Конфигурация блоков заданий
+const DAILY_TASKS_CONFIG = {
+    // Блок 1: Упражнения (физические)
+    exercise: {
+        items: [
+            { id: 'exercise_1', name: 'Приседания', baseValue: 15, unit: 'раз', icon: 'fa-solid fa-dumbbell' },
+            { id: 'exercise_2', name: 'Отжимания', baseValue: 10, unit: 'раз', icon: 'fa-solid fa-dumbbell' },
+            { id: 'exercise_3', name: 'Подтягивания', baseValue: 5, unit: 'раз', icon: 'fa-solid fa-dumbbell' },
+            { id: 'exercise_4', name: 'Скручивания', baseValue: 20, unit: 'раз', icon: 'fa-solid fa-dumbbell' },
+            { id: 'exercise_5', name: 'Выпады', baseValue: 10, unit: 'на каждую ногу', icon: 'fa-solid fa-dumbbell' },
+            { id: 'exercise_6', name: 'Бёрпи', baseValue: 8, unit: 'раз', icon: 'fa-solid fa-dumbbell' },
+            { id: 'exercise_7', name: 'Планка', baseValue: 30, unit: 'сек', icon: 'fa-solid fa-dumbbell' }
+        ],
+        maxPerDay: null
+    },
+    // Блок 2: Друзья
+    friends: {
+        items: [
+            { id: 'friends_1', name: 'Дружный', description: 'Выполнить совместную тренировку', icon: 'fa-solid fa-user-group' },
+            { id: 'friends_2', name: 'Дружелюбный', description: 'Посмотреть профиль друга', icon: 'fa-solid fa-user-group' },
+            { id: 'friends_3', name: 'Общительный', description: 'Добавить друга в друзья', icon: 'fa-solid fa-user-plus' }
+        ],
+        maxPerDay: 1
+    },
+    // Блок 3: Статистика
+    stats: {
+        exercises: {
+            items: [
+                { id: 'stats_ex_1', name: 'Спортсмен', target: 15, icon: 'fa-solid fa-chart-bar' },
+                { id: 'stats_ex_2', name: 'Спортсмен', target: 20, icon: 'fa-solid fa-chart-bar' },
+                { id: 'stats_ex_3', name: 'Спортсмен', target: 25, icon: 'fa-solid fa-chart-bar' },
+                { id: 'stats_ex_4', name: 'Спортсмен', target: 30, icon: 'fa-solid fa-chart-bar' }
+            ],
+            maxPerDay: 1
+        },
+        time: {
+            items: [
+                { id: 'stats_time_1', name: 'Атлет', target: 30, icon: 'fa-solid fa-stopwatch' },
+                { id: 'stats_time_2', name: 'Атлет', target: 45, icon: 'fa-solid fa-stopwatch' },
+                { id: 'stats_time_3', name: 'Атлет', target: 60, icon: 'fa-solid fa-stopwatch' }
+            ],
+            maxPerDay: 1
+        }
+    },
+    // Блок 4: Умная статистика
+    smartStats: {
+        items: [
+            { id: 'smart_1', name: 'Упражнения на {category}', description: 'Выполнить {count} упражнений на {category}', icon: 'fa-solid fa-trophy' },
+            { id: 'smart_2', name: 'Тренировка {category}', description: 'Выполнить тренировку {category}', icon: 'fa-solid fa-trophy' }
+        ],
+        maxPerDay: 1
+    }
+};
+
+// Ключи для localStorage
+const DAILY_TASKS_KEY = 'sportapp_daily_tasks';
+const DAILY_DATE_KEY = 'sportapp_daily_date';
+
+
+// ===== ФУНКЦИИ ДЛЯ ЕЖЕДНЕВНЫХ ЗАДАНИЙ =====
+
+// Получить уровень пользователя
+function getUserLevel() {
+    const xp = parseFloat(localStorage.getItem('userXp')) || 0;
+    const level = getCurrentLevel(xp);
+    return level.id || 1;
+}
+
+// Рассчитать целевое значение для упражнения
+function calculateExerciseTarget(baseValue, userLevel) {
+    const result = (baseValue * (1 + userLevel)) / 2;
+    return Math.ceil(result);
+}
+
+// Получить категорию с наименьшим количеством тренировок
+function getLeastTrainedCategory(statsData) {
+    if (!statsData || !statsData.categoryCounts) {
+        const categories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+        return categories[Math.floor(Math.random() * categories.length)];
+    }
+    
+    // ★★★ НАХОДИМ МИНИМАЛЬНОЕ ЗНАЧЕНИЕ ★★★
+    let minCount = Infinity;
+    for (const [category, count] of Object.entries(statsData.categoryCounts)) {
+        if (count < minCount) {
+            minCount = count;
+        }
+    }
+    
+    // ★★★ СОБИРАЕМ ВСЕ КАТЕГОРИИ С МИНИМАЛЬНЫМ ЗНАЧЕНИЕМ ★★★
+    const minCategories = [];
+    for (const [category, count] of Object.entries(statsData.categoryCounts)) {
+        if (count === minCount) {
+            minCategories.push(category);
+        }
+    }
+    
+    // ★★★ ДОБАВЛЯЕМ КАТЕГОРИИ, КОТОРЫХ НЕТ В СТАТИСТИКЕ (ТОЖЕ 0) ★★★
+    const allCategories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+    for (const cat of allCategories) {
+        if (!statsData.categoryCounts[cat]) {
+            minCategories.push(cat);
+        }
+    }
+    
+    // ★★★ ВЫБИРАЕМ СЛУЧАЙНУЮ ИЗ ВСЕХ С МИНИМАЛЬНЫМ ЗНАЧЕНИЕМ ★★★
+    const randomIndex = Math.floor(Math.random() * minCategories.length);
+    const result = minCategories[randomIndex];
+    
+    console.log('📊 getLeastTrainedCategory:');
+    console.log('  - minCount:', minCount);
+    console.log('  - minCategories:', minCategories);
+    console.log('  - выбрано:', result);
+    
+    return result || 'Ноги';
+}
+
+// Получить категорию с наименьшим количеством упражнений
+function getLeastExercisedCategory(statsData) {
+    if (!statsData || !statsData.exerciseCounts) {
+        const categories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+        return categories[Math.floor(Math.random() * categories.length)];
+    }
+    
+    // ★★★ НАХОДИМ МИНИМАЛЬНОЕ ЗНАЧЕНИЕ ★★★
+    let minCount = Infinity;
+    for (const [category, count] of Object.entries(statsData.exerciseCounts)) {
+        if (count < minCount) {
+            minCount = count;
+        }
+    }
+    
+    // ★★★ СОБИРАЕМ ВСЕ КАТЕГОРИИ С МИНИМАЛЬНЫМ ЗНАЧЕНИЕМ ★★★
+    const minCategories = [];
+    for (const [category, count] of Object.entries(statsData.exerciseCounts)) {
+        if (count === minCount) {
+            minCategories.push(category);
+        }
+    }
+    
+    // ★★★ ДОБАВЛЯЕМ КАТЕГОРИИ, КОТОРЫХ НЕТ В СТАТИСТИКЕ (ТОЖЕ 0) ★★★
+    const allCategories = ['Руки', 'Плечи', 'Пресс', 'Грудь', 'Спина', 'Ноги', 'Ягодицы', 'Кардио', 'Гибкость', 'Всё тело'];
+    for (const cat of allCategories) {
+        if (!statsData.exerciseCounts[cat]) {
+            minCategories.push(cat);
+        }
+    }
+    
+    // ★★★ ВЫБИРАЕМ СЛУЧАЙНУЮ ИЗ ВСЕХ С МИНИМАЛЬНЫМ ЗНАЧЕНИЕМ ★★★
+    const randomIndex = Math.floor(Math.random() * minCategories.length);
+    const result = minCategories[randomIndex];
+    
+    console.log('📊 getLeastExercisedCategory:');
+    console.log('  - minCount:', minCount);
+    console.log('  - minCategories:', minCategories);
+    console.log('  - выбрано:', result);
+    
+    return result || 'Руки';
+}
+
+function collectAvailableTasks(userLevel, statsData) {
+    const tasks = [];
+    const userLevelNum = userLevel || 1;
+    
+    // 1. Блок Упражнения — берём иконки из конфига
+    DAILY_TASKS_CONFIG.exercise.items.forEach(item => {
+        const target = calculateExerciseTarget(item.baseValue, userLevelNum);
+        tasks.push({
+            id: item.id,
+            type: 'exercise',
+            block: 'exercise',
+            name: item.name,
+            description: `${target} ${item.unit}`,
+            target: target,
+            icon: item.icon, // ← БЕРЁМ ИЗ КОНФИГА
+            completed: false,
+            baseValue: item.baseValue,
+            unit: item.unit
+        });
+    });
+    
+    // 2. Блок Друзья — берём иконки из конфига
+    DAILY_TASKS_CONFIG.friends.items.forEach(item => {
+        tasks.push({
+            id: item.id,
+            type: 'friends',
+            block: 'friends',
+            name: item.name,
+            description: item.description,
+            target: null,
+            icon: item.icon, // ← БЕРЁМ ИЗ КОНФИГА
+            completed: false
+        });
+    });
+    
+    // 3. Блок Статистика - Упражнения — берём иконки из конфига
+    const statsExercises = DAILY_TASKS_CONFIG.stats.exercises.items;
+    const randomExercise = statsExercises[Math.floor(Math.random() * statsExercises.length)];
+    tasks.push({
+        id: randomExercise.id,
+        type: 'stats_exercise',
+        block: 'stats_exercise',
+        name: randomExercise.name,
+        description: `Выполнить ${randomExercise.target} упражнений`,
+        target: randomExercise.target,
+        icon: randomExercise.icon, // ← БЕРЁМ ИЗ КОНФИГА
+        completed: false
+    });
+    
+    // 4. Блок Статистика - Время — берём иконки из конфига
+    const statsTime = DAILY_TASKS_CONFIG.stats.time.items;
+    const randomTime = statsTime[Math.floor(Math.random() * statsTime.length)];
+    tasks.push({
+        id: randomTime.id,
+        type: 'stats_time',
+        block: 'stats_time',
+        name: randomTime.name,
+        description: `Тренироваться ${randomTime.target} минут`,
+        target: randomTime.target,
+        icon: randomTime.icon, // ← БЕРЁМ ИЗ КОНФИГА
+        completed: false
+    });
+    
+    // 5. Блок Умная статистика — берём иконки из конфига
+    const smartTasks = [];
+    
+    const leastExercisedCategory = getLeastExercisedCategory(statsData);
+    const exerciseCounts = [5, 10, 15];
+    const randomCount = exerciseCounts[Math.floor(Math.random() * exerciseCounts.length)];
+    smartTasks.push({
+        id: 'smart_exercise_' + Date.now(),
+        type: 'smart_exercise',
+        block: 'smart_stats',
+        name: `${randomCount} упражнений на ${leastExercisedCategory}`,
+        description: `Выполнить ${randomCount} упражнений на ${leastExercisedCategory}`,
+        target: randomCount,
+        category: leastExercisedCategory,
+        icon: DAILY_TASKS_CONFIG.smartStats.items[0].icon,
+        completed: false
+    });
+    
+    const leastTrainedCategory = getLeastTrainedCategory(statsData);
+    smartTasks.push({
+        id: 'smart_workout_' + Date.now(),
+        type: 'smart_workout',
+        block: 'smart_stats',
+        name: `Тренировка ${leastTrainedCategory}`,
+        description: `Выполнить тренировку ${leastTrainedCategory}`,
+        target: null,
+        category: leastTrainedCategory,
+        icon: DAILY_TASKS_CONFIG.smartStats.items[1].icon,
+        completed: false
+    });
+    
+    const randomSmart = smartTasks[Math.floor(Math.random() * smartTasks.length)];
+    tasks.push(randomSmart);
+    
+    return tasks;
+}
+
+// Выбрать финальный набор заданий
+function selectDailyTasks(tasks) {
+    const count = 3;
+    const selected = [];
+    const usedBlocks = {
+        friends: false,
+        smart_stats: false,
+        stats_exercise: false,
+        stats_time: false,
+        exercise: 0
+    };
+    
+    const maxExercise = 1;
+    
+    // Перемешиваем задания
+    const shuffled = [...tasks].sort(() => Math.random() - 0.5);
+    
+    for (const task of shuffled) {
+        // Проверяем ограничения по блокам
+        if (task.block === 'friends' && usedBlocks.friends) continue;
+        if (task.block === 'smart_stats' && usedBlocks.smart_stats) continue;
+        if (task.block === 'stats_exercise' && usedBlocks.stats_exercise) continue;
+        if (task.block === 'stats_time' && usedBlocks.stats_time) continue;
+        
+        // ★★★ ПРОВЕРКА ДЛЯ УПРАЖНЕНИЙ ★★★
+        if (task.block === 'exercise' && usedBlocks.exercise >= maxExercise) continue;
+        
+        selected.push(task);
+        
+        // Отмечаем использованные блоки
+        if (task.block === 'friends') usedBlocks.friends = true;
+        if (task.block === 'smart_stats') usedBlocks.smart_stats = true;
+        if (task.block === 'stats_exercise') usedBlocks.stats_exercise = true;
+        if (task.block === 'stats_time') usedBlocks.stats_time = true;
+        if (task.block === 'exercise') usedBlocks.exercise++;  // ★★★ УВЕЛИЧИВАЕМ СЧЁТЧИК ★★★
+        
+        if (selected.length >= count) break;
+    }
+    
+    // Если не хватило заданий - добираем из оставшихся
+    if (selected.length < count) {
+        for (const task of shuffled) {
+            if (!selected.includes(task)) {
+                // Проверяем ограничения и для добирания
+                if (task.block === 'exercise' && usedBlocks.exercise >= maxExercise) continue;
+                if (task.block === 'friends' && usedBlocks.friends) continue;
+                if (task.block === 'smart_stats' && usedBlocks.smart_stats) continue;
+                if (task.block === 'stats_exercise' && usedBlocks.stats_exercise) continue;
+                if (task.block === 'stats_time' && usedBlocks.stats_time) continue;
+                
+                selected.push(task);
+                if (task.block === 'exercise') usedBlocks.exercise++;
+                if (selected.length >= count) break;
+            }
+        }
+    }
+    
+    return selected;
+}
+
+// Генерировать ежедневные задания
+async function generateDailyTasks() {
+    try {
+        console.log('🔄 Генерация ежедневных заданий...');
+
+        // Получаем уровень пользователя
+        const user = await getFirebaseUser();
+        let userLevel = 1;
+        let statsData = null;
+        
+        if (user) {
+            const profileResult = await getUserProfile(user.uid);
+            if (profileResult.success) {
+                const xp = profileResult.data.totalXp || 0;
+                userLevel = getCurrentLevel(xp).id || 1;
+                console.log('👤 Уровень пользователя:', userLevel);
+            }
+            
+            // Получаем статистику для умной статистики
+            const workoutsResult = await getUserWorkoutsFromFirestore(user.uid);
+            if (workoutsResult.success) {
+                statsData = {
+                    categoryCounts: {},
+                    exerciseCounts: {}
+                };
+                
+                const workouts = workoutsResult.data.filter(w => getWorkoutIcon(w) !== 'charging');
+                workouts.forEach(w => {
+                    const icon = getWorkoutIcon(w);
+                    const category = getCategoryByIcon(icon);
+                    if (category && category !== 'Зарядка') {
+                        statsData.categoryCounts[category] = (statsData.categoryCounts[category] || 0) + 1;
+                    }
+                    (w.exercises || []).forEach(ex => {
+                        if (ex.completed) {
+                            const exIcon = ex.icon || getExerciseIcon(ex.name);
+                            const exCategory = getCategoryByIcon(exIcon);
+                            if (exCategory && exCategory !== 'Зарядка') {
+                                statsData.exerciseCounts[exCategory] = (statsData.exerciseCounts[exCategory] || 0) + 1;
+                            }
+                        }
+                    });
+                });
+                console.log('📊 Статистика загружена');
+            }
+        }
+        
+        // Собираем все доступные задания
+        const allTasks = collectAvailableTasks(userLevel, statsData);
+        console.log('📋 Всего доступных заданий:', allTasks.length);
+
+        // Выбираем финальный набор (всегда 3 задания)
+        const selectedTasks = selectDailyTasks(allTasks);
+        console.log('✅ Выбрано заданий:', selectedTasks.length);
+        
+        // Сохраняем
+        dailyTasksList = selectedTasks.map(task => ({
+            ...task,
+            completed: false
+        }));
+        
+        // Создаём объект для быстрого доступа к статусу
+        dailyTasksCompleted = {};
+        dailyTasksList.forEach(task => {
+            dailyTasksCompleted[task.id] = false;
+        });
+        
+        const today = new Date().toISOString().split('T')[0];
+        dailyTasksDate = today;
+        
+        // Сохраняем в localStorage
+        saveDailyTasksToStorage();
+        
+        // Обновляем UI
+        renderDailyTasks();
+        
+        console.log('✅ Ежедневные задания сгенерированы:', dailyTasksList.length);
+        
+    } catch (error) {
+        console.error('❌ Ошибка генерации ежедневных заданий:', error);
+    }
+}
+
+function saveDailyTasksToStorage() {
+    const data = {
+        tasks: dailyTasksList,
+        completed: dailyTasksCompleted,
+        date: dailyTasksDate
+    };
+    
+    // 1. Локально
+    localStorage.setItem(DAILY_TASKS_KEY, JSON.stringify(data));
+    localStorage.setItem(DAILY_DATE_KEY, dailyTasksDate);
+    
+    // 2. В Firestore
+    syncSaveToFirestore('dailyTasks', data);
+}
+
+async function loadDailyTasksFromStorage() {
+    const data = await syncLoadWithFallback('dailyTasks', DAILY_TASKS_KEY, null);
+    
+    if (data) {
+        let parsed = data;
+        if (typeof data === 'string') {
+            try { parsed = JSON.parse(data); } catch (e) { return false; }
+        }
+        
+        dailyTasksList = parsed.tasks || [];
+        dailyTasksCompleted = parsed.completed || {};
+        dailyTasksDate = parsed.date || '';
+        
+        dailyTasksList.forEach(task => {
+            if (dailyTasksCompleted[task.id] !== undefined) {
+                task.completed = dailyTasksCompleted[task.id];
+            }
+        });
+        
+        return true;
+    }
+    return false;
+}
+
+// Проверить, нужно ли обновить задания
+function shouldRefreshDailyTasks() {
+    const today = new Date().toISOString().split('T')[0];
+    const savedDate = localStorage.getItem(DAILY_DATE_KEY);
+    
+    if (!savedDate || savedDate !== today) {
+        return true;
+    }
+    
+    // Проверяем, есть ли задания
+    const saved = localStorage.getItem(DAILY_TASKS_KEY);
+    if (!saved) {
+        return true;
+    }
+    
+    try {
+        const data = JSON.parse(saved);
+        return !data.tasks || data.tasks.length === 0;
+    } catch (e) {
+        return true;
+    }
+}
+
+async function initDailyTasks() {
+    console.log('🔄 Инициализация ежедневных заданий...');
+    
+    // ★★★ СНАЧАЛА ЗАГРУЖАЕМ ЗНАЧКИ ИЗ FIRESTORE ★★★
+    await loadMonthlyBadgesFromFirestore();
+    
+    if (shouldRefreshDailyTasks()) {
+        console.log('📅 Требуется обновление заданий');
+        await generateDailyTasks();
+    } else {
+        console.log('📂 Загружаем задания из Firestore/localStorage');
+        await loadDailyTasksFromStorage();
+        renderDailyTasks();
+    }
+    
+    if (typeof refreshAutoCarousel === 'function') {
+        refreshAutoCarousel();
+    }
+}
+
+// Рендерить ежедневные задания в интерфейсе
+function renderDailyTasks() {
+    const container = document.getElementById('dailyTasksContainer');
+    if (!container) {
+        console.warn('⚠️ Контейнер dailyTasksContainer не найден');
+        return;
+    }
+
+    if (!dailyTasksList || dailyTasksList.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state" style="box-shadow: none;">
+                <span class="empty-icon">📋</span>
+                <h3 class="empty-title">Нет заданий</h3>
+                <p class="empty-text">Задания не сгенерированы</p>
+            </div>
+        `;
+        return;
+    }
+
+    // ★★★ ПРОВЕРЯЕМ, ВСЕ ЛИ ЗАДАНИЯ ВЫПОЛНЕНЫ ★★★
+    const allCompleted = dailyTasksList.every(t => t.completed);
+
+    let html = '';
+    dailyTasksList.forEach((task) => {
+        const isCompleted = task.completed || false;
+        const iconClass = isCompleted ? 'fa-regular fa-square-check' : 'fa-regular fa-square';
+        const iconColor = isCompleted ? 'var(--accent)' : 'var(--light-grey)';
+
+        let displayName = task.name;
+        let displayDesc = task.description;
+
+        // ★★★ ЛОГИКА КЛИКА ★★★
+        let clickHandler = '';
+        let cursorStyle = 'cursor: default;';
+
+        if (!isCompleted) {
+            // Не выполнено → обычная подсказка
+            clickHandler = `onclick="openDailyTaskHelpModal('${task.id}')"`;
+            cursorStyle = 'cursor: pointer;';
+        } else if (allCompleted) {
+            // Всё выполнено → показываем таймер до следующих
+            clickHandler = `onclick="openAllTasksDoneModal()"`;
+            cursorStyle = 'cursor: pointer;';
+        }
+        // Иначе (выполнено, но не всё) — не кликабельно
+
+        if (task.type === 'exercise') {
+            displayName = task.name;
+            displayDesc = `Выполнить ${task.target} ${task.unit}`;
+        } else if (task.type === 'smart_exercise') {
+            const template = DAILY_TASKS_CONFIG.smartStats.items[0];
+            if (template) {
+                displayName = template.name.replace('{category}', task.category);
+                displayDesc = template.description
+                    .replace('{count}', task.target)
+                    .replace('{category}', task.category);
+            }
+        } else if (task.type === 'smart_workout') {
+            const template = DAILY_TASKS_CONFIG.smartStats.items[1];
+            if (template) {
+                displayName = template.name.replace('{category}', task.category);
+                displayDesc = template.description.replace('{category}', task.category);
+            }
+        } else if (task.type === 'friends') {
+            const configItem = DAILY_TASKS_CONFIG.friends.items.find(item => item.id === task.id);
+            if (configItem) {
+                displayName = configItem.name;
+                displayDesc = configItem.description;
+            }
+        } else if (task.type === 'stats_exercise') {
+            const configItem = DAILY_TASKS_CONFIG.stats.exercises.items.find(item => item.id === task.id);
+            if (configItem) {
+                displayName = configItem.name;
+                displayDesc = `Выполнить ${task.target} упражнений`;
+            }
+        } else if (task.type === 'stats_time') {
+            const configItem = DAILY_TASKS_CONFIG.stats.time.items.find(item => item.id === task.id);
+            if (configItem) {
+                displayName = configItem.name;
+                displayDesc = `Тренироваться ${task.target} минут`;
+            }
+        }
+
+        html += `
+            <div class="settings-item" style="${cursorStyle}" ${clickHandler} data-task-id="${task.id}">
+                <div class="settings-icon"><i class="${task.icon || 'fa-solid fa-tasks'}"></i></div>
+                <div class="settings-info">
+                    <div class="settings-title">${displayName}</div>
+                    <div class="settings-desc">${displayDesc}</div>
+                </div>
+                <div class="settings-action task-checkbox" style="pointer-events: none; cursor: default;">
+                    <i class="${iconClass}" id="dailyTaskStatus_${task.id}" style="color: ${iconColor};"></i>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+
+    if (typeof refreshAutoCarousel === 'function') {
+        refreshAutoCarousel();
+    }
+}
+
+// =================== ВСЕ ЕЖЕДНЕВНЫЕ ЗАДАНИЯ ВЫПОЛНЕНЫ ===================
+let _allTasksDoneTimer = null;
+
+function openAllTasksDoneModal() {
+    // Удаляем старую, если есть
+    const old = document.getElementById('allTasksDoneModal');
+    if (old) old.remove();
+    if (_allTasksDoneTimer) {
+        clearInterval(_allTasksDoneTimer);
+        _allTasksDoneTimer = null;
+    }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'allTasksDoneModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-title">Все задания выполнены!</div>
+
+            <div style="text-align:center; font-size: 3.5rem; color: var(--accent); margin: 0.3rem 0 0.5rem 0;">
+                <i class="fa-solid fa-trophy"></i>
+            </div>
+
+            <p class="modal-text" style="margin-bottom: 0.3rem;">
+                Отличная работа! Вы выполнили все задания на сегодня.
+            </p>
+            <p class="modal-text" style="margin-bottom: 0.8rem;">
+                Следующие задания появятся через
+            </p>
+
+            <div id="allTasksDoneTimer" style="
+                font-size: 2rem;
+                font-weight: 700;
+                color: var(--accent);
+                font-variant-numeric: tabular-nums;
+                letter-spacing: 0.05em;
+                margin-bottom: 1rem;
+            ">00:00:00</div>
+
+            <button class="btn btn-primary" id="allTasksDoneCloseBtn">Понятно</button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    document.getElementById('allTasksDoneCloseBtn').addEventListener('click', function() {
+        if (_allTasksDoneTimer) {
+            clearInterval(_allTasksDoneTimer);
+            _allTasksDoneTimer = null;
+        }
+        closeModal('allTasksDoneModal');
+    });
+
+    // Первый рендер + обновление каждую секунду
+    updateAllTasksDoneTimer();
+    _allTasksDoneTimer = setInterval(updateAllTasksDoneTimer, 1000);
+}
+
+function updateAllTasksDoneTimer() {
+    const el = document.getElementById('allTasksDoneTimer');
+    if (!el) {
+        if (_allTasksDoneTimer) {
+            clearInterval(_allTasksDoneTimer);
+            _allTasksDoneTimer = null;
+        }
+        return;
+    }
+
+    const now = new Date();
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const diff = tomorrow - now;
+
+    const hours = String(Math.floor(diff / (1000 * 60 * 60))).padStart(2, '0');
+    const minutes = String(Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60))).padStart(2, '0');
+    const seconds = String(Math.floor((diff % (1000 * 60)) / 1000)).padStart(2, '0');
+
+    el.textContent = `${hours}:${minutes}:${seconds}`;
+}
+
+window.openAllTasksDoneModal = openAllTasksDoneModal;
+
+// Начисление XP за ежедневное задание
+async function addDailyTaskXp() {
+    console.log('🔥🔥🔥 addDailyTaskXp ВЫЗВАНА!');
+    
+    const user = await getFirebaseUser();
+    if (!user) {
+        console.warn('⚠️ Пользователь не найден');
+        return;
+    }
+    console.log('👤 Пользователь:', user.uid);
+    
+    try {
+        const profileResult = await getUserProfile(user.uid);
+        console.log('📊 Профиль получен:', profileResult);
+        
+        if (profileResult.success) {
+            const currentXp = profileResult.data.totalXp || 0;
+            const newXp = currentXp + 10;
+            console.log(`📊 Текущий XP: ${currentXp}, Новый XP: ${newXp}`);
+            
+            await updateUserProfile(user.uid, { totalXp: newXp });
+            if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel(); // ★
+            console.log('✅ Начислено +10 XP за ежедневное задание');
+            
+            // ★★★ ЖДЁМ 1 СЕКУНДУ, ПОКА FIRESTORE ОБНОВИТСЯ ★★★
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // ★★★ ПОЛУЧАЕМ СВЕЖИЕ ДАННЫЕ ★★★
+            const freshProfile = await firebase.firestore()
+                .collection('users')
+                .doc(user.uid)
+                .get();
+            
+            if (freshProfile.exists) {
+                const data = freshProfile.data();
+                const xp = data.totalXp || 0;
+                console.log(`📊 Фактический XP в Firestore: ${xp}`);
+                
+                const currentLevel = getCurrentLevel(xp);
+                const progress = getXpProgress(xp);
+                const nextLevel = getNextLevel(xp);
+                const xpRounded = Math.round(xp);
+                let progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+                
+                document.getElementById('levelLvl').textContent = currentLevel.id + ' LVL';
+                document.getElementById('levelTitle').textContent = currentLevel.name;
+                document.getElementById('levelProgressText').textContent = progressText;
+                window._lastProfileXp = xpRounded;
+                document.getElementById('levelFill').style.width = progress + '%';
+                
+                console.log(`✅ Профиль принудительно обновлён: ${xpRounded} XP`);
+            }
+        } else {
+            console.error('❌ Не удалось получить профиль');
+        }
+    } catch (error) {
+        console.error('❌ Ошибка начисления XP:', error);
+    }
+}
+
+// ===== ТРИГГЕРЫ ДЛЯ ВЫПОЛНЕНИЯ ЗАДАНИЙ =====
+async function completeDailyTaskIfExists(taskId) {
+    if (!dailyTasksList || dailyTasksList.length === 0) return false;
+    
+    var task = dailyTasksList.find(function(t) { return t.id === taskId; });
+    if (!task || task.completed) return false;
+    
+    task.completed = true;
+    dailyTasksCompleted[task.id] = true;
+    saveDailyTasksToStorage();
+    renderDailyTasks();
+    
+    // ★★★ НАЧИСЛЯЕМ БАЛЛ ЗА МЕСЯЦ (ЕСЛИ ВСЕ 3 ВЫПОЛНЕНЫ) ★★★
+    await addMonthlyPointIfAllDone();
+    
+    await addDailyTaskXp();
+    
+    showToast('✅ Ежедневное задание выполнено!');
+    
+    var allCompleted = dailyTasksList.every(function(t) { return t.completed; });
+    if (allCompleted) {
+        showNotification(
+            '🎉',
+            'Все ежедневные задания выполнены! Отличная работа!',
+            null,
+            true,
+            function() {
+                window.navigateTo('profile');
+                TabManager.profile('my');
+                setTimeout(function() { loadProfile(); }, 300);
+            }
+        );
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ КАРУСЕЛЬ ★★★
+    if (typeof refreshAutoCarousel === 'function') {
+        refreshAutoCarousel();
+    }
+    
+    return true;
+}
+
+function checkDailyTasksAfterWorkout(workoutData) {
+    // ★★★ ЕСЛИ ПЕРВЫЕ ЗАДАНИЯ НЕ ВЫПОЛНЕНЫ — ЕЖЕДНЕВНЫЕ НЕ АКТИВНЫ ★★★
+    if (!checkAllTasksCompleted()) {
+        console.log('⏭️ Первые задания не выполнены, ежедневные не активны');
+        return;
+    }
+    
+    if (!dailyTasksList || dailyTasksList.length === 0) return;
+    
+    // ★★★ СЧИТАЕМ ВЫПОЛНЕННЫЕ УПРАЖНЕНИЯ ★★★
+    const completedExercises = workoutData.exercises?.filter(function(e) { 
+        return e.completed; 
+    }).length || 0;
+    
+    // ★★★ СЧИТАЕМ ДЛИТЕЛЬНОСТЬ В МИНУТАХ ★★★
+    const durationMinutes = Math.floor((workoutData.durationSeconds || 0) / 60);
+    
+    // ★★★ СЧИТАЕМ УПРАЖНЕНИЯ ПО КАТЕГОРИЯМ (для smart_exercise) ★★★
+    const categoryCounts = {};
+    workoutData.exercises?.forEach(function(e) {
+        if (e.completed) {
+            const icon = e.icon || getExerciseIcon(e.name);
+            const category = getCategoryByIcon(icon);
+            if (category && category !== 'Зарядка') {
+                if (!categoryCounts[category]) {
+                    categoryCounts[category] = 0;
+                }
+                categoryCounts[category]++;
+            }
+        }
+    });
+    
+    // ★★★ СЧИТАЕМ ПОВТОРЕНИЯ ПО ФИЗИЧЕСКИМ УПРАЖНЕНИЯМ ★★★
+const exerciseRepsData = {};
+workoutData.exercises?.forEach(function(e) {
+    if (e.completed) {
+        // ★ Ищем подходящую запись в конфиге
+        const configItem = DAILY_TASKS_CONFIG.exercise.items.find(function(item) {
+            return e.name.toLowerCase().includes(item.name.toLowerCase());
+        });
+        
+        if (!configItem) return;   // нет совпадения — пропускаем
+        
+        const sets = parseInt(e.sets) || 0;
+        const repsStr = String(e.reps || '');
+        let repsValue = 0;
+        
+        if (repsStr.includes('сек') || repsStr.includes('с') || repsStr.includes('Секунд')) {
+            repsValue = parseFloat(repsStr.replace(/[^0-9.]/g, '')) || 0;
+        } else {
+            repsValue = parseFloat(repsStr) || 0;
+        }
+        
+        const totalReps = sets * repsValue;
+        
+        // ★★★ СОХРАНЯЕМ ПОД ИМЕНЕМ ИЗ КОНФИГА (а не из тренировки) ★★★
+        if (!exerciseRepsData[configItem.name]) {
+            exerciseRepsData[configItem.name] = 0;
+        }
+        exerciseRepsData[configItem.name] += totalReps;
+    }
+});
+    
+    // ★★★ ОБНОВЛЯЕМ ДНЕВНОЙ ПРОГРЕСС ★★★
+    const dailyProgress = updateDailyProgress(completedExercises, durationMinutes, categoryCounts, exerciseRepsData);
+    
+    console.log('📊 Дневной прогресс: упражнений = ' + dailyProgress.exercises + ', минут = ' + dailyProgress.minutes);
+    console.log('📊 По категориям:', dailyProgress.categories);
+    console.log('📊 По упражнениям:', dailyProgress.exerciseReps);
+    
+    // ★★★ ПРОВЕРЯЕМ ЗАДАНИЯ ★★★
+    dailyTasksList.forEach(function(task) {
+        if (task.completed) return;
+        
+        // ★★★ ФИЗИЧЕСКИЕ УПРАЖНЕНИЯ (СУММАРНО ЗА ДЕНЬ) ★★★
+        if (task.type === 'exercise') {
+            const totalReps = dailyProgress.exerciseReps[task.name] || 0;
+            console.log('📊 ' + task.name + ': totalReps за день = ' + totalReps + ', нужно = ' + task.target);
+            
+            if (totalReps >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Статистика - упражнения (суммарно за день)
+        if (task.type === 'stats_exercise') {
+            if (dailyProgress.exercises >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Статистика - время (суммарно за день)
+        if (task.type === 'stats_time') {
+            if (dailyProgress.minutes >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Умная статистика - упражнения на категорию (суммарно за день)
+        if (task.type === 'smart_exercise') {
+            const categoryProgress = dailyProgress.categories[task.category] || 0;
+            console.log('📊 Прогресс по категории "' + task.category + '": ' + categoryProgress + '/' + task.target);
+            
+            if (categoryProgress >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Умная статистика - тренировка категории (за 1 тренировку)
+        if (task.type === 'smart_workout') {
+            if (workoutData.category?.toLowerCase().includes(task.category?.toLowerCase())) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+    });
+}
+
+function checkDailyTasksAfterCoopWorkout(workoutData) {
+    // ★★★ ЕСЛИ ПЕРВЫЕ ЗАДАНИЯ НЕ ВЫПОЛНЕНЫ — ЕЖЕДНЕВНЫЕ НЕ АКТИВНЫ ★★★
+    if (!checkAllTasksCompleted()) {
+        console.log('⏭️ Первые задания не выполнены, ежедневные не активны');
+        return;
+    }
+    
+    if (!dailyTasksList || dailyTasksList.length === 0) return;
+    
+    // ★★★ СЧИТАЕМ ВЫПОЛНЕННЫЕ УПРАЖНЕНИЯ ★★★
+    const completedExercises = workoutData.exercises?.filter(function(e) { 
+        return e.completed; 
+    }).length || 0;
+    
+    // ★★★ СЧИТАЕМ ДЛИТЕЛЬНОСТЬ В МИНУТАХ ★★★
+    const durationMinutes = Math.floor((workoutData.durationSeconds || 0) / 60);
+    
+    // ★★★ СЧИТАЕМ УПРАЖНЕНИЯ ПО КАТЕГОРИЯМ ★★★
+    const categoryCounts = {};
+    workoutData.exercises?.forEach(function(e) {
+        if (e.completed) {
+            const icon = e.icon || getExerciseIcon(e.name);
+            const category = getCategoryByIcon(icon);
+            if (category && category !== 'Зарядка') {
+                if (!categoryCounts[category]) {
+                    categoryCounts[category] = 0;
+                }
+                categoryCounts[category]++;
+            }
+        }
+    });
+    
+    // ★★★ СЧИТАЕМ ПОВТОРЕНИЯ ПО ФИЗИЧЕСКИМ УПРАЖНЕНИЯМ ★★★
+const exerciseRepsData = {};
+workoutData.exercises?.forEach(function(e) {
+    if (e.completed) {
+        // ★ Ищем подходящую запись в конфиге
+        const configItem = DAILY_TASKS_CONFIG.exercise.items.find(function(item) {
+            return e.name.toLowerCase().includes(item.name.toLowerCase());
+        });
+        
+        if (!configItem) return;   // нет совпадения — пропускаем
+        
+        const sets = parseInt(e.sets) || 0;
+        const repsStr = String(e.reps || '');
+        let repsValue = 0;
+        
+        if (repsStr.includes('сек') || repsStr.includes('с') || repsStr.includes('Секунд')) {
+            repsValue = parseFloat(repsStr.replace(/[^0-9.]/g, '')) || 0;
+        } else {
+            repsValue = parseFloat(repsStr) || 0;
+        }
+        
+        const totalReps = sets * repsValue;
+        
+        // ★★★ СОХРАНЯЕМ ПОД ИМЕНЕМ ИЗ КОНФИГА (а не из тренировки) ★★★
+        if (!exerciseRepsData[configItem.name]) {
+            exerciseRepsData[configItem.name] = 0;
+        }
+        exerciseRepsData[configItem.name] += totalReps;
+    }
+});
+    
+    // ★★★ ОБНОВЛЯЕМ ДНЕВНОЙ ПРОГРЕСС ★★★
+    const dailyProgress = updateDailyProgress(completedExercises, durationMinutes, categoryCounts, exerciseRepsData);
+    
+    console.log('📊 Дневной прогресс (совместная): упражнений = ' + dailyProgress.exercises + ', минут = ' + dailyProgress.minutes);
+    console.log('📊 По категориям:', dailyProgress.categories);
+    console.log('📊 По упражнениям:', dailyProgress.exerciseReps);
+    
+    // ★★★ ПРОВЕРЯЕМ ЗАДАНИЯ ★★★
+    dailyTasksList.forEach(function(task) {
+        if (task.completed) return;
+        
+        // friends_1 — совместная тренировка
+        if (task.id === 'friends_1' || task.name.includes('Совместная тренировка')) {
+            completeDailyTaskIfExists(task.id);
+        }
+        
+        // ★★★ ФИЗИЧЕСКИЕ УПРАЖНЕНИЯ (СУММАРНО ЗА ДЕНЬ) ★★★
+        if (task.type === 'exercise') {
+            const totalReps = dailyProgress.exerciseReps[task.name] || 0;
+            console.log('📊 ' + task.name + ': totalReps за день = ' + totalReps + ', нужно = ' + task.target);
+            
+            if (totalReps >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Статистика - упражнения (суммарно за день)
+        if (task.type === 'stats_exercise') {
+            if (dailyProgress.exercises >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Статистика - время (суммарно за день)
+        if (task.type === 'stats_time') {
+            if (dailyProgress.minutes >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Умная статистика - упражнения на категорию (суммарно за день)
+        if (task.type === 'smart_exercise') {
+            const categoryProgress = dailyProgress.categories[task.category] || 0;
+            console.log('📊 Прогресс по категории "' + task.category + '": ' + categoryProgress + '/' + task.target);
+            
+            if (categoryProgress >= task.target) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+        
+        // Умная статистика - тренировка категории (за 1 тренировку)
+        if (task.type === 'smart_workout') {
+            if (workoutData.category?.toLowerCase().includes(task.category?.toLowerCase())) {
+                completeDailyTaskIfExists(task.id);
+            }
+        }
+    });
+}
+
+// Триггер: открытие профиля друга
+function checkDailyTasksAfterFriendProfile(friendId) {
+    // ★★★ ЕСЛИ ПЕРВЫЕ ЗАДАНИЯ НЕ ВЫПОЛНЕНЫ — ЕЖЕДНЕВНЫЕ НЕ АКТИВНЫ ★★★
+    if (!checkAllTasksCompleted()) {
+        console.log('⏭️ Первые задания не выполнены, ежедневные не активны');
+        return;
+    }
+    
+    if (!dailyTasksList || dailyTasksList.length === 0) return;
+    
+    dailyTasksList.forEach(function(task) {
+        if (task.completed) return;
+        
+        if (task.id === 'friends_2' || task.name.includes('Профиль друга')) {
+            completeDailyTaskIfExists(task.id);
+        }
+    });
+}
+
+// Триггер: добавление друга
+function checkDailyTasksAfterAddFriend() {
+    // ★★★ ЕСЛИ ПЕРВЫЕ ЗАДАНИЯ НЕ ВЫПОЛНЕНЫ — ЕЖЕДНЕВНЫЕ НЕ АКТИВНЫ ★★★
+    if (!checkAllTasksCompleted()) {
+        console.log('⏭️ Первые задания не выполнены, ежедневные не активны');
+        return;
+    }
+    
+    if (!dailyTasksList || dailyTasksList.length === 0) return;
+    
+    dailyTasksList.forEach(function(task) {
+        if (task.completed) return;
+        
+        if (task.id === 'friends_3' || task.name.includes('Новый друг')) {
+            completeDailyTaskIfExists(task.id);
+        }
+    });
+}
+
+// ★★★ ВЫБОР СВОБОДНОГО ЦВЕТА ★★★
+function applyCustomColor() {
+    const colorPicker = document.getElementById('customColorPicker');
+    const color = colorPicker.value;
+    
+    // Сохраняем как custom цвет
+    localStorage.setItem('themeColor', color);
+    localStorage.setItem('themeColorCustom', 'true');
+    
+    // Применяем
+    applyColorToTheme(color);
+    closeModal('colorModal');
+    showToast(`✅ Цвет изменён на ${color}`);
+}
+
+function applyColorToTheme(color) {
+    // ★★★ УБИРАЕМ ВСЕ КЛАССЫ ТЕМ ★★★
+    document.body.className = '';
+    
+    // ★★★ ДОБАВЛЯЕМ КАСТОМНЫЙ ЦВЕТ КАК CSS ПЕРЕМЕННУЮ ★★★
+    document.body.style.setProperty('--accent', color);
+    document.body.style.setProperty('--accent-dark', darkenColor(color, 30));
+    document.body.style.setProperty('--accent-light', lightenColor(color, 85));
+    
+    if (isDarkMode) {
+        document.body.classList.add('theme-dark-mode');
+    }
+}
+
+// ★★★ УТЕМНЕНИЕ ЦВЕТА ★★★
+function darkenColor(hex, percent) {
+    if (typeof hex !== 'string' || !hex.startsWith('#')) return hex;
+    const num = parseInt(hex.replace('#', ''), 16);
+    if (isNaN(num)) return hex;
+    const amt = Math.round(2.55 * percent);
+    const R = Math.max((num >> 16) - amt, 0);
+    const G = Math.max((num >> 8 & 0x00FF) - amt, 0);
+    const B = Math.max((num & 0x0000FF) - amt, 0);
+    return `#${(1 << 24 | R << 16 | G << 8 | B).toString(16).slice(1)}`;
+}
+
+// ★★★ ОСВЕТЛЕНИЕ ЦВЕТА ★★★
+function lightenColor(hex, percent) {
+    const num = parseInt(hex.replace('#', ''), 16);
+    const amt = Math.round(2.55 * percent);
+    const R = Math.min((num >> 16) + amt, 255);
+    const G = Math.min((num >> 8 & 0x00FF) + amt, 255);
+    const B = Math.min((num & 0x0000FF) + amt, 255);
+    return `#${(1 << 24 | R << 16 | G << 8 | B).toString(16).slice(1)}`;
+}
+
+// ★★★ ОТКРЫТЬ ПАЛИТРУ ★★★
+function openPaletteModal() {
+    const currentColor = localStorage.getItem('themeColor') || '#DC143C';
+    const picker = document.getElementById('customColorPicker');
+    if (picker) {
+        picker.value = currentColor;
+    }
+    openModal('paletteModal');
+}
+
+// ★★★ ПРИМЕНИТЬ ЦВЕТ ИЗ ПАЛИТРЫ ★★★
+function applyPaletteColor() {
+    const colorPicker = document.getElementById('customColorPicker');
+    const color = colorPicker.value;
+    
+    // ★★★ ПРОВЕРЯЕМ, ИЗМЕНИЛСЯ ЛИ ЦВЕТ ★★★
+    const currentColor = localStorage.getItem('themeColor') || '#DC143C';
+    const colorChanged = color !== currentColor;
+    
+    if (colorChanged) {
+        // ★★★ СОХРАНЯЕМ КАК КАСТОМНЫЙ ЦВЕТ ★★★
+        localStorage.setItem('themeColor', color);
+        syncSaveToFirestore('settings', {
+    themeMode: localStorage.getItem('appThemeMode') || 'system',
+    themeColor: color,
+    themeColorCustom: true // или false
+});
+        localStorage.setItem('themeColorCustom', 'true');
+        
+        // ★★★ ПРИМЕНЯЕМ ★★★
+        applyColorToTheme(color);
+        
+        // ★★★ ПОКАЗЫВАЕМ ТОСТ ★★★
+        showToast(`✅ Цвет изменён`);
+        
+        // ★★★ ЗАДАНИЕ 5: ОФОРМЛЕНИЕ ★★★
+        if (!tasks[5]) {
+            tasks[5] = true;
+            saveTasks();
+            updateTasksUI();
+            showToast('✅ Задание "Оформление" выполнено!');
+            addTaskXp();
+        }
+    } else {
+        showToast('ℹ️ Цвет не изменён');
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ СТАТУС ★★★
+    updateColorStatus(color);
+    
+    // ★★★ ОБНОВЛЯЕМ АКТИВНЫЕ КНОПКИ ★★★
+    document.querySelectorAll('.color-btn').forEach(btn => {
+        btn.classList.toggle('color-btn-active', btn.dataset.color === color);
+    });
+    
+    closeModal('paletteModal');
+}
+
+function openPaletteWithPremiumCheck() {
+    closeModal('colorModal');
+    if (hasPremium()) {
+        openPaletteModal();
+    } else {
+        openModal('premiumModal');
+    }
+}
+
+// =================== ПРЕМИУМ СТАТИСТИКА: НАГРУЗОЧНЫЙ ИНДЕКС ПО НЕДЕЛЯМ ===================
+
+let weeklyLoadStartDate = new Date();
+weeklyLoadStartDate.setDate(1);
+weeklyLoadStartDate.setMonth(weeklyLoadStartDate.getMonth() - 1);
+
+function calculateTrainingLoad(workout) {
+    let totalLoad = 0;
+    if (workout.exercises) {
+        workout.exercises.forEach(ex => {
+            const sets = parseInt(ex.sets) || 0;
+            const repsStr = String(ex.reps || '');
+            if (repsStr.includes('сек') || repsStr.includes('с')) {
+                const secs = parseFloat(repsStr.replace(/[^0-9.]/g, '')) || 0;
+                totalLoad += sets * (secs / 10);
+            } else {
+                const reps = parseFloat(repsStr) || 0;
+                totalLoad += sets * reps;
+            }
+        });
+    }
+    const durationBonus = (workout.durationSeconds || 0) / 60;
+    totalLoad += durationBonus * 0.5;
+    return Math.round(totalLoad);
+}
+
+function getWeeksInRange(startDate, endDate) {
+    const weeks = [];
+    
+    // Находим первый понедельник, который >= startDate
+    let current = new Date(startDate);
+    const day = current.getDay();
+    const diff = (day === 0) ? 6 : day - 1;
+    current.setDate(current.getDate() - diff);
+    
+    while (current < startDate) {
+        current.setDate(current.getDate() + 7);
+    }
+    
+    if (current > startDate) {
+        current.setDate(current.getDate() - 7);
+    }
+    
+    while (current <= endDate) {
+        const weekEnd = new Date(current);
+        weekEnd.setDate(weekEnd.getDate() + 6);
+        
+        const weekStart = new Date(current);
+        const weekFinish = new Date(weekEnd);
+        
+        const hasOverlap = weekStart <= endDate && weekFinish >= startDate;
+        
+        if (hasOverlap) {
+            weeks.push({
+                start: new Date(weekStart),
+                end: new Date(weekFinish),
+                key: weekStart.toISOString().split('T')[0]
+            });
+        }
+        
+        current.setDate(current.getDate() + 7);
+    }
+    
+    return weeks;
+}
+
+function formatWeekDate(date) {
+    const d = String(date.getDate()).padStart(2, '0');
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    return `${d}.${m}`;
+}
+
+function renderWeeklyLoadChart(weeklyData, weeks) {
+    const container = document.getElementById('weeklyLoadChart');
+    if (!container) return;
+
+    const values = Object.values(weeklyData).filter(v => v > 0);
+    const maxLoad = Math.max(0, ...values);
+    const chartHeight = 180;
+
+    let html = `<div style="position:relative; padding:0.5rem;  background-image: 
+        linear-gradient(rgba(100, 100, 100, 0.1) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(100, 100, 100, 0.1) 1px, transparent 1px);
+        background-size: 20px 20px; border-radius:12px; min-height:${chartHeight + 40}px;">`;
+
+    html += `<div style="display:flex; align-items:flex-end; gap:0.5rem; height:${chartHeight}px; padding-top:0.5rem;">`;
+
+    weeks.forEach((week) => {
+        const load = weeklyData[week.key] || 0;
+        const percent = maxLoad > 0 ? (load / maxLoad) * 100 : 0;
+        const barHeight = Math.max(4, (percent / 100) * (chartHeight - 20));
+        const label = `${formatWeekDate(week.start)}-${formatWeekDate(week.end)}`;
+        const percentDisplay = Math.round((load / maxLoad) * 100);
+        const showInside = barHeight > 30;
+
+html += `
+    <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:0.2rem; height:100%; justify-content:flex-end;">
+        <span style="font-size:0.7rem; font-weight:700; color:var(--accent);">${load > 0 ? load : ''}</span>
+        <div style="width:100%; height:${barHeight}px; background:var(--accent); border-radius:6px 6px 0 0; min-height:4px; display:flex; align-items:flex-start; justify-content:center; padding-top:4px;">
+            ${load > 0 && showInside ? `<span style="font-size:0.6rem; font-weight:700; color:var(--white);">${percentDisplay}%</span>` : ''}
+        </div>
+        <span style="font-size:0.55rem; color:var(--slate); text-align:center; line-height:1.2;">${label}</span>
+    </div>
+`;
+    });
+
+    html += `</div>`;
+
+    const avg = values.length > 0 ? Math.round(values.reduce((a,b) => a+b, 0) / values.length) : 0;
+    const total = values.reduce((a,b) => a+b, 0);
+    const minValue = values.length > 0 ? Math.min(...values) : 0;
+
+html += `
+    <div class="weekly-load-info">
+        <span>Всего: ${total} ед.</span>
+        <span>Средний: ${avg} ед.</span>
+        <span>Макс: ${maxLoad} ед.</span>
+        <span>Минимум: ${minValue} ед.</span>
+    </div>
+`;
+
+    html += `</div>`;
+    container.innerHTML = html;
+}
+
+async function loadPremiumStats() {
+    // ★★★ УБИРАЕМ ПРОВЕРКУ PREMIUM ★★★
+    const user = await getFirebaseUser();
+    if (!user) return;
+
+    const result = await getUserWorkoutsFromFirestore(user.uid);
+    if (!result.success) return;
+
+    const workouts = result.data.filter(w => {
+        const icon = getWorkoutIcon(w);
+        return icon && icon !== 'charging';
+    });
+
+    const workoutLoads = {};
+    workouts.forEach(w => {
+        const date = new Date(w.date);
+        const day = date.getDay();
+        const diff = date.getDate() - day + (day === 0 ? -6 : 1);
+        const monday = new Date(date);
+        monday.setDate(diff);
+        const weekKey = monday.toISOString().split('T')[0];
+        const load = calculateTrainingLoad(w);
+        if (workoutLoads[weekKey]) {
+            workoutLoads[weekKey] += load;
+        } else {
+            workoutLoads[weekKey] = load;
+        }
+    });
+
+    const now = new Date();
+    const offset = window._monthOffset || 0;
+    now.setMonth(now.getMonth() + offset);
+    
+    const monthStart = new Date(now);
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    
+    const monthEnd = new Date(now);
+    monthEnd.setDate(1);
+    monthEnd.setMonth(monthEnd.getMonth() + 1);
+    monthEnd.setDate(monthEnd.getDate() - 1);
+    monthEnd.setHours(23, 59, 59, 999);
+    
+    const startDate = new Date(now);
+    startDate.setDate(1);
+    startDate.setDate(startDate.getDate() - 7);
+    
+    const endDate = new Date(now);
+    endDate.setDate(1);
+    endDate.setMonth(endDate.getMonth() + 1);
+    endDate.setDate(endDate.getDate() - 1);
+    endDate.setDate(endDate.getDate() + 7);
+
+    const weeks = getWeeksInRange(startDate, endDate);
+
+    const filteredWeeks = weeks.filter(week => {
+        const weekStart = week.start;
+        const weekEnd = week.end;
+        return weekStart <= monthEnd && weekEnd >= monthStart;
+    });
+
+    const filteredLoads = {};
+    filteredWeeks.forEach(week => {
+        if (workoutLoads[week.key]) {
+            filteredLoads[week.key] = workoutLoads[week.key];
+        } else {
+            filteredLoads[week.key] = 0;
+        }
+    });
+
+    renderWeeklyLoadChart(filteredLoads, filteredWeeks);
+
+const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+const titleEl = document.getElementById('weeklyLoadTitle');
+if (titleEl) {
+    titleEl.textContent = monthNames[now.getMonth()] + ' ' + now.getFullYear();
+}
+
+    const block = document.getElementById('weekly-load-block');
+    if (block) block.style.display = 'block';
+}
+
+function changeWeeklyLoadMonth(delta) {
+    if (typeof window._monthOffset === 'undefined') {
+        window._monthOffset = 0;
+    }
+    window._monthOffset += delta;
+
+    const user = firebase.auth().currentUser;
+    if (!user) return;
+
+    getUserWorkoutsFromFirestore(user.uid).then(result => {
+        if (!result.success) return;
+        const workouts = result.data.filter(w => {
+        const icon = getWorkoutIcon(w);
+        return icon && icon !== 'charging';
+    });
+
+        const workoutLoads = {};
+        workouts.forEach(w => {
+            const date = new Date(w.date);
+            const day = date.getDay();
+            const diff = date.getDate() - day + (day === 0 ? -6 : 1);
+            const monday = new Date(date);
+            monday.setDate(diff);
+            const weekKey = monday.toISOString().split('T')[0];
+            const load = calculateTrainingLoad(w);
+            if (workoutLoads[weekKey]) {
+                workoutLoads[weekKey] += load;
+            } else {
+                workoutLoads[weekKey] = load;
+            }
+        });
+
+        const now = new Date();
+        now.setMonth(now.getMonth() + window._monthOffset);
+        
+        // ★★★ ТОЧНЫЕ ГРАНИЦЫ МЕСЯЦА ★★★
+        const monthStart = new Date(now);
+        monthStart.setDate(1);
+        monthStart.setHours(0, 0, 0, 0);
+        
+        const monthEnd = new Date(now);
+        monthEnd.setDate(1);
+        monthEnd.setMonth(monthEnd.getMonth() + 1);
+        monthEnd.setDate(monthEnd.getDate() - 1);
+        monthEnd.setHours(23, 59, 59, 999);
+        
+        // ★★★ РАСШИРЕННЫЙ ДИАПАЗОН ★★★
+        const startDate = new Date(now);
+        startDate.setDate(1);
+        startDate.setDate(startDate.getDate() - 7);
+        
+        const endDate = new Date(now);
+        endDate.setDate(1);
+        endDate.setMonth(endDate.getMonth() + 1);
+        endDate.setDate(endDate.getDate() - 1);
+        endDate.setDate(endDate.getDate() + 7);
+
+        const weeks = getWeeksInRange(startDate, endDate);
+
+        // ★★★ ФИЛЬТРУЕМ НЕДЕЛИ: ОСТАВЛЯЕМ ТОЛЬКО ТЕ, КОТОРЫЕ ПЕРЕСЕКАЮТСЯ С МЕСЯЦЕМ ★★★
+        const filteredWeeks = weeks.filter(week => {
+            const weekStart = week.start;
+            const weekEnd = week.end;
+            return weekStart <= monthEnd && weekEnd >= monthStart;
+        });
+
+        const filteredLoads = {};
+        filteredWeeks.forEach(week => {
+            if (workoutLoads[week.key]) {
+                filteredLoads[week.key] = workoutLoads[week.key];
+            } else {
+                filteredLoads[week.key] = 0;
+            }
+        });
+
+        renderWeeklyLoadChart(filteredLoads, filteredWeeks);
+
+const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+const titleEl = document.getElementById('weeklyLoadTitle');
+if (titleEl) {
+    titleEl.textContent = monthNames[now.getMonth()] + ' ' + now.getFullYear();
+}
+    });
+}
+
+// ★★★ СОХРАНЕНИЕ ВЕСА В ИСХОДНЫЕ ДАННЫЕ ★★★
+function saveExerciseWeightToSource(index, newWeight) {
+    const workoutTitle = sessionWorkoutTitle || '';
+    const cleanTitle = workoutTitle.replace(' (совместно)', '');
+    
+    let saved = false;
+    
+    // 1. Проверяем личные тренировки
+    const allWorkouts = getMyWorkouts();
+    for (const workout of allWorkouts) {
+        if (workout.title === cleanTitle) {
+            if (workout.exercises && workout.exercises[index]) {
+                workout.exercises[index].weight = newWeight;
+                saveMyWorkouts(allWorkouts);
+                saved = true;
+                break;
+            }
+        }
+    }
+    
+    // 2. Если не нашли в личных — ищем в готовых
+    if (!saved) {
+        for (const parent in exercisesData) {
+            if (typeof exercisesData[parent] === 'object') {
+                for (const category in exercisesData[parent]) {
+                    if (typeof exercisesData[parent][category] === 'object') {
+                        for (const level in exercisesData[parent][category]) {
+                            if (level === '_premium') continue;
+                            const levelData = exercisesData[parent][category][level];
+                            let exercisesArray = null;
+                            let titleFromData = '';
+                            
+                            if (Array.isArray(levelData)) {
+                                exercisesArray = levelData;
+                                titleFromData = category + ' ' + level;
+                            } else if (levelData && typeof levelData === 'object' && levelData._exercises) {
+                                exercisesArray = levelData._exercises;
+                                titleFromData = levelData._title || category + ' ' + level;
+                            }
+                            
+                            if (exercisesArray && exercisesArray[index]) {
+                                if (titleFromData === cleanTitle || category === cleanTitle) {
+                                    exercisesArray[index].weight = newWeight;
+                                    saveExercisesData();
+                                    saved = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (saved) break;
+                    }
+                    if (saved) break;
+                }
+                if (saved) break;
+            }
+        }
+    }
+}
+
+// =================== УНИВЕРСАЛЬНАЯ МОДАЛКА УПРАЖНЕНИЯ ===================
+
+// Состояние модалки
+let universalModalState = {
+    mode: 'create', // 'create' | 'edit'
+    source: 'edit', // 'edit' | 'session'
+    index: null,
+    exercises: null,
+    callback: null
+};
+
+function openUniversalExerciseModal(mode = 'create', source = 'edit', index = null, exercises = null, callback = null) {
+    const modal = document.getElementById('exerciseUniversalModal');
+    if (!modal) return;
+    
+    // Сохраняем состояние
+    universalModalState.mode = mode;
+    universalModalState.source = source;
+    universalModalState.index = index;
+    universalModalState.exercises = exercises;
+    universalModalState.callback = callback;
+    
+    // ★★★ ПОКАЗЫВАЕМ/СКРЫВАЕМ БЛОК ВЫБОРА ЗНАЧКА ★★★
+    const iconPickerBlock = document.getElementById('universalIconPickerBlock');
+    if (iconPickerBlock) {
+        iconPickerBlock.style.display = (source === 'session') ? 'none' : 'block';
+    }
+    
+    // ★★★ ВСЕГДА ПОКАЗЫВАЕМ ВЕС ★★★
+    const weightGroup = document.getElementById('universalWeightGroup');
+    if (weightGroup) {
+        weightGroup.style.display = 'block';
+    }
+    
+    // Устанавливаем заголовок
+    const title = document.getElementById('exerciseUniversalTitle');
+    if (title) {
+        title.textContent = mode === 'create' ? 'СОЗДАТЬ УПРАЖНЕНИЕ' : 'РЕДАКТИРОВАТЬ УПРАЖНЕНИЕ';
+    }
+    
+    // Очищаем ошибки
+    document.querySelectorAll('#exerciseUniversalModal input').forEach(inp => inp.classList.remove('error'));
+    
+    // Если редактируем — заполняем поля
+    if (mode === 'edit' && index !== null && exercises && exercises[index]) {
+        const ex = exercises[index];
+        document.getElementById('exerciseUniversalName').value = ex.name || '';
+        document.getElementById('exerciseUniversalSets').value = ex.sets || 3;
+        
+        const repsStr = String(ex.reps || '');
+        const isSeconds = isTimeBased(repsStr);
+        let repsValue = parseInt(repsStr.replace(/[^0-9.]/g, '')) || 12;
+        if (isNaN(repsValue) || repsValue < 1) repsValue = 12;
+        if (repsValue > 60) repsValue = 60;
+        document.getElementById('exerciseUniversalReps').value = repsValue;
+        
+        // ★★★ УСТАНАВЛИВАЕМ ВЕС ★★★
+        const weightDisplay = document.getElementById('exerciseUniversalWeightDisplay');
+        if (weightDisplay) {
+            weightDisplay.textContent = (ex.weight || 0) + ' кг';
+        }
+        
+        // ★★★ ВОССТАНАВЛИВАЕМ ЗНАЧОК (ЕСЛИ ЕСТЬ) ★★★
+        if (source !== 'session' && ex.icon) {
+            document.querySelectorAll('#universalIconPicker .icon-option').forEach(el => {
+                el.classList.toggle('icon-option-active', el.dataset.icon === ex.icon);
+            });
+        }
+        
+        // Устанавливаем тип
+        setExerciseTypeUniversal(isSeconds ? 'seconds' : 'reps');
+    } else {
+        // Создание — сбрасываем поля
+        document.getElementById('exerciseUniversalName').value = '';
+        document.getElementById('exerciseUniversalSets').value = 3;
+        document.getElementById('exerciseUniversalReps').value = 12;
+        document.getElementById('exerciseUniversalWeightDisplay').textContent = '0 кг';
+        setExerciseTypeUniversal('reps');
+        
+        // ★★★ ВЫБИРАЕМ ЗНАЧОК ПО УМОЛЧАНИЮ ★★★
+        if (source !== 'session') {
+            const defaultIcon = 'bodybuilding';
+            document.querySelectorAll('#universalIconPicker .icon-option').forEach(el => {
+                el.classList.toggle('icon-option-active', el.dataset.icon === defaultIcon);
+            });
+        }
+    }
+    
+    // Показываем модалку
+    openModal('exerciseUniversalModal');
+}
+window.openUniversalExerciseModal = openUniversalExerciseModal;
+
+// Закрыть универсальную модалку
+function closeUniversalExerciseModal() {
+    closeModal('exerciseUniversalModal');
+    universalModalState = { mode: 'create', source: 'edit', index: null, exercises: null, callback: null };
+}
+window.closeUniversalExerciseModal = closeUniversalExerciseModal;
+
+// ★★★ КОРРЕКТИРОВКА ВЕСА ★★★
+function adjustUniversalWeight(delta) {
+    const display = document.getElementById('exerciseUniversalWeightDisplay');
+    let val = parseFloat(display.textContent.replace(' кг', '')) || 0;
+    val = val + delta;
+    if (val < 0) val = 0;
+    if (val > 100) val = 100;
+    display.textContent = val + ' кг';
+}
+
+// Переключить тип (повторения / секунды)
+function toggleExerciseTypeUniversal(type) {
+    const label = document.getElementById('exerciseUniversalRepsLabel');
+    if (label) {
+        label.textContent = type === 'seconds' ? 'Секунды' : 'Повторения';
+    }
+    
+    // Обновляем активную кнопку
+    document.querySelectorAll('#exerciseUniversalModal .toggle-btn').forEach(btn => {
+        btn.classList.toggle('toggle-btn-active', btn.dataset.type === type);
+        if (btn.dataset.type === type) {
+            btn.style.background = 'var(--white)';
+            btn.style.color = 'var(--slate)';
+        } else {
+            btn.style.background = 'transparent';
+            btn.style.color = 'var(--slate)';
+        }
+    });
+}
+
+// Установить тип без обновления UI кнопок (для загрузки данных)
+function setExerciseTypeUniversal(type) {
+    const label = document.getElementById('exerciseUniversalRepsLabel');
+    if (label) {
+        label.textContent = type === 'seconds' ? 'Секунды' : 'Повторения';
+    }
+    
+    document.querySelectorAll('#exerciseUniversalModal .toggle-btn').forEach(btn => {
+        const isActive = btn.dataset.type === type;
+        btn.classList.toggle('toggle-btn-active', isActive);
+        if (isActive) {
+            btn.style.background = 'var(--white)';
+            btn.style.color = 'var(--slate)';
+        } else {
+            btn.style.background = 'transparent';
+            btn.style.color = 'var(--slate)';
+        }
+    });
+}
+
+// ★★★ ВЫБОР ЗНАЧКА ★★★
+document.querySelectorAll('#universalIconPicker .icon-option').forEach(el => {
+    el.addEventListener('click', function() {
+        document.querySelectorAll('#universalIconPicker .icon-option').forEach(e => e.classList.remove('icon-option-active'));
+        this.classList.add('icon-option-active');
+    });
+});
+
+// Сохранить упражнение из универсальной модалки
+document.getElementById('exerciseUniversalSaveBtn')?.addEventListener('click', function() {
+    const name = document.getElementById('exerciseUniversalName').value.trim();
+    const sets = document.getElementById('exerciseUniversalSets').value.trim();
+    const reps = document.getElementById('exerciseUniversalReps').value.trim();
+    const weightDisplay = document.getElementById('exerciseUniversalWeightDisplay');
+    let weight = parseFloat(weightDisplay.textContent.replace(' кг', '')) || 0;
+    
+    const nameInput = document.getElementById('exerciseUniversalName');
+    const setsInput = document.getElementById('exerciseUniversalSets');
+    const repsInput = document.getElementById('exerciseUniversalReps');
+    
+    [nameInput, setsInput, repsInput].forEach(inp => inp.classList.remove('error'));
+    
+    let hasError = false;
+    let errorMessage = '';
+    
+    if (!name) {
+        nameInput.classList.add('error');
+        hasError = true;
+        errorMessage = 'Введите название упражнения';
+    }
+    if (!sets || parseInt(sets) < 1 || parseInt(sets) > 5) {
+        setsInput.classList.add('error');
+        hasError = true;
+        if (!errorMessage) errorMessage = 'Подходы должны быть от 1 до 5';
+    }
+    if (!reps || parseInt(reps) < 1 || parseInt(reps) > 60) {
+        repsInput.classList.add('error');
+        hasError = true;
+        if (!errorMessage) errorMessage = 'Повторения должны быть от 1 до 60';
+    }
+    
+    if (hasError) {
+        showToast('⚠️ ' + errorMessage);
+        return;
+    }
+    
+    // Определяем тип
+    const activeBtn = document.querySelector('#exerciseUniversalModal .toggle-btn-active');
+    const isSeconds = activeBtn ? activeBtn.dataset.type === 'seconds' : false;
+    const repsDisplay = isSeconds ? `${reps} секунд` : `${reps}`;
+    
+    // ★★★ ПОЛУЧАЕМ ВЫБРАННЫЙ ЗНАЧОК (ЕСЛИ БЛОК ВИДЕН) ★★★
+    let icon = null;
+    const iconPickerBlock = document.getElementById('universalIconPickerBlock');
+    if (iconPickerBlock && iconPickerBlock.style.display !== 'none') {
+        const selectedIcon = document.querySelector('#universalIconPicker .icon-option-active');
+        if (selectedIcon) {
+            icon = selectedIcon.dataset.icon;
+        }
+    }
+    
+    // Создаём объект упражнения
+    const exercise = {
+        name: name,
+        sets: parseInt(sets),
+        reps: repsDisplay,
+        weight: weight
+    };
+    
+    // Добавляем иконку, если она есть
+    if (icon) {
+        exercise.icon = icon;
+    }
+    
+    // ★★★ СОХРАНЯЕМ В ЗАВИСИМОСТИ ОТ РЕЖИМА ★★★
+    if (universalModalState.mode === 'edit' && universalModalState.index !== null && universalModalState.exercises) {
+        // Редактирование
+        universalModalState.exercises[universalModalState.index] = exercise;
+        
+        // ★★★ ЕСЛИ ИЗ СЕССИИ — СОХРАНЯЕМ В ИСХОДНЫЙ ИСТОЧНИК ★★★
+        if (universalModalState.source === 'session') {
+            saveExerciseToSource(universalModalState.index, exercise);
+        }
+        
+        // Если есть колбэк — вызываем
+        if (typeof universalModalState.callback === 'function') {
+            universalModalState.callback(universalModalState.index, exercise);
+        }
+        
+        showToast('✅ Упражнение обновлено');
+    } else {
+        // Создание
+        if (universalModalState.exercises) {
+            universalModalState.exercises.push(exercise);
+        }
+        
+        // Если есть колбэк — вызываем
+        if (typeof universalModalState.callback === 'function') {
+            universalModalState.callback(null, exercise);
+        }
+        
+        showToast('✅ Упражнение создано');
+    }
+    
+    closeUniversalExerciseModal();
+});
+
+// Отмена в универсальной модалке
+document.getElementById('exerciseUniversalCancelBtn')?.addEventListener('click', function() {
+    closeUniversalExerciseModal();
+});
+
+// Открыть модалку для создания упражнения (из редактирования тренировки)
+function openCreateExerciseModal() {
+    // Используем editExercises как массив
+    openUniversalExerciseModal('create', 'edit', null, editExercises, function(index, exercise) {
+        // После создания обновляем UI
+        renderEditExercises();
+        // Сохраняем в localStorage
+        if (editIsCustom || editWorkoutId === 'new') {
+            const nameInput = document.getElementById('editWorkoutName');
+            if (nameInput) localStorage.setItem('temp_edit_name', nameInput.value);
+            localStorage.setItem('temp_edit_exercises', JSON.stringify(editExercises));
+            localStorage.setItem('temp_edit_category', editCategory);
+            localStorage.setItem('temp_edit_level', editLevel);
+            localStorage.setItem('temp_edit_isCustom', editIsCustom);
+            localStorage.setItem('temp_edit_id', editWorkoutId || '');
+        }
+    });
+}
+
+// Открыть модалку для редактирования упражнения (из сессии)
+function openSessionEditExerciseModal(index) {
+    if (index === undefined || index === null || !sessionExercises || !sessionExercises[index]) {
+        showToast('⚠️ Упражнение не найдено');
+        return;
+    }
+    openUniversalExerciseModal('edit', 'session', index, sessionExercises, function(index, exercise) {
+        renderSessionExercise();
+        renderSessionProgress();
+
+        if (currentSessionId && sessionData) {
+            if (sessionData.exercises && sessionData.exercises[index]) {
+                sessionData.exercises[index] = { ...exercise };
+            }
+            if (coopExercises && coopExercises[index]) {
+                coopExercises[index] = { ...exercise };
+            }
+            updateCoopProgress(sessionCompleted.size, false);
+        }
+        // saveExerciseToSource и showToast уже вызываются в обработчике
+        // сохранения openUniversalExerciseModal — дублировать не нужно
+    });
+}
+window.openSessionEditExerciseModal = openSessionEditExerciseModal;
+
+// ★★★ НОВАЯ ФУНКЦИЯ: СОХРАНЕНИЕ УПРАЖНЕНИЯ В ИСХОДНЫЙ ИСТОЧНИК ★★★
+function saveExerciseToSource(index, exercise) {
+    if (index === undefined || index === null) return;
+    
+    const workoutTitle = sessionWorkoutTitle || '';
+    const cleanTitle = workoutTitle.replace(' (совместно)', '').trim();
+    
+    let saved = false;
+    
+    // ★★★ 1. ПРОВЕРЯЕМ ЛИЧНЫЕ ТРЕНИРОВКИ (myCustomWorkouts) ★★★
+    const allWorkouts = getMyWorkouts();
+    for (const workout of allWorkouts) {
+        if (workout.title === cleanTitle) {
+            if (workout.exercises && workout.exercises[index]) {
+                workout.exercises[index] = { ...exercise };
+                saveMyWorkouts(allWorkouts);
+                saved = true;
+                console.log('✅ Сохранено в личные тренировки:', workout.title);
+                break;
+            }
+        }
+    }
+    
+    // ★★★ 2. ЕСЛИ НЕ НАШЛИ В ЛИЧНЫХ — ИЩЕМ В ГОТОВЫХ (exercisesData) ★★★
+    if (!saved) {
+        for (const parent in exercisesData) {
+            if (typeof exercisesData[parent] === 'object') {
+                for (const category in exercisesData[parent]) {
+                    if (typeof exercisesData[parent][category] === 'object') {
+                        for (const level in exercisesData[parent][category]) {
+                            if (level === '_premium' || level === '_restTime') continue;
+                            
+                            const levelData = exercisesData[parent][category][level];
+                            let exercisesArray = null;
+                            let titleFromData = '';
+                            
+                            if (Array.isArray(levelData)) {
+                                exercisesArray = levelData;
+                                titleFromData = category + ' ' + level;
+                            } else if (levelData && typeof levelData === 'object' && levelData._exercises) {
+                                exercisesArray = levelData._exercises;
+                                titleFromData = levelData._title || category + ' ' + level;
+                            }
+                            
+                            if (exercisesArray && exercisesArray[index]) {
+                                // Проверяем совпадение по названию тренировки
+                                const isMatch = 
+                                    titleFromData === cleanTitle || 
+                                    category === cleanTitle ||
+                                    cleanTitle.includes(category) ||
+                                    category.includes(cleanTitle);
+                                
+                                if (isMatch) {
+                                    exercisesArray[index] = { ...exercise };
+                                    saveExercisesData();
+                                    saved = true;
+                                    console.log('✅ Сохранено в готовые тренировки:', titleFromData);
+                                    break;
+                                }
+                            }
+                        }
+                        if (saved) break;
+                    }
+                    if (saved) break;
+                }
+                if (saved) break;
+            }
+        }
+    }
+    
+    // ★★★ 3. ЕСЛИ НЕ НАШЛИ — СОХРАНЯЕМ В СЕССИЮ (КАК FALLBACK) ★★★
+    if (!saved) {
+        // Сохраняем в sessionExercises (уже есть)
+        // И в sessionData.exercises
+        if (sessionData && sessionData.exercises && sessionData.exercises[index]) {
+            sessionData.exercises[index] = { ...exercise };
+        }
+        if (coopExercises && coopExercises[index]) {
+            coopExercises[index] = { ...exercise };
+        }
+        console.log('⚠️ Не найдено исходное место, сохранено только в сессии');
+    }
+}
+
+// =================== МОДАЛКА ТРЕНИРОВОК ЗА ДЕНЬ ===================
+async function openDayWorkoutsModal(year, month, day) {
+    const dateObj = new Date(year, month, day);
+    const dateStr = dateObj.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    
+    document.getElementById('dayWorkoutsDate').textContent = dateStr;
+    
+    const container = document.getElementById('dayWorkoutsList');
+    container.innerHTML = Skeleton.historyRowList(3);
+    
+    try {
+        const user = await getFirebaseUser();
+        if (!user) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:1rem;">Авторизуйтесь, чтобы увидеть тренировки</div>';
+            openModal('dayWorkoutsModal');
+            return;
+        }
+        
+        const result = await getUserWorkoutsFromFirestore(user.uid);
+        if (!result.success) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:1rem;">Ошибка загрузки тренировок</div>';
+            openModal('dayWorkoutsModal');
+            return;
+        }
+        
+        const targetDate = new Date(year, month, day);
+        targetDate.setHours(0, 0, 0, 0);
+        const nextDay = new Date(targetDate);
+        nextDay.setDate(nextDay.getDate() + 1);
+        
+        const dayWorkouts = result.data.filter(w => {
+            const workoutDate = new Date(w.date);
+            return workoutDate >= targetDate && workoutDate < nextDay;
+        });
+        
+        const filteredWorkouts = dayWorkouts.filter(w => {
+            const icon = getWorkoutIcon(w);
+            return icon && icon !== 'charging';
+        });
+        
+        if (filteredWorkouts.length === 0) {
+            container.innerHTML = '<div style="text-align:center;color:var(--slate);padding:1rem;">В этот день тренировок не было :(</div>';
+        } else {
+            filteredWorkouts.sort((a, b) => new Date(b.date) - new Date(a.date));
+            
+            container.innerHTML = filteredWorkouts.map(w => {
+                const totalEx = w.exercises?.length || 0;
+                const completedEx = w.exercises?.filter(e => e.completed === true).length || 0;
+                const xpEarned = w.xpEarned || 0;
+                const minutes = Math.floor((w.durationSeconds || 0) / 60);
+                const detailsText = `${minutes} мин · ${completedEx}/${totalEx} ${declOfNum(totalEx, ['упражнение', 'упражнения', 'упражнений'])} · ${xpEarned.toFixed(1)} XP`;
+                const workoutTime = new Date(w.date).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                
+                return `
+                    <div class="history-item" style="margin-bottom:0.5rem;">
+                        <div class="history-item-header">
+                            <strong class="history-item-title">${w.title || 'Тренировка'}</strong>
+                            <span class="history-item-date">${workoutTime}</span>
+                        </div>
+                        <div class="history-item-details">${detailsText}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+    } catch (error) {
+        console.error('Ошибка загрузки тренировок за день:', error);
+        container.innerHTML = '<div style="text-align:center;color:#EF4444;padding:1rem;">Ошибка загрузки</div>';
+    }
+    
+    openModal('dayWorkoutsModal');
+}
+
+
+function openDailyTaskHelpModal(taskId) {
+    const task = dailyTasksList.find(t => t.id === taskId);
+    if (!task) {
+        showToast('⚠️ Задание не найдено');
+        return;
+    }
+
+    // Проверяем, не выполнено ли уже
+    if (task.completed) {
+        showToast('ℹ️ Задание уже выполнено');
+        return;
+    }
+
+    // ДЛЯ БЛОКА EXERCISE - ОСОБАЯ ЛОГИКА
+    if (task.block === 'exercise') {
+        // Заполняем модалку для упражнения
+        document.getElementById('dailyTaskHelpTitle').textContent = task.name;
+        document.getElementById('dailyTaskHelpIcon').innerHTML = `<i class="${task.icon || 'fa-solid fa-dumbbell'}" style="color: var(--accent);"></i>`;
+        document.getElementById('dailyTaskHelpText').textContent = `Для прохождения задания "${task.name}" нужно выполнить упражнение ${task.name} ${task.target} ${task.unit}.`;
+        
+        document.getElementById('dailyTaskHelpActionBtn').onclick = function() {
+            closeModal('dailyTaskHelpModal');
+            startTaskSession(taskId);
+        };
+        
+        openModal('dailyTaskHelpModal');
+        return;
+    }
+
+    // ДЛЯ ЗАДАНИЙ ИЗ БЛОКА FRIENDS
+    if (task.block === 'friends') {
+        let title = task.name;
+        let icon = task.icon || 'fa-solid fa-user-group';
+        let text = '';
+        let action = null;
+        
+        if (task.id === 'friends_1') {
+            text = 'Для прохождения задания "Дружный" нужно выбрать любую тренировку, нажать на кнопку "Совместная", выбрать друга и выполнить совместную тренировку.';
+            action = function() {
+                closeModal('dailyTaskHelpModal');
+                TabManager.workouts('ready');
+                window.navigateTo('workouts');
+            };
+        } else if (task.id === 'friends_2') {
+            text = 'Для прохождения задания "Дружелюбный" нужно перейти на страницу друзей и открыть профиль любого друга.';
+            action = function() {
+                closeModal('dailyTaskHelpModal');
+                TabManager.profile('friends');
+                window.navigateTo('profile');
+                setTimeout(() => renderFriendsInProfile(), 300);
+            };
+        } else if (task.id === 'friends_3') {
+            text = 'Для прохождения задания "Общительный" нужно перейти на страницу друзей и добавить друга в друзья.';
+            action = function() {
+                closeModal('dailyTaskHelpModal');
+                TabManager.profile('friends');
+                window.navigateTo('profile');
+                setTimeout(() => renderFriendsInProfile(), 300);
+            };
+        }
+        
+        document.getElementById('dailyTaskHelpTitle').textContent = title;
+        document.getElementById('dailyTaskHelpIcon').innerHTML = `<i class="${icon}" style="color: var(--accent);"></i>`;
+        document.getElementById('dailyTaskHelpText').textContent = text;
+        document.getElementById('dailyTaskHelpActionBtn').onclick = action;
+        
+        openModal('dailyTaskHelpModal');
+        return;
+    }
+
+    // ДЛЯ ЗАДАНИЙ ИЗ БЛОКА STATS_EXERCISE
+    if (task.block === 'stats_exercise') {
+        document.getElementById('dailyTaskHelpTitle').textContent = 'Спортсмен';
+        document.getElementById('dailyTaskHelpIcon').innerHTML = `<i class="fa-solid fa-chart-bar" style="color: var(--accent);"></i>`;
+        document.getElementById('dailyTaskHelpText').textContent = `Для прохождения задания "Спортсмен" нужно выполнить ${task.target} упражнений.`;
+        document.getElementById('dailyTaskHelpActionBtn').onclick = function() {
+            closeModal('dailyTaskHelpModal');
+            TabManager.workouts('ready');
+            window.navigateTo('workouts');
+        };
+        
+        openModal('dailyTaskHelpModal');
+        return;
+    }
+
+    // ДЛЯ ЗАДАНИЙ ИЗ БЛОКА STATS_TIME
+    if (task.block === 'stats_time') {
+        document.getElementById('dailyTaskHelpTitle').textContent = 'Атлет';
+        document.getElementById('dailyTaskHelpIcon').innerHTML = `<i class="fa-solid fa-stopwatch" style="color: var(--accent);"></i>`;
+        document.getElementById('dailyTaskHelpText').textContent = `Для прохождения задания "Атлет" нужно тренироваться ${task.target} минут.`;
+        document.getElementById('dailyTaskHelpActionBtn').onclick = function() {
+            closeModal('dailyTaskHelpModal');
+            TabManager.workouts('ready');
+            window.navigateTo('workouts');
+        };
+        
+        openModal('dailyTaskHelpModal');
+        return;
+    }
+
+    // ДЛЯ ЗАДАНИЙ ИЗ БЛОКА SMART_STATS
+    if (task.block === 'smart_stats') {
+        if (task.type === 'smart_exercise') {
+            document.getElementById('dailyTaskHelpTitle').textContent = `Упражнения на ${task.category}`;
+            document.getElementById('dailyTaskHelpIcon').innerHTML = `<i class="fa-solid fa-trophy" style="color: var(--accent);"></i>`;
+            document.getElementById('dailyTaskHelpText').textContent = `Для прохождения задания "Упражнения на ${task.category}" нужно выполнить ${task.target} упражнений, которые относятся к группе мышц "${task.category}".`;
+            document.getElementById('dailyTaskHelpActionBtn').onclick = function() {
+                closeModal('dailyTaskHelpModal');
+                const categoryMap = {
+                    'Руки': 'Руки',
+                    'Плечи': 'Плечи',
+                    'Пресс': 'Пресс',
+                    'Грудь': 'Грудь',
+                    'Спина': 'Спина',
+                    'Ноги': 'Ноги',
+                    'Ягодицы': 'Ягодицы',
+                    'Кардио': 'Кардио',
+                    'Гибкость': 'Растяжка',
+                    'Всё тело': 'Всё тело'
+                };
+                const category = categoryMap[task.category] || task.category;
+                window.navigateTo('level-select', { category: category });
+            };
+        } else if (task.type === 'smart_workout') {
+            document.getElementById('dailyTaskHelpTitle').textContent = `Тренировка ${task.category}`;
+            document.getElementById('dailyTaskHelpIcon').innerHTML = `<i class="fa-solid fa-trophy" style="color: var(--accent);"></i>`;
+            document.getElementById('dailyTaskHelpText').textContent = `Для прохождения задания "Тренировка ${task.category}" нужно выполнить любую готовую тренировку из категории "${task.category}".`;
+            document.getElementById('dailyTaskHelpActionBtn').onclick = function() {
+                closeModal('dailyTaskHelpModal');
+                const categoryMap = {
+                    'Руки': 'Руки',
+                    'Плечи': 'Плечи',
+                    'Пресс': 'Пресс',
+                    'Грудь': 'Грудь',
+                    'Спина': 'Спина',
+                    'Ноги': 'Ноги',
+                    'Ягодицы': 'Ягодицы',
+                    'Кардио': 'Кардио',
+                    'Гибкость': 'Растяжка',
+                    'Всё тело': 'Всё тело'
+                };
+                const category = categoryMap[task.category] || task.category;
+                window.navigateTo('level-select', { category: category });
+            };
+        }
+        
+        openModal('dailyTaskHelpModal');
+        return;
+    }
+}
+
+// =================== ФУНКЦИЯ START TASK SESSION ===================
+function startTaskSession(taskId) {
+    const task = dailyTasksList.find(t => t.id === taskId);
+    if (!task) {
+        showToast('⚠️ Задание не найдено');
+        return;
+    }
+
+    const isSeconds = task.unit === 'сек' || task.unit === 'seconds' || task.unit === 'секунд';
+    const target = task.target;
+
+    const exercise = {
+        name: task.name,
+        sets: 1,
+        reps: isSeconds ? target + ' секунд' : target,
+        weight: 0,
+        icon: null
+    };
+
+    // Сбрасываем таймеры
+    if (taskExerciseTimerInterval) {
+        clearInterval(taskExerciseTimerInterval);
+        taskExerciseTimerInterval = null;
+    }
+    taskSessionSeconds = 0;
+    if (taskTimerInterval) {
+        clearInterval(taskTimerInterval);
+        taskTimerInterval = null;
+    }
+
+    taskSessionData = {
+        taskId: taskId,
+        task: task,
+        exercise: exercise,
+        target: target,
+        isSeconds: isSeconds,
+        startTime: Date.now(),
+        elapsedSeconds: 0,
+        remainingSeconds: isSeconds ? target : 0,
+        isActive: true
+    };
+
+    console.log('📊 taskSessionData создан:', taskSessionData);
+
+    // Обновляем UI
+    const nameEl = document.getElementById('taskExerciseName');
+    const detailsEl = document.getElementById('taskExerciseDetails');
+    
+    if (nameEl) nameEl.textContent = task.name;
+    renderExerciseGallery(task, 'taskExerciseGallery');
+    if (detailsEl) {
+        const detailsText = isSeconds ? `${target} секунд` : `${target} повторений`;
+        detailsEl.textContent = detailsText;
+    }
+
+    // УПРАВЛЕНИЕ ТАЙМЕРОМ И КНОПКОЙ
+    const timerWrapper = document.getElementById('taskExerciseTimerWrapper');
+    const finishBtn = document.getElementById('taskFinishBtn');
+
+    if (isSeconds) {
+        console.log('⏱️ Временное упражнение: показываем таймер');
+        // ДЛЯ СЕКУНД — ПОКАЗЫВАЕМ ТАЙМЕР, КНОПКА ПОКАЗЫВАЕТ СТАРТ
+        if (timerWrapper) timerWrapper.style.display = 'flex';
+        if (finishBtn) {
+            finishBtn.textContent = 'СТАРТ';
+            finishBtn.style.background = 'var(--accent)';
+            finishBtn.disabled = false;
+        }
+        updateTaskExerciseTimerDisplay();
+    } else {
+        console.log('📌 Упражнение с повторениями: скрываем таймер');
+        // ДЛЯ ПОВТОРЕНИЙ — СКРЫВАЕМ ТАЙМЕР, КНОПКА ПОКАЗЫВАЕТ ФИНИШ
+        if (timerWrapper) timerWrapper.style.display = 'none';
+        if (finishBtn) {
+            finishBtn.textContent = 'ФИНИШ';
+            finishBtn.style.background = 'var(--accent)';
+            finishBtn.disabled = false;
+        }
+    }
+
+    renderTaskProgress();
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('page-active'));
+    document.getElementById('page-task-session').classList.add('page-active');
+    document.getElementById('bottomNav').style.display = 'none';
+
+    startTaskTimer();
+    
+    console.log('✅ Специальная сессия запущена:', task.name);
+}
+
+// =================== ФУНКЦИЯ ОБНОВЛЕНИЯ ТАЙМЕРА УПРАЖНЕНИЯ ===================
+function updateTaskExerciseTimerDisplay() {
+    const display = document.getElementById('taskExerciseTimer');
+    if (!display) return;
+    
+    if (!taskSessionData) {
+        display.textContent = '00:00';
+        return;
+    }
+    
+    if (taskSessionData.isSeconds) {
+        const rem = Math.max(0, taskSessionData.remainingSeconds);
+        const mins = String(Math.floor(rem / 60)).padStart(2, '0');
+        const secs = String(rem % 60).padStart(2, '0');
+        display.textContent = `${mins}:${secs}`;
+    } else {
+        const elapsed = taskSessionData.elapsedSeconds || 0;
+        const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+        const secs = String(elapsed % 60).padStart(2, '0');
+        display.textContent = `${mins}:${secs}`;
+    }
+}
+
+function openTaskResultModal(sessionData, actualSeconds) {
+    const oldModal = document.getElementById('taskResultModal');
+    if (oldModal) oldModal.remove();
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.id = 'taskResultModal';
+    modal.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title" style="text-align:center;">${sessionData.exercise.name}</div>
+            <p class="modal-text" style="margin: 0.5rem 0 1.5rem 0; text-align:center;">
+                Сколько повторений вы выполнили?
+            </p>
+            <div style="display:flex; align-items:center; justify-content:center; gap:1.5rem; margin-bottom:1.5rem;">
+                <button class="btn btn-secondary" id="taskResultDec" style="width:40px; height:40px; border-radius:10px; font-size:1.5rem; padding:0; display:flex; align-items:center; justify-content:center;">−</button>
+                <span id="taskResultValue" style="font-size:2.5rem; font-weight:700; min-width:4rem; text-align:center; color:var(--accent);">${sessionData.target}</span>
+                <button class="btn btn-secondary" id="taskResultInc" style="width:40px; height:40px; border-radius:10px; font-size:1.5rem; padding:0; display:flex; align-items:center; justify-content:center;">+</button>
+            </div>
+            <div style="display:flex; gap:0.5rem;">
+                <button class="btn btn-secondary" id="taskResultCancel" style="flex:1;">Отмена</button>
+                <button class="btn btn-primary" id="taskResultConfirm" style="flex:1;">Продолжить</button>
+            </div>
+        </div>
+    `;
+document.body.appendChild(modal);
+void modal.offsetWidth;
+modal.classList.add('modal-overlay-visible');
+
+let currentValue = sessionData.target;
+    const minValue = 0;
+    const maxValue = 999;
+
+    document.getElementById('taskResultDec').addEventListener('click', function(e) {
+        e.stopPropagation();
+        currentValue = Math.max(minValue, currentValue - 1);
+        document.getElementById('taskResultValue').textContent = currentValue;
+    });
+    
+    document.getElementById('taskResultInc').addEventListener('click', function(e) {
+        e.stopPropagation();
+        currentValue = Math.min(maxValue, currentValue + 1);
+        document.getElementById('taskResultValue').textContent = currentValue;
+    });
+
+document.getElementById('taskResultCancel').addEventListener('click', function() {
+    closeModal('taskResultModal');
+    if (taskSessionData) {
+        taskSessionData.isActive = true;
+        startTaskTimer();
+    }
+    const finishBtn = document.getElementById('taskFinishBtn');
+    if (finishBtn) {
+        finishBtn.textContent = 'ФИНИШ';
+        finishBtn.style.background = 'var(--accent)';
+        finishBtn.disabled = false;
+    }
+});
+
+document.getElementById('taskResultConfirm').addEventListener('click', async function() {
+    const entered = currentValue;
+    const target = sessionData.target;
+    const taskId = sessionData.taskId;
+    const exercise = sessionData.exercise;
+    const exerciseName = exercise.name;
+
+    closeModal('taskResultModal');
+
+        if (taskSessionData) {
+            taskSessionData.isActive = false;
+            if (taskSessionData.timerInterval) {
+                clearInterval(taskSessionData.timerInterval);
+                taskSessionData.timerInterval = null;
+            }
+            taskSessionData = null;
+        }
+        stopTaskTimer();
+        if (taskExerciseTimerInterval) {
+            clearInterval(taskExerciseTimerInterval);
+            taskExerciseTimerInterval = null;
+        }
+
+        const tempExercise = {
+            name: exercise.name,
+            sets: 1,
+            reps: entered,
+            weight: 0,
+            icon: exercise.icon || null
+        };
+
+        let durationSeconds = actualSeconds || 0;
+
+        // ★★★ 1. НАЧИСЛЯЕМ XP ★★★
+        const xpForExercise = calculateExerciseXP(tempExercise, 1);
+        await addSingleExerciseToStats(tempExercise, durationSeconds, xpForExercise);
+        console.log('✅ XP за упражнение начислено:', xpForExercise);
+
+        // ★★★ 2. ОБНОВЛЯЕМ ДНЕВНОЙ ПРОГРЕСС (СУММИРУЕМ) ★★★
+        const dailyProgress = updateDailyProgressForExercise(exerciseName, entered);
+        console.log('📊 Дневной прогресс по упражнению "' + exerciseName + '": ' + dailyProgress.exerciseReps[exerciseName] + '/' + target);
+
+        // ★★★ 3. ПРОВЕРЯЕМ, ВЫПОЛНЕНО ЛИ ЗАДАНИЕ ★★★
+        if (dailyProgress.exerciseReps[exerciseName] >= target) {
+            await completeDailyTaskIfExists(taskId);
+            showToast('✅ Задание "' + exerciseName + '" выполнено!');
+        } else {
+            const remaining = target - dailyProgress.exerciseReps[exerciseName];
+            showToast('📊 Выполнено ' + dailyProgress.exerciseReps[exerciseName] + ' из ' + target + '. Осталось ' + remaining);
+        }
+
+        TabManager.profile('my');
+        window.navigateTo('profile');
+        document.getElementById('bottomNav').style.display = 'block';
+    });
+}
+
+// Функция добавления одного упражнения в статистику (без тренировки)
+async function addSingleExerciseToStats(exercise, durationSeconds, xpEarned) {
+    const user = await getFirebaseUser();
+    if (!user) return;
+
+    // Получаем текущий профиль
+    const profileResult = await getUserProfile(user.uid);
+    if (profileResult.success) {
+        const currentXp = profileResult.data.totalXp || 0;
+        await updateUserProfile(user.uid, { totalXp: currentXp + xpEarned });
+        if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel(); // ★
+    }
+
+    // Добавляем упражнение как отдельную запись в workout
+    const workoutData = {
+        title: 'Одиночное упражнение: ' + exercise.name,
+        date: new Date().toISOString(),
+        durationSeconds: durationSeconds,
+        exercises: [{ ...exercise, completed: true }],
+        xpEarned: xpEarned,
+        category: 'Одиночное',
+        icon: exercise.icon,
+        isSingle: true
+    };
+
+    const result = await saveWorkoutToFirestore(user.uid, workoutData);
+    if (!result.success) {
+        addPendingWorkout(workoutData);
+    }
+}
+
+function openTaskHelpModal(taskId) {
+    const isCompleted = tasks[taskId] === true;
+    
+    const configs = {
+        1: {
+            title: 'Первый шаг',
+            icon: 'fa-solid fa-dumbbell',
+            text: 'Для прохождения задания "Первый шаг" нужно перейти на страницу тренировок и выполнить любую тренировку.',
+            completedText: 'Задание "Первый шаг" выполнено!',
+            action: function() {
+                closeModal('taskHelpModal');
+                TabManager.workouts('ready');
+                window.navigateTo('workouts');
+            }
+        },
+        2: {
+            title: 'Статистика',
+            icon: 'fa-solid fa-chart-bar',
+            text: 'Для прохождения задания "Статистика" нужно перейти на страницу статистики и посмотреть свои результаты.',
+            completedText: 'Задание "Статистика" выполнено!',
+            action: function() {
+                closeModal('taskHelpModal');
+                TabManager.stats('personal');
+                window.navigateTo('stats');
+            }
+        },
+        3: {
+            title: 'Индивидуальность',
+            icon: 'fa-solid fa-drafting-compass',
+            text: 'Для прохождения задания "Индивидуальность" нужно перейти на страницу личных тренировок и создать свою собственную тренировку.',
+            completedText: 'Задание "Индивидуальность" выполнено!',
+            action: function() {
+                closeModal('taskHelpModal');
+                TabManager.workouts('my');
+                window.navigateTo('workouts');
+            }
+        },
+        4: {
+            title: 'Новые знакомства',
+            icon: 'fa-solid fa-user-plus',
+            text: 'Для прохождения задания "Новые знакомства" нужно перейти на страницу друзей и добавить друга в друзья.',
+            completedText: 'Задание "Новые знакомства" выполнено!',
+            action: function() {
+                closeModal('taskHelpModal');
+                TabManager.profile('friends');
+                window.navigateTo('profile');
+                setTimeout(() => renderFriendsInProfile(), 300);
+            }
+        },
+        5: {
+            title: 'Оформление',
+            icon: 'fa-solid fa-palette',
+            text: 'Для прохождения задания "Оформление" нужно изменить акцентный цвет приложения в дополнительных настройках.',
+            completedText: 'Задание "Оформление" выполнено!',
+            action: function() {
+                closeModal('taskHelpModal');
+                TabManager.profile('my');
+                window.navigateTo('profile');
+                setTimeout(() => {
+                    const settingsBlock = document.getElementById('settings-block-main');
+                    if (settingsBlock) {
+                        settingsBlock.classList.add('open');
+                        saveBlocksState();
+                    }
+                }, 300);
+            }
+        }
+    };
+
+    const config = configs[taskId];
+    if (!config) {
+        console.warn('⚠️ Задание с id ' + taskId + ' не найдено');
+        return;
+    }
+
+    const titleEl = document.getElementById('taskHelpTitle');
+    const iconEl = document.getElementById('taskHelpIcon');
+    const textEl = document.getElementById('taskHelpText');
+    const actionBtn = document.getElementById('taskHelpActionBtn');
+    const cancelBtn = document.getElementById('taskHelpCancelBtn');
+
+    if (!titleEl || !iconEl || !textEl) {
+        console.error('❌ Элементы модалки не найдены!');
+        showToast('⚠️ Ошибка отображения подсказки');
+        return;
+    }
+
+    titleEl.textContent = config.title;
+    iconEl.innerHTML = `<i class="${config.icon}" style="color: var(--accent);"></i>`;
+    
+    if (isCompleted) {
+        textEl.textContent = config.completedText;
+        if (actionBtn) actionBtn.style.display = 'none';
+        if (cancelBtn) {
+            cancelBtn.textContent = 'Понятно';
+            cancelBtn.className = 'btn btn-primary';
+            cancelBtn.onclick = function() {
+                closeModal('taskHelpModal');
+            };
+        }
+    } else {
+        textEl.textContent = config.text;
+        if (actionBtn) {
+            actionBtn.style.display = 'block';
+            actionBtn.onclick = config.action;
+        }
+        if (cancelBtn) {
+            cancelBtn.textContent = 'Отмена';
+            cancelBtn.className = 'btn btn-secondary';
+            cancelBtn.onclick = function() {
+                closeModal('taskHelpModal');
+            };
+        }
+    }
+
+    openModal('taskHelpModal');
+}
+
+document.getElementById('taskQuitBtn')?.addEventListener('click', function() {
+    if (!taskSessionData) {
+        showToast('❌ Задание не выполнено');
+        return;
+    }
+    
+    stopTaskTimer();
+    if (taskExerciseTimerInterval) {
+        clearInterval(taskExerciseTimerInterval);
+        taskExerciseTimerInterval = null;
+    }
+    taskSessionData.isActive = false;
+    
+    showToast('❌ Задание не выполнено');
+    
+    taskSessionData = null;
+    taskSessionSeconds = 0;
+    
+    TabManager.profile('my');
+    window.navigateTo('profile');
+    document.getElementById('bottomNav').style.display = 'block';
+});
+
+// Отладка - переопределяем openTaskResultModal
+const originalOpenTaskResultModal = window.openTaskResultModal;
+window.openTaskResultModal = function(...args) {
+    console.trace('🔴 Вызвана openTaskResultModal!');
+    console.log('📊 Аргументы:', args);
+    // Проверяем, откуда вызвана
+    if (taskSessionData && taskSessionData.isSeconds) {
+        console.warn('⚠️ openTaskResultModal вызвана для временного упражнения! Это ошибка!');
+        return;
+    }
+    originalOpenTaskResultModal(...args);
+};
+
+// =================== ОБРАБОТЧИК КНОПКИ taskFinishBtn (ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ) ===================
+document.getElementById('taskFinishBtn')?.addEventListener('click', function() {
+    const btn = this;
+    
+    console.log('🔵 Нажата кнопка taskFinishBtn');
+    console.log('📊 taskSessionData:', taskSessionData);
+    
+    // ★★★ ПРОВЕРЯЕМ, ЕСТЬ ЛИ ДАННЫЕ СЕССИИ ★★★
+    if (!taskSessionData) {
+        console.warn('⚠️ Нет данных сессии');
+        return;
+    }
+    
+    // ★★★ ДЛЯ УПРАЖНЕНИЙ НА ПОВТОРЕНИЯ — КНОПКА ФИНИШ → ОТКРЫВАЕМ МОДАЛКУ ★★★
+    if (!taskSessionData.isSeconds) {
+        console.log('📌 Повторения: открываем модалку');
+        // Останавливаем основной таймер
+        stopTaskTimer();
+        
+        let actualSeconds = taskSessionData.elapsedSeconds || 0;
+        openTaskResultModal(taskSessionData, actualSeconds);
+        return;
+    }
+    
+    // ★★★ ДЛЯ УПРАЖНЕНИЙ СО ВРЕМЕНЕМ — СТАРТ/СТОП (МОДАЛКА НЕ ОТКРЫВАЕТСЯ) ★★★
+    if (taskSessionData.isSeconds) {
+        console.log('⏱️ Время: режим СТАРТ/СТОП');
+        
+        if (btn.textContent === 'СТАРТ') {
+            console.log('▶️ Запускаем таймер');
+            // ЗАПУСКАЕМ ТАЙМЕР
+            btn.textContent = 'СТОП';
+            btn.style.background = 'var(--danger)';
+            
+            // Если время обнулилось - сбрасываем
+            if (taskSessionData.remainingSeconds <= 0) {
+                taskSessionData.remainingSeconds = taskSessionData.target;
+            }
+            
+            if (taskExerciseTimerInterval) {
+                clearInterval(taskExerciseTimerInterval);
+            }
+            taskExerciseTimerInterval = setInterval(() => {
+                if (!taskSessionData || !taskSessionData.isActive) return;
+                
+                taskSessionData.remainingSeconds = Math.max(0, taskSessionData.remainingSeconds - 1);
+                updateTaskExerciseTimerDisplay();
+                
+                // ЕСЛИ ВРЕМЯ ВЫШЛО — АВТОМАТИЧЕСКИ ЗАВЕРШАЕМ
+                if (taskSessionData.remainingSeconds <= 0) {
+                    console.log('⏰ Время вышло! Автоматическое завершение');
+                    clearInterval(taskExerciseTimerInterval);
+                    taskExerciseTimerInterval = null;
+                    btn.textContent = 'СТАРТ';
+                    btn.style.background = 'var(--accent)';
+                    
+// АВТОМАТИЧЕСКИ ВЫПОЛНЯЕМ ЗАДАНИЕ (БЕЗ МОДАЛКИ)
+(async function() {
+    const taskId = taskSessionData.taskId;
+    const exercise = taskSessionData.exercise;
+    const exerciseName = exercise.name;
+    const target = taskSessionData.target;
+    
+    const tempExercise = {
+        name: exercise.name,
+        sets: 1,
+        reps: exercise.reps,
+        weight: 0,
+        icon: exercise.icon || null
+    };
+    
+    const xpForExercise = calculateExerciseXP(tempExercise, 1);
+    await addSingleExerciseToStats(tempExercise, taskSessionData.target, xpForExercise);
+    console.log('✅ XP за упражнение начислено:', xpForExercise);
+    
+    // ★★★ ОБНОВЛЯЕМ ДНЕВНОЙ ПРОГРЕСС ★★★
+    const dailyProgress = updateDailyProgressForExercise(exerciseName, target);
+    console.log('📊 Дневной прогресс по упражнению "' + exerciseName + '": ' + dailyProgress.exerciseReps[exerciseName] + '/' + target);
+    
+    // ★★★ ПРОВЕРЯЕМ, ВЫПОЛНЕНО ЛИ ЗАДАНИЕ ★★★
+    if (dailyProgress.exerciseReps[exerciseName] >= target) {
+        await completeDailyTaskIfExists(taskId);
+        showToast('✅ Задание "' + exerciseName + '" выполнено!');
+    } else {
+        const remaining = target - dailyProgress.exerciseReps[exerciseName];
+showToast('❌ Задание не выполнено.');    }
+    
+    stopTaskTimer();
+    taskSessionData.isActive = false;
+    taskSessionData = null;
+    taskSessionSeconds = 0;
+    
+    TabManager.profile('my');
+    window.navigateTo('profile');
+    document.getElementById('bottomNav').style.display = 'block';
+})();
+                }
+            }, 1000);
+            
+        } else if (btn.textContent === 'СТОП') {
+            console.log('⏹️ Останавливаем таймер');
+            // ОСТАНАВЛИВАЕМ ТАЙМЕР
+            btn.textContent = 'СТАРТ';
+            btn.style.background = 'var(--accent)';
+            if (taskExerciseTimerInterval) {
+                clearInterval(taskExerciseTimerInterval);
+                taskExerciseTimerInterval = null;
+            }
+        }
+        // ★★★ ВАЖНО: ЗДЕСЬ НЕТ ВЫЗОВА openTaskResultModal ★★★
+        return;
+    }
+});
+
+function renderTaskProgress() {
+    const container = document.getElementById('taskSessionProgress');
+    if (!container) return;
+    container.innerHTML = '';
+    const dash = document.createElement('div');
+    dash.className = 'progress-dash progress-dash-active';
+    container.appendChild(dash);
+}
+
+function startTaskTimer() {
+    if (taskTimerInterval) {
+        clearInterval(taskTimerInterval);
+        taskTimerInterval = null;
+    }
+    taskTimerInterval = setInterval(() => {
+        taskSessionSeconds++;
+        updateTaskTimerDisplay2();
+        
+        // ДЛЯ ПОВТОРЕНИЙ — ОБНОВЛЯЕМ elapsedSeconds
+        if (taskSessionData && !taskSessionData.isSeconds) {
+            taskSessionData.elapsedSeconds = taskSessionSeconds;
+            updateTaskExerciseTimerDisplay();
+        }
+    }, 1000);
+}
+
+function updateTaskTimerDisplay2() {
+    const timer = document.getElementById('taskSessionTimer');
+    if (!timer) return;
+    const mins = String(Math.floor(taskSessionSeconds / 60)).padStart(2, '0');
+    const secs = String(taskSessionSeconds % 60).padStart(2, '0');
+    timer.textContent = `${mins}:${secs}`;
+}
+
+function stopTaskTimer() {
+    if (taskTimerInterval) {
+        clearInterval(taskTimerInterval);
+        taskTimerInterval = null;
+    }
+}
+
+// =================== ОБРАБОТЧИК КНОПКИ СТАРТ/СТОП ===================
+document.getElementById('taskStartStopBtn')?.addEventListener('click', function() {
+    const btn = this;
+    
+    if (btn.textContent === 'СТАРТ') {
+        btn.textContent = 'СТОП';
+        btn.style.background = 'var(--danger)';
+        
+        if (taskSessionData && taskSessionData.isSeconds && taskSessionData.remainingSeconds <= 0) {
+            taskSessionData.remainingSeconds = taskSessionData.target;
+        }
+        if (taskSessionData && !taskSessionData.isSeconds) {
+            taskSessionData.startTime = Date.now();
+        }
+        
+        if (taskExerciseTimerInterval) {
+            clearInterval(taskExerciseTimerInterval);
+        }
+        taskExerciseTimerInterval = setInterval(() => {
+            if (!taskSessionData || !taskSessionData.isActive) return;
+            
+            if (taskSessionData.isSeconds) {
+                taskSessionData.remainingSeconds = Math.max(0, taskSessionData.remainingSeconds - 1);
+                updateTaskExerciseTimerDisplay();
+                
+                // ★★★ ЕСЛИ ВРЕМЯ ВЫШЛО ★★★
+                if (taskSessionData.remainingSeconds <= 0) {
+                    clearInterval(taskExerciseTimerInterval);
+                    taskExerciseTimerInterval = null;
+                    btn.textContent = 'СТАРТ';
+                    btn.style.background = 'var(--accent)';
+                    
+                    // ★★★ ВЫПОЛНЯЕМ ЗАДАНИЕ (АСИНХРОННО) ★★★
+                    (async function() {
+                        const taskId = taskSessionData.taskId;
+                        const exercise = taskSessionData.exercise;
+                        
+                        // 1. Сначала сохраняем упражнение и ждём
+    const tempExercise = {
+        name: exercise.name,
+        sets: 1,
+        reps: exercise.reps,
+        weight: 0,
+        icon: exercise.icon || null
+    };
+                        
+                        const xpForExercise = calculateExerciseXP(tempExercise, 1);
+                        await addSingleExerciseToStats(tempExercise, taskSessionData.target, xpForExercise);
+                        console.log('✅ XP за упражнение начислено:', xpForExercise);
+                        
+                        // 2. Теперь начисляем XP за задание (+10) и ЖДЁМ
+                        await completeDailyTaskIfExists(taskId);
+                        
+                        // Останавливаем основной таймер
+                        stopTaskTimer();
+                        
+                        // Очищаем данные
+                        taskSessionData.isActive = false;
+                        taskSessionData = null;
+                        taskSessionSeconds = 0;
+                        
+                        // Переход на профиль
+                        TabManager.profile('my');
+                        window.navigateTo('profile');
+                        document.getElementById('bottomNav').style.display = 'block';
+                    })();
+                }
+            } else {
+                taskSessionData.elapsedSeconds = Math.floor((Date.now() - taskSessionData.startTime) / 1000);
+                updateTaskExerciseTimerDisplay();
+            }
+        }, 1000);
+        
+    } else {
+        btn.textContent = 'СТАРТ';
+        btn.style.background = 'var(--accent)';
+        if (taskExerciseTimerInterval) {
+            clearInterval(taskExerciseTimerInterval);
+            taskExerciseTimerInterval = null;
+        }
+    }
+});
+
+// app.js - обновляем getDailyProgress()
+function getDailyProgress() {
+    const today = new Date().toISOString().split('T')[0];
+    const saved = localStorage.getItem(DAILY_PROGRESS_KEY);
+    
+    if (saved) {
+        try {
+            const data = JSON.parse(saved);
+            if (data.date !== today) {
+                const newData = { 
+                    date: today, 
+                    exercises: 0, 
+                    minutes: 0,
+                    categories: {},
+                    exerciseReps: {}  // ★★★ ДОБАВЛЯЕМ ДЛЯ ФИЗИЧЕСКИХ УПРАЖНЕНИЙ ★★★
+                };
+                localStorage.setItem(DAILY_PROGRESS_KEY, JSON.stringify(newData));
+                return newData;
+            }
+            if (!data.categories) {
+                data.categories = {};
+            }
+            if (!data.exerciseReps) {
+                data.exerciseReps = {};  // ★★★ ДОБАВЛЯЕМ ★★★
+            }
+            return data;
+        } catch (e) {
+            console.warn('Ошибка загрузки дневного прогресса:', e);
+        }
+    }
+    
+    const newData = { 
+        date: today, 
+        exercises: 0, 
+        minutes: 0,
+        categories: {},
+        exerciseReps: {}  // ★★★ ДОБАВЛЯЕМ ★★★
+    };
+    localStorage.setItem(DAILY_PROGRESS_KEY, JSON.stringify(newData));
+    return newData;
+}
+
+// app.js - обновляем updateDailyProgress()
+function updateDailyProgress(exercisesCompleted, durationMinutes, exercisesWithCategories, exerciseRepsData) {
+    const progress = getDailyProgress();
+    progress.exercises += exercisesCompleted;
+    progress.minutes += durationMinutes;
+    
+    // Обновляем прогресс по категориям (для smart_exercise)
+    if (exercisesWithCategories) {
+        for (const [category, count] of Object.entries(exercisesWithCategories)) {
+            if (!progress.categories[category]) {
+                progress.categories[category] = 0;
+            }
+            progress.categories[category] += count;
+        }
+    }
+    
+    // ★★★ ОБНОВЛЯЕМ ПРОГРЕСС ПО ФИЗИЧЕСКИМ УПРАЖНЕНИЯМ ★★★
+    if (exerciseRepsData) {
+        for (const [exerciseName, reps] of Object.entries(exerciseRepsData)) {
+            if (!progress.exerciseReps[exerciseName]) {
+                progress.exerciseReps[exerciseName] = 0;
+            }
+            progress.exerciseReps[exerciseName] += reps;
+        }
+    }
+    
+    localStorage.setItem(DAILY_PROGRESS_KEY, JSON.stringify(progress));
+    return progress;
+}
+
+// Получить прогресс по конкретной категории за день
+function getDailyCategoryProgress(category) {
+    const progress = getDailyProgress();
+    return progress.categories[category] || 0;
+}
+
+// Сбросить дневной прогресс (принудительно)
+function resetDailyProgress() {
+    const today = new Date().toISOString().split('T')[0];
+    const newData = { date: today, exercises: 0, minutes: 0 };
+    localStorage.setItem(DAILY_PROGRESS_KEY, JSON.stringify(newData));
+    return newData;
+}
+
+// app.js - добавить новую функцию
+
+function updateDailyProgressForExercise(exerciseName, totalReps) {
+    const today = new Date().toISOString().split('T')[0];
+    let progress = getDailyProgress();
+    
+    // Проверяем, не изменилась ли дата
+    if (progress.date !== today) {
+        progress = { date: today, exercises: 0, minutes: 0, categories: {}, exerciseReps: {} };
+    }
+    
+    // Добавляем повторения
+    if (!progress.exerciseReps[exerciseName]) {
+        progress.exerciseReps[exerciseName] = 0;
+    }
+    progress.exerciseReps[exerciseName] += totalReps;
+    
+    // Добавляем общее количество упражнений (для stats_exercise)
+    progress.exercises += 1;
+    
+    localStorage.setItem(DAILY_PROGRESS_KEY, JSON.stringify(progress));
+    return progress;
+}
+
+// =================== ИСТОРИЯ ДРУЗЕЙ ===================
+
+// Переменные для фильтра
+let selectedFriendForHistory = 'all';
+let tempSelectedFriendForHistory = 'all';
+
+/*** Получить историю тренировок всех друзей (с учётом их настроек видимости)*/
+async function getFriendsWorkoutHistory() {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+    
+    try {
+        const friendsResult = await getFriendsList();
+        if (!friendsResult.success || friendsResult.data.length === 0) {
+            return { success: true, data: [] };
+        }
+        
+        const allHistory = [];
+        
+        for (const friend of friendsResult.data) {
+            const friendProfile = await getUserProfile(friend.id);
+            if (!friendProfile.success) continue;
+            
+            // ★★★ ПРОВЕРЯЕМ, РАЗРЕШАЕТ ЛИ ДРУГ ВИДЕТЬ СВОЮ ИСТОРИЮ ★★★
+            if (friendProfile.data.friendsHistoryVisible === false) {
+                continue;
+            }
+            
+            const workoutsResult = await getUserWorkoutsFromFirestore(friend.id);
+            if (workoutsResult.success && workoutsResult.data.length > 0) {
+                const filteredWorkouts = workoutsResult.data.filter(w => {
+                    const icon = getWorkoutIcon(w);
+                    return icon && icon !== 'charging';
+                });
+                
+                filteredWorkouts.forEach(w => {
+                    allHistory.push({
+                        friendName: friend.displayName || 'Пользователь',
+                        friendId: friend.id,
+                        friendAvatar: (friend.displayName || 'П')[0].toUpperCase(),
+                        ...w
+                    });
+                });
+            }
+        }
+        
+        allHistory.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
+        return { success: true, data: allHistory };
+        
+    } catch (error) {
+        console.error('Ошибка получения истории друзей:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Сгруппировать историю по друзьям
+ */
+function groupHistoryByFriend(history) {
+    const grouped = {};
+    
+    history.forEach(item => {
+        const key = item.friendId;
+        if (!grouped[key]) {
+            grouped[key] = {
+                friendId: item.friendId,
+                friendName: item.friendName,
+                friendAvatar: item.friendAvatar,
+                workouts: []
+            };
+        }
+        grouped[key].workouts.push(item);
+    });
+    
+    return Object.values(grouped);
+}
+
+/**
+ * Форматирование даты: сегодня, вчера, X дней назад (до 7 дней), потом DD.MM.YYYY
+ */
+function formatRelativeDate(dateString) {
+    const date = new Date(dateString);
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const targetDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const diffDays = Math.floor((today - targetDate) / (1000 * 60 * 60 * 24));
+    
+    if (diffDays === 0) return 'сегодня';
+    if (diffDays === 1) return 'вчера';
+    if (diffDays <= 7) return `${diffDays} ${declOfNum(diffDays, ['день', 'дня', 'дней'])} назад`;
+    
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+    return `${day}.${month}.${year}`;
+}
+
+/**
+ * Обновить отображение выбранного друга в кнопке
+ */
+function updateSelectedFriendName() {
+    const nameEl = document.getElementById('selectedFriendName');
+    if (!nameEl) return;
+    
+    if (selectedFriendForHistory === 'all') {
+        nameEl.textContent = 'Все';
+        return;
+    }
+    
+    getFriendsList().then(result => {
+        if (result.success) {
+            const friend = result.data.find(f => f.id === selectedFriendForHistory);
+            if (friend) {
+                nameEl.textContent = friend.displayName || 'Пользователь';
+            } else {
+                nameEl.textContent = 'Все';
+                selectedFriendForHistory = 'all';
+            }
+        }
+    });
+}
+
+/**
+ * Открыть модалку выбора друга для истории
+ */
+function openFriendHistoryFilterModal() {
+    const oldModal = document.getElementById('friendHistoryFilterModal');
+    if (oldModal) oldModal.remove();
+    
+    tempSelectedFriendForHistory = selectedFriendForHistory;
+    
+    getFriendsList().then(result => {
+        const friends = result.success ? result.data : [];
+        
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'friendHistoryFilterModal';
+        overlay.innerHTML = `
+            <div class="modal-content" style="max-width: 400px;">
+                <div class="modal-title">Выберите друга</div>
+                <div class="scroll-wrapper" style="max-height: 300px; overflow-y: auto; margin-bottom: 0.5rem;">
+                    <!-- Блок "Все" -->
+                    <div class="friend-itemMOD" data-friend-id="all" onclick="selectFriendHistoryFilter('all')">
+                        <div class="friend-avatar" style="background: var(--accent-light); color: var(--accent);">
+                            <i class="fa-solid fa-users" style="font-size: 1rem;"></i>
+                        </div>
+                        <div class="friend-info">
+                            <strong>Все</strong>
+                            <span>Показать всех друзей</span>
+                        </div>
+                        <button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>
+                    </div>
+                    
+                    <!-- Реальные друзья -->
+                    ${friends.map(f => {
+                        const level = getCurrentLevel(f.totalXp || 0).id;
+                        const xp = Math.round(f.totalXp || 0);
+                        return `
+                            <div class="friend-itemMOD" data-friend-id="${f.id}" onclick="selectFriendHistoryFilter('${f.id}')">
+                                <div class="friend-avatar">${(f.displayName || 'П')[0].toUpperCase()}</div>
+                                <div class="friend-info">
+                                    <strong>${f.displayName || 'Пользователь'}</strong>
+                                    <span>Уровень ${level} · ${xp} XP</span>
+                                </div>
+                                <button class="item-action"><i class="fa-solid fa-chevron-right"></i></button>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-secondary" onclick="closeFriendHistoryFilterModal()" style="flex: 1;">Отмена</button>
+                    <button class="btn btn-primary" id="applyFriendFilterBtn" style="flex: 1;">Применить</button>
+                </div>
+            </div>
+        `;
+document.body.appendChild(overlay);
+overlay.style.display = 'flex';
+void overlay.offsetWidth;
+overlay.classList.add('modal-overlay-visible');
+        
+        document.getElementById('applyFriendFilterBtn').addEventListener('click', function() {
+            applyFriendHistoryFilter();
+        });
+    });
+}
+
+function closeFriendHistoryFilterModal() {
+    closeModal('friendHistoryFilterModal');
+}
+
+function selectFriendHistoryFilter(friendId) {
+    console.log('🔵 Клик по фильтру:', friendId);
+
+    tempSelectedFriendForHistory = friendId;
+
+    document.querySelectorAll('#friendHistoryFilterModal .friend-itemMOD').forEach(el => {
+        const isSelected = el.dataset.friendId === friendId;
+        el.classList.toggle('selected', isSelected);
+    });
+}
+
+function applyFriendHistoryFilter() {
+    selectedFriendForHistory = tempSelectedFriendForHistory;
+    closeFriendHistoryFilterModal();
+    updateSelectedFriendName();
+    renderFriendsHistory();
+}
+
+async function renderFriendsHistory() {
+    const container = document.getElementById('friendsHistoryContainer');
+    if (!container) return;
+    
+    if (!isFriendsHistoryVisible()) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <span class="empty-icon">🔒</span>
+                <h3 class="empty-title">История скрыта</h3>
+                <p class="empty-text">Вы скрыли историю друзей. Включите в настройках, чтобы видеть.</p>
+            </div>
+        `;
+        return;
+    }
+    
+    container.innerHTML = Skeleton.historyRowList(4);
+    
+    try {
+        // ★★★ ПОЛУЧАЕМ ТРЕНИРОВКИ ДРУЗЕЙ ★★★
+        const workoutsResult = await getFriendsWorkoutHistory();
+        // ★★★ ПОЛУЧАЕМ СОБЫТИЯ ДРУЗЕЙ (LVL И ДОСТИЖЕНИЯ) ★★★
+        const eventsResult = await getFriendsEvents();
+        
+        // Объединяем и сортируем
+        let allItems = [];
+        
+        // Добавляем тренировки
+        if (workoutsResult.success) {
+            let filteredData = workoutsResult.data;
+            if (selectedFriendForHistory !== 'all') {
+                filteredData = filteredData.filter(item => item.friendId === selectedFriendForHistory);
+            }
+            filteredData.forEach(w => {
+                allItems.push({
+                    type: 'workout',
+                    timestamp: new Date(w.date).getTime() / 1000,
+                    friendName: w.friendName,
+                    friendAvatar: w.friendAvatar,
+                    friendId: w.friendId,
+                    data: w
+                });
+            });
+        }
+        
+        // ★★★ ДОБАВЛЯЕМ СОБЫТИЯ (LVL И ДОСТИЖЕНИЯ) ★★★
+        if (eventsResult.success) {
+            let filteredData = eventsResult.data;
+            if (selectedFriendForHistory !== 'all') {
+                filteredData = filteredData.filter(item => item.friendId === selectedFriendForHistory);
+            }
+            filteredData.forEach(event => {
+                allItems.push({
+                    type: event.type,
+                    timestamp: event.timestamp?.seconds || 0,
+                    friendName: event.friendName,
+                    friendAvatar: event.friendAvatar,
+                    friendId: event.friendId,
+                    data: event.data
+                });
+            });
+        }
+        
+        // Сортируем по времени (новые сверху)
+        allItems.sort((a, b) => b.timestamp - a.timestamp);
+        
+        if (allItems.length === 0) {
+            const friendName = selectedFriendForHistory !== 'all' 
+                ? 'у этого друга' 
+                : 'у ваших друзей';
+            container.innerHTML = `
+                <div class="empty-state">
+                    <span class="empty-icon">📋</span>
+                    <h3 class="empty-title">Нет активности</h3>
+                    <p class="empty-text">Пока нет активности ${friendName}.</p>
+                </div>
+            `;
+            return;
+        }
+        
+        // ★★★ РЕНДЕРИМ ★★★
+        let html = '';
+        let currentFriend = '';
+        
+allItems.forEach(item => {
+    // Если это новый пользователь — закрываем старую группу и открываем новую
+    if (currentFriend !== item.friendId) {
+        // Закрываем предыдущую группу и контейнер событий
+        if (currentFriend !== '') {
+            html += `</div></div>`; // Закрываем events и group
+        }
+        
+        currentFriend = item.friendId;
+        
+        // Открываем новую группу
+        html += `<div class="friend-history-group">`;
+        
+        // Аватар + имя
+        html += `
+            <div class="friend-history-header">
+                <div class="friend-history-avatar">${item.friendAvatar}</div>
+                <span class="friend-history-name">${item.friendName}</span>
+            </div>
+        `;
+        
+        // Открываем контейнер событий
+        html += `<div class="friend-history-events">`;
+    }
+    
+    const relativeDate = formatRelativeDateFromTimestamp(item.timestamp);
+    
+    if (item.type === 'workout') {
+        // Тренировка
+        const w = item.data;
+        const totalEx = w.exercises?.length || 0;
+        const completedEx = w.exercises?.filter(e => e.completed === true).length || 0;
+        const xpEarned = w.xpEarned || 0;
+        const minutes = Math.floor((w.durationSeconds || 0) / 60);
+        
+        html += `
+            <div class="history-item">
+                <div class="history-item-header">
+                    <strong class="history-item-title" style="font-size:0.75rem;">${w.title || 'Тренировка'}</strong>
+                    <span class="history-item-date" style="font-size:0.65rem;">${relativeDate}</span>
+                </div>
+                <div class="history-item-details" style="font-size:0.65rem;">
+                    ${minutes} мин · ${completedEx}/${totalEx} ${declOfNum(totalEx, ['упражнение', 'упражнения', 'упражнений'])} · ${xpEarned.toFixed(1)} XP
+                </div>
+            </div>
+        `;
+    } else if (item.type === 'level_up') {
+        // Новый уровень
+        const level = item.data.level || '?';
+        const levelName = item.data.levelName || '';
+        html += `
+            <div class="history-item" style="border-left-color: var(--gold);">
+                <div class="history-item-header">
+                    <strong class="history-item-title" style="font-size:0.75rem;">Новый уровень</strong>
+                    <span class="history-item-date" style="font-size:0.65rem;">${relativeDate}</span>
+                </div>
+                <div class="history-item-details" style="font-size:0.65rem;">
+                    Достиг ${level} уровня - "${levelName}"
+                </div>
+            </div>
+        `;
+    } else if (item.type === 'achievement_unlocked') {
+        // Новое достижение
+        const achName = item.data.achievementName || 'Достижение';
+        html += `
+            <div class="history-item" style="border-left-color: var(--gold);">
+                <div class="history-item-header">
+                    <strong class="history-item-title" style="font-size:0.75rem;">Новое достижение</strong>
+                    <span class="history-item-date" style="font-size:0.65rem;">${relativeDate}</span>
+                </div>
+                <div class="history-item-details" style="font-size:0.65rem;">
+                    Получил достижение - "${achName}"
+                </div>
+            </div>
+        `;
+    }
+});
+
+// Закрываем последнюю группу после цикла
+if (currentFriend !== '') {
+    html += `</div></div>`; // Закрываем events и group
+}
+
+container.innerHTML = html;
+        
+        container.innerHTML = html;
+        
+    } catch (error) {
+        console.error('Ошибка рендера истории друзей:', error);
+        container.innerHTML = `<div style="text-align:center;color:#EF4444;padding:1rem;">Ошибка загрузки</div>`;
+    }
+}
+
+// Добавьте эту функцию для обновления истории после завершения тренировки
+function refreshFriendsHistory() {
+    const friendsTab = document.getElementById('profileTab-friends');
+    if (friendsTab && friendsTab.classList.contains('profile-tab-content-active')) {
+        renderFriendsHistory();
+    }
+}
+
+function formatRelativeDateFromTimestamp(timestamp) {
+    if (!timestamp) return 'недавно';
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const targetDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const diffDays = Math.floor((today - targetDate) / (1000 * 60 * 60 * 24));
+    
+    if (diffDays === 0) return 'сегодня';
+    if (diffDays === 1) return 'вчера';
+    if (diffDays <= 7) return `${diffDays} ${declOfNum(diffDays, ['день', 'дня', 'дней'])} назад`;
+    
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    return `${day}.${month}`;
+}
+
+// =================== ИСТОРИЯ ДРУЗЕЙ - ВИДИМОСТЬ ===================
+
+const FRIENDS_HISTORY_VISIBILITY_KEY = 'friendsHistoryVisible';
+
+/**
+ * Получить настройку видимости истории друзей
+ */
+function isFriendsHistoryVisible() {
+    return localStorage.getItem(FRIENDS_HISTORY_VISIBILITY_KEY) !== 'false';
+}
+
+function updateFriendsHistoryStatusUI(visible) {
+    const statusEl = document.getElementById('friendsHistoryStatus');
+    if (statusEl) {
+        statusEl.textContent = visible ? 'Показана' : 'Скрыта';
+    }
+    
+    // ★★★ УБИРАЕМ СКРЫТИЕ БЛОКА ★★★
+    // Блок всегда виден, но внутри будет показываться разный контент
+    const block = document.getElementById('friends-history-block');
+    if (block) {
+        block.style.display = 'block'; // Всегда показываем блок
+    }
+    
+    // Обновляем контент внутри блока
+    renderFriendsHistory();
+}
+
+function toggleFriendsHistoryVisibility() {
+    const current = isFriendsHistoryVisible();
+    const newState = !current;
+
+    showConfirmModal(
+        newState ? 'Показать историю друзей?' : 'Скрыть историю друзей?',
+        newState
+            ? 'Ваша история тренировок снова будет видна друзьям, и вы будете видеть их историю.'
+            : 'Ваша история тренировок будет скрыта от друзей, и вы не будете видеть их историю.',
+        async function() {
+            localStorage.setItem(FRIENDS_HISTORY_VISIBILITY_KEY, String(newState));
+            updateFriendsHistoryStatusUI(newState);
+            
+            const user = await getFirebaseUser();
+            if (user) {
+                await updateUserProfile(user.uid, { 
+                    friendsHistoryVisible: newState 
+                });
+            }
+            
+            // ★★★ ПРОСТО ОБНОВЛЯЕМ КОНТЕНТ, БЛОК НЕ СКРЫВАЕТСЯ ★★★
+            renderFriendsHistory();
+            
+            showToast(`✅ История друзей ${newState ? 'показана' : 'скрыта'}`);
+        },
+        newState ? 'Показать' : 'Скрыть'
+    );
+}
+
+/**
+ * Загрузить настройку видимости из профиля пользователя
+ */
+async function loadFriendsHistoryVisibilityFromProfile() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    try {
+        const profileResult = await getUserProfile(user.uid);
+        if (profileResult.success && profileResult.data.friendsHistoryVisible !== undefined) {
+            const visible = profileResult.data.friendsHistoryVisible;
+            localStorage.setItem(FRIENDS_HISTORY_VISIBILITY_KEY, String(visible));
+            updateFriendsHistoryStatusUI(visible);
+        } else {
+            // Если в профиле нет настройки, используем localStorage
+            const visible = isFriendsHistoryVisible();
+            updateFriendsHistoryStatusUI(visible);
+        }
+    } catch (error) {
+        console.warn('Ошибка загрузки настройки видимости истории:', error);
+        const visible = isFriendsHistoryVisible();
+        updateFriendsHistoryStatusUI(visible);
+    }
+}
+
+// =================== СОХРАНЕНИЕ СОБЫТИЙ В FIRESTORE ===================
+
+/**
+ * Сохранить событие в Firestore
+ */
+async function saveUserEvent(userId, type, data) {
+    try {
+        await firebase.firestore().collection('userEvents').add({
+            userId: userId,
+            type: type,
+            data: data,
+            timestamp: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`✅ Событие "${type}" сохранено`);
+    } catch (error) {
+        console.error('❌ Ошибка сохранения события:', error);
+    }
+}
+
+/**
+ * Получить события пользователя (для его друзей) - БЕЗ СОРТИРОВКИ
+ */
+async function getUserEvents(userId, limit = 30) {
+    try {
+        // ★★★ УБИРАЕМ orderBy, ЧТОБЫ НЕ ТРЕБОВАТЬ ИНДЕКС ★★★
+        const snapshot = await firebase.firestore()
+            .collection('userEvents')
+            .where('userId', '==', userId)
+            .limit(limit)
+            .get();
+        
+        const events = [];
+        snapshot.forEach(doc => {
+            events.push({ id: doc.id, ...doc.data() });
+        });
+        
+        // ★★★ СОРТИРУЕМ ВРУЧНУЮ ★★★
+        events.sort((a, b) => {
+            const timeA = a.timestamp?.seconds || 0;
+            const timeB = b.timestamp?.seconds || 0;
+            return timeB - timeA;
+        });
+        
+        return { success: true, data: events };
+    } catch (error) {
+        console.error('❌ Ошибка получения событий:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Получить события для всех друзей
+ */
+async function getFriendsEvents() {
+    const user = await getFirebaseUser();
+    if (!user) return { success: false, error: 'Не авторизован' };
+    
+    try {
+        const friendsResult = await getFriendsList();
+        if (!friendsResult.success || friendsResult.data.length === 0) {
+            return { success: true, data: [] };
+        }
+        
+        const allEvents = [];
+        const friendIds = friendsResult.data.map(f => f.id);
+        
+        // Получаем события для всех друзей
+        for (const friendId of friendIds) {
+            const result = await getUserEvents(friendId);
+            if (result.success) {
+                // Добавляем имя друга к каждому событию
+                const friend = friendsResult.data.find(f => f.id === friendId);
+                const friendName = friend?.displayName || 'Пользователь';
+                const friendAvatar = (friendName)[0].toUpperCase();
+                
+                result.data.forEach(event => {
+                    allEvents.push({
+                        ...event,
+                        friendName: friendName,
+                        friendAvatar: friendAvatar,
+                        friendId: friendId
+                    });
+                });
+            }
+        }
+        
+        // Сортируем по времени
+        allEvents.sort((a, b) => {
+            const timeA = a.timestamp?.seconds || 0;
+            const timeB = b.timestamp?.seconds || 0;
+            return timeB - timeA;
+        });
+        
+        return { success: true, data: allEvents };
+        
+    } catch (error) {
+        console.error('❌ Ошибка получения событий друзей:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// =================== СТРАНИЦА: ВЫБОР ИНВЕНТАРЯ ===================
+
+// Массив выбранного инвентаря
+let selectedInventory = [];
+
+/**
+ * Обновить текст с выбранным инвентарём
+ */
+function updateInventoryText() {
+    const textEl = document.getElementById('selectedInventoryText');
+    if (!textEl) return;
+    
+    if (selectedInventory.length === 0) {
+        textEl.textContent = 'Ничего из перечисленного';
+        return;
+    }
+    
+const names = {
+    'dumbbells': 'Гантели',
+    'mat': 'Коврик',
+    'pullup': 'Турник'
+};
+    
+    const selectedNames = selectedInventory.map(item => names[item] || item);
+    textEl.textContent = selectedNames.join(' · ');
+}
+
+/**
+ * Показать страницу выбора инвентаря (для вызова через консоль)
+ */
+function showInventoryPage() {
+    // Сбрасываем выбор
+    selectedInventory = [];
+    document.querySelectorAll('.inventory-btn').forEach(btn => {
+        btn.classList.remove('selected');
+    });
+    updateInventoryText();
+    
+    // Показываем страницу
+    document.querySelectorAll('.page').forEach(p => {
+        p.classList.remove('page-active');
+        p.style.display = 'none';
+    });
+    
+    const target = document.getElementById('page-inventory');
+    if (target) {
+        target.classList.add('page-active');
+        target.style.display = 'block';
+    }
+    
+    // Скрываем нижнюю навигацию
+    document.getElementById('bottomNav').style.display = 'none';
+}
+
+// ★★★ ОБРАБОТЧИК ФОРМЫ ИНВЕНТАРЯ (ФИНАЛ РЕГИСТРАЦИИ) ★★★
+document.getElementById('inventoryForm')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+
+    localStorage.setItem('userInventory', JSON.stringify(selectedInventory));
+
+    // ★ Сохраняем инвентарь и пол в Firestore
+    try {
+        const user = await getFirebaseUser();
+        if (user) {
+            const genderFromStorage = localStorage.getItem('pendingGender') || 'male';
+
+            await updateUserProfile(user.uid, {
+                inventory: selectedInventory,
+                gender: genderFromStorage
+            });
+
+            localStorage.removeItem('pendingGender');
+            console.log('✅ Инвентарь и пол сохранены в Firestore');
+        }
+    } catch (error) {
+        console.warn('Ошибка сохранения инвентаря и пола:', error);
+    }
+
+    // ★ Сбрасываем флаг регистрации
+    isRegistering = false;
+
+    // ★ Ставим флаг, что нужен туториал — ДО enterApp()
+    window._tutorialNeeded = true;
+
+    // ★★★ СРАЗУ ВХОДИМ В ПРИЛОЖЕНИЕ ★★★
+    console.log('🎓 Регистрация завершена, входим в приложение');
+    enterApp();
+});
+
+// ★★★ ВОССТАНАВЛИВАЕМ СОХРАНЁННЫЙ ВЫБОР ПРИ ЗАГРУЗКЕ ★★★
+function loadInventorySelection() {
+    const saved = localStorage.getItem('userInventory');
+    if (saved) {
+        try {
+            const items = JSON.parse(saved);
+            if (Array.isArray(items)) {
+                selectedInventory = items;
+                // Отмечаем кнопки
+                document.querySelectorAll('.inventory-btn').forEach(btn => {
+                    if (items.includes(btn.dataset.inventory)) {
+                        btn.classList.add('selected');
+                    }
+                });
+                updateInventoryText();
+            }
+        } catch (e) {}
+    }
+}
+
+// Загружаем сохранённый выбор при инициализации
+document.addEventListener('DOMContentLoaded', function() {
+    loadInventorySelection();
+});
+
+// =================== УПРАВЛЕНИЕ ЯЗЫКОМ ===================
+
+// Ключ для localStorage
+const LANGUAGE_KEY = 'appLanguage';
+
+// ★★★ ПЕРЕМЕННАЯ ДЛЯ ХРАНЕНИЯ ВРЕМЕННОГО ВЫБОРА ★★★
+let tempLanguage = null;
+
+/**
+ * Получить текущий язык приложения
+ */
+function getLanguage() {
+    return localStorage.getItem(LANGUAGE_KEY) || 'ru';
+}
+
+/**
+ * Обновить UI статуса языка в настройках
+ */
+function updateLanguageUI() {
+    const lang = getLanguage();
+    const statusEl = document.getElementById('languageStatus');
+    if (statusEl) {
+        statusEl.textContent = lang === 'ru' ? 'Русский' : 'English';
+    }
+}
+
+/**
+ * Открыть модальное окно выбора языка
+ */
+function toggleLanguageModal() {
+    const currentLang = getLanguage();
+    
+    // ★★★ СОХРАНЯЕМ ТЕКУЩИЙ ЯЗЫК КАК ВРЕМЕННЫЙ ★★★
+    tempLanguage = currentLang;
+    
+document.querySelectorAll('#languageModal .language-option').forEach(el => {
+    el.classList.remove('language-option-active');
+});
+
+const selectedOption = document.querySelector(`#languageModal .language-option[data-language="${currentLang}"]`);
+if (selectedOption) {
+    selectedOption.classList.add('language-option-active');
+}
+    
+    openModal('languageModal');
+}
+
+/**
+ * Выбрать язык (временно, без сохранения)
+ */
+function selectLanguage(lang) {
+    // ★★★ СОХРАНЯЕМ ТОЛЬКО В ВРЕМЕННУЮ ПЕРЕМЕННУЮ ★★★
+    tempLanguage = lang;
+    
+document.querySelectorAll('#languageModal .language-option').forEach(el => {
+    el.classList.remove('language-option-active');
+});
+
+const selectedOption = document.querySelector(`#languageModal .language-option[data-language="${lang}"]`);
+if (selectedOption) {
+    selectedOption.classList.add('language-option-active');
+}
+}
+
+/**
+ * ★★★ ПРИМЕНИТЬ ЯЗЫК (ПРИ НАЖАТИИ "ГОТОВО") ★★★
+ * Логика смены языка не реализована — только сохранение выбора.
+ */
+function applyLanguage() {
+    if (tempLanguage) {
+        const currentLang = getLanguage();
+        
+        // ★★★ ПРОВЕРЯЕМ, ИЗМЕНИЛСЯ ЛИ ЯЗЫК ★★★
+        if (tempLanguage !== currentLang) {
+            // Язык реально изменился - сохраняем
+            localStorage.setItem(LANGUAGE_KEY, tempLanguage);
+            
+            // ★★★ ОБНОВЛЯЕМ UI ★★★
+            updateLanguageUI();
+            
+            // ★★★ ПОКАЗЫВАЕМ ТОСТ ТОЛЬКО ПРИ РЕАЛЬНОМ ИЗМЕНЕНИИ ★★★
+            const langName = tempLanguage === 'ru' ? 'Русский' : 'English';
+            showToast(`✅ Язык изменён на ${langName}`);
+            console.log(`✅ Применён язык: ${langName}`);
+        } else {
+            console.log('ℹ️ Язык не изменился');
+        }
+    }
+    
+    // Закрываем модалку
+    closeModal('languageModal');
+}
+
+// =================== МОДАЛКА: УПРАЖНЕНИЯ ПО ГРУППАМ МЫШЦ ===================
+
+// ★★★ КОНФИГУРАЦИЯ ТЕКСТОВ ДЛЯ РАЗНЫХ БЛОКОВ ★★★
+const MUSCLE_MODAL_CONFIG = {
+    muscles: {
+        title: 'Нагрузка по группам мышц',
+        text1: 'Этот блок показывает, сколько упражнений вы выполнили на каждую группу мышц за всё время тренировок.',
+        text2: 'Это помогает понять, какие мышцы вы прорабатываете чаще, а какие - отстают и требуют больше внимания.',
+        text3: 'Если какая-то группа мышц заполнена слабо - добавьте в свою программу больше упражнений на неё. Так вы сделаете тренировки сбалансированными и будете развиваться равномерно.'
+    },
+    categories: {
+        title: 'Тренировки по категориям',
+        text1: 'Этот блок показывает, сколько тренировок вы выполнили по каждой категории за всё время.',
+        text2: 'Это помогает понять, какие типы тренировок вы выбираете чаще, а какие - остаются без внимания.',
+        text3: 'Если какая-то категория заполнена слабо - попробуйте добавить её в свой план. Разнообразие тренировок помогает развиваться гармонично и не застревать на одном месте.'
+    },
+    weeklyLoad: {
+        title: 'Нагрузочный индекс',
+        text1: 'Этот блок показывает, насколько интенсивно вы тренировались каждую неделю месяца.',
+        text2: 'Индекс рассчитывается из количества подходов, повторений и общей длительности тренировок. Чем выше индекс - тем больше нагрузки получил ваш организм.',
+        text3: 'Следите за тем, чтобы нагрузка росла постепенно. Резкие скачки могут привести к перетренированности, а слишком низкий индекс - к застою в прогрессе.'
+    },
+    // ★★★ НОВЫЙ БЛОК: РЕДКОСТЬ ДОСТИЖЕНИЙ ★★★
+    communityAchievements: {
+        title: 'Редкость достижений',
+        text1: 'Этот блок показывает, у какого процента пользователей SportApp есть каждое достижение.',
+        text2: 'Золотая иконка - достижение есть у вас. Серая иконка - вы его ещё не получили. Процент рядом показывает, насколько достижение распространено среди всех пользователей.',
+        text3: 'Чем меньше процент - тем реже встречается достижение. Соберите все пять и станьте одним из немногих, кто прошёл весь путь!'
+    },
+        // ★★★ НОВЫЕ ★★★
+    personalStats: {
+        title: 'Личная статистика',
+        text1: 'Здесь собрана основная статистика по всем вашим тренировкам за всё время.',
+        text2: '«Минут» - суммарное время всех тренировок. «Тренировок» - общее количество завершённых тренировок. «Упражнений» - сколько упражнений вы выполнили суммарно.',
+        text3: 'Данные обновляются автоматически после каждой завершённой тренировки. Зарядка и одиночные упражнения в счётчик тренировок не входят, но упражнения из них учитываются.'
+    },
+
+    worldStats: {
+        title: 'Мировая статистика',
+        text1: 'Здесь собрана статистика всего сообщества SportApp - всех пользователей приложения.',
+        text2: '«Минут» - суммарное время всех тренировок сообщества. «Тренировок» - сколько раз пользователи тренировались. «Упражнений» - общее количество выполненных упражнений.',
+        text3: 'Данные обновляются в реальном времени по мере того, как пользователи завершают тренировки. Это помогает увидеть, насколько активно тренируется сообщество в целом.'
+    }
+};
+
+/**
+ * Открыть модалку с описанием блока статистики
+ * @param {string} type - тип блока: 'muscles' или 'categories'
+ */
+function openMuscleGroupsModal(type = 'muscles') {
+    // ★ Не открываем при редактировании страницы статистики
+    if (window.statsEditor && window.statsEditor.isEditing) return;
+
+    const config = MUSCLE_MODAL_CONFIG[type];
+    if (!config) {
+        console.warn('⚠️ Нет конфига для модалки:', type);
+        return;
+    }
+
+    const titleEl = document.getElementById('muscleModalTitle');
+    const text1El = document.getElementById('muscleModalText1');
+    const text2El = document.getElementById('muscleModalText2');
+    const text3El = document.getElementById('muscleModalText3');
+
+    if (titleEl) titleEl.textContent = config.title;
+    if (text1El) text1El.textContent = config.text1;
+    if (text2El) text2El.textContent = config.text2;
+    if (text3El) text3El.textContent = config.text3;
+
+    openModal('muscleGroupsModal');
+}
+
+// Экспорт в window для вызова из консоли и из HTML
+window.openMuscleGroupsModal = openMuscleGroupsModal;
+
+
+// Нормализуем названия: разные варианты формулировки одного упражнения
+// должны находить одну и ту же запись каталога.
+function normalizeExerciseLookupName(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/ё/g, 'е')
+        .replace(/[«»"'’]/g, '')
+        .replace(/[^a-zа-я0-9]+/gi, ' ')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .replace(/\bс коленей\b/g, 'от коленей')
+        .replace(/\bна коленях\b/g, 'от коленей');
+}
+
+function getSessionExerciseDescription(exercise) {
+    if (!exercise) return '';
+
+    // В личных и готовых тренировках описание может уже быть в объекте.
+    const directDescription = [
+        exercise.description,
+        exercise.instructions,
+        exercise.technique,
+        exercise.howTo
+    ].find(value =>
+        typeof value === 'string' &&
+        value.trim() &&
+        value.trim() !== 'Описание пока не добавлено'
+    );
+
+    if (directDescription) return directDescription.trim();
+
+    if (typeof EXERCISES_CATALOG === 'undefined' || !Array.isArray(EXERCISES_CATALOG)) {
+        console.error('[SportApp] EXERCISES_CATALOG недоступен');
+        return '';
+    }
+
+    const targetName = normalizeExerciseLookupName(exercise.name);
+    const catalog = EXERCISES_CATALOG;
+
+    // 1. Точное совпадение после нормализации названия.
+    let match = catalog.find(item =>
+        normalizeExerciseLookupName(item?.name) === targetName &&
+        typeof item?.description === 'string' && item.description.trim()
+    );
+
+    // 2. Если название в тренировке отличается, пробуем совпадение по изображениям.
+    if (!match && Array.isArray(exercise.images) && exercise.images.length) {
+        const imageSet = new Set(exercise.images.filter(Boolean));
+        match = catalog.find(item =>
+            Array.isArray(item?.images) &&
+            item.images.some(src => imageSet.has(src)) &&
+            typeof item?.description === 'string' && item.description.trim()
+        );
+    }
+
+    // 3. Последний безопасный вариант - сравнить значимые слова названия.
+    if (!match && targetName) {
+        const targetWords = targetName.split(' ').filter(word => word.length > 2);
+        let bestScore = 0;
+        for (const item of catalog) {
+            if (typeof item?.description !== 'string' || !item.description.trim()) continue;
+            const candidate = normalizeExerciseLookupName(item.name);
+            const words = candidate.split(' ').filter(word => word.length > 2);
+            const common = targetWords.filter(word => words.includes(word)).length;
+            const score = common / Math.max(targetWords.length, words.length, 1);
+            if (score > bestScore) {
+                bestScore = score;
+                match = item;
+            }
+        }
+        if (bestScore < 0.6) match = null;
+    }
+
+    return typeof match?.description === 'string' ? match.description.trim() : '';
+}
+
+function getExerciseForMusclesHint() {
+    if (!Array.isArray(sessionExercises)) return null;
+
+    // Во время отдыха индекс ещё указывает на только что выполненное упражнение.
+    // Поэтому описание должно относиться к следующему элементу массива.
+    const index = isResting ? sessionCurrentIndex + 1 : sessionCurrentIndex;
+    return sessionExercises[index] || null;
+}
+
+function openMusclesHintModal() {
+    const modal = document.getElementById('musclesHintModal');
+    const content = modal?.querySelector('.modal-content');
+    if (!modal || !content) {
+        console.error('[SportApp] Не найдена модалка musclesHintModal');
+        return;
+    }
+
+    const exercise = getExerciseForMusclesHint();
+    const exerciseName = exercise?.name || (isResting ? 'Следующее упражнение' : 'Упражнение');
+    const description = getSessionExerciseDescription(exercise) || 'Описание пока не добавлено';
+
+    content.innerHTML = `
+        <div class="modal-title">Информация</div>
+        <div class="muscles-hint-image">
+            <img src="images/muscles-hint.png" alt="Цвета мышц">
+        </div>
+        <div class="modal-title" style="margin-top: 1rem;" id="musclesHintCurrentName"></div>
+        <div class="modal-text" style="text-align: left; line-height: 1.5;" id="musclesHintCurrentDescription"></div>
+        <button class="btn btn-primary" onclick="closeModal('musclesHintModal')">Понятно</button>
+    `;
+
+    content.querySelector('#musclesHintCurrentName').textContent = exerciseName;
+    content.querySelector('#musclesHintCurrentDescription').textContent = description;
+
+    localStorage.setItem('musclesHintSeen', 'true');
+    document.querySelectorAll('.session-muscles-hint').forEach(btn => btn.classList.add('compact'));
+
+    window.openModal('musclesHintModal');
+}
+window.openMusclesHintModal = openMusclesHintModal;
+
+function updateMusclesHintState() {
+    const seen = localStorage.getItem('musclesHintSeen') === 'true';
+
+    document.querySelectorAll('.session-muscles-hint').forEach(btn => {
+        btn.classList.toggle('compact', seen);
+    });
+}
+
+window.updateMusclesHintState = updateMusclesHintState;
+
+
+
+// =================== ИНВЕНТАРЬ (МОДАЛКА В НАСТРОЙКАХ) ===================
+
+/**
+ * Открыть модалку "Инвентарь" в настройках
+ */
+function openInventoryModal() {
+    // ★★★ СИНХРОНИЗИРУЕМ СОСТОЯНИЕ КНОПОК С ТЕКУЩИМ ВЫБОРОМ ★★★
+    document.querySelectorAll('#inventoryModal .inventory-btn').forEach(btn => {
+        const inventory = btn.dataset.inventory;
+        if (selectedInventory.includes(inventory)) {
+            btn.classList.add('selected');
+        } else {
+            btn.classList.remove('selected');
+        }
+    });
+
+    openModal('inventoryModal');
+}
+
+
+/**
+ * Сохранить выбор инвентаря из модалки
+ */
+async function saveInventoryFromModal() {
+    // ★★★ СОХРАНЯЕМ В localStorage ★★★
+    localStorage.setItem('userInventory', JSON.stringify(selectedInventory));
+    console.log('📦 Сохранённый инвентарь:', selectedInventory);
+
+    // ★★★ ОБНОВЛЯЕМ СТАТУС В НАСТРОЙКАХ ★★★
+    updateInventoryStatus();
+
+    // ★★★ СОХРАНЯЕМ В FIRESTORE ★★★
+    try {
+        const user = await getFirebaseUser();
+        if (user) {
+            await updateUserProfile(user.uid, {
+                inventory: selectedInventory
+            });
+            console.log('✅ Инвентарь сохранён в Firestore');
+        }
+    } catch (error) {
+        console.warn('⚠️ Не удалось сохранить инвентарь в Firestore:', error);
+    }
+
+    showToast('✅ Инвентарь сохранён');
+    closeModal('inventoryModal');
+}
+
+function updateInventoryStatus() {
+    const statusEl = document.getElementById('inventoryStatus');
+    if (!statusEl) return;
+
+    if (selectedInventory.length === 0) {
+        statusEl.textContent = 'Ничего из перечисленного';
+        return;
+    }
+
+    const names = {
+        'dumbbells': 'Гантели',
+        'mat': 'Коврик',
+        'pullup': 'Турник'
+    };
+
+    const selectedNames = selectedInventory.map(item => names[item] || item);
+    statusEl.textContent = selectedNames.join(' · ');
+}
+
+/**
+ * ★★★ ОБНОВЛЯЕМ ФУНКЦИЮ toggleInventory ★★★
+ * Она уже есть, но добавим обновление текста в модалке
+ */
+function toggleInventory(btn) {
+    const inventory = btn.dataset.inventory;
+    const index = selectedInventory.indexOf(inventory);
+
+    if (index !== -1) {
+        // Убираем выделение
+        selectedInventory.splice(index, 1);
+        btn.classList.remove('selected');
+    } else {
+        // Добавляем выделение
+        selectedInventory.push(inventory);
+        btn.classList.add('selected');
+    }
+
+    // ★★★ ОБНОВЛЯЕМ ОБА ТЕКСТА: И В РЕГИСТРАЦИИ, И В МОДАЛКЕ ★★★
+    updateInventoryText();          // для шага 5 регистрации
+}
+
+/**
+ * ★★★ ЗАГРУЗКА ИНВЕНТАРЯ ИЗ FIRESTORE ПРИ СТАРТЕ ★★★
+ * Вызывается при загрузке профиля
+ */
+async function loadInventoryFromProfile() {
+    try {
+        const user = await getFirebaseUser();
+        if (!user) return;
+
+        const profileResult = await getUserProfile(user.uid);
+        if (profileResult.success && profileResult.data.inventory) {
+            // ★★★ ВОССТАНАВЛИВАЕМ ВЫБОР ИЗ ПРОФИЛЯ ★★★
+            selectedInventory = profileResult.data.inventory;
+
+            // Сохраняем в localStorage для быстрого доступа
+            localStorage.setItem('userInventory', JSON.stringify(selectedInventory));
+
+            // Обновляем UI
+            document.querySelectorAll('.inventory-btn').forEach(btn => {
+                if (selectedInventory.includes(btn.dataset.inventory)) {
+                    btn.classList.add('selected');
+                } else {
+                    btn.classList.remove('selected');
+                }
+            });
+
+            updateInventoryText();
+            updateInventoryStatus();
+        }
+    } catch (error) {
+        console.warn('⚠️ Ошибка загрузки инвентаря из профиля:', error);
+    }
+}
+
+// Экспорт в window
+window.openInventoryModal = openInventoryModal;
+window.saveInventoryFromModal = saveInventoryFromModal;
+
+// =================== ГЛОБАЛЬНЫЕ АГРЕГАТЫ ===================
+async function loadGlobalStats(force = false) {
+    const container = document.getElementById('globalStatsContainer');
+    if (!container) return;
+
+    const ids = ['globalTotalMinutes', 'globalTotalWorkouts', 'globalTotalExercises'];
+
+    let data = Cache.getAggregate('globalStats');
+
+    if (!data || force) {
+        try {
+            const snapshot = await firebase.firestore().collection('workouts').get();
+
+            let totalWorkouts = 0, totalMinutes = 0, totalExercises = 0;
+
+            snapshot.forEach(doc => {
+                const d = doc.data();
+                const icon = d.icon || null;
+                if (!icon || icon === 'charging' || d.isSingle === true) return;
+
+                totalWorkouts++;
+                totalMinutes += Math.floor((d.durationSeconds || 0) / 60);
+                if (Array.isArray(d.exercises)) {
+                    totalExercises += d.exercises.filter(e => e.completed === true).length;
+                }
+            });
+
+            data = { totalWorkouts, totalMinutes, totalExercises };
+            Cache.setAggregate('globalStats', data);
+        } catch (error) {
+            console.error('loadGlobalStats:', error);
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = '—';
+            });
+            return;
+        }
+    }
+
+    const minutesEl = document.getElementById('globalTotalMinutes');
+    const workoutsEl = document.getElementById('globalTotalWorkouts');
+    const exercisesEl = document.getElementById('globalTotalExercises');
+    if (minutesEl) minutesEl.textContent = formatBigNumber(data.totalMinutes);
+    if (workoutsEl) workoutsEl.textContent = formatBigNumber(data.totalWorkouts);
+    if (exercisesEl) exercisesEl.textContent = formatBigNumber(data.totalExercises);
+}
+
+// Форматирование больших чисел: 1234 → 1 234, 12345 → 12,3K, 1234567 → 1,2M
+function formatBigNumber(num) {
+    if (num === undefined || num === null || isNaN(num)) return '0';
+    const n = Number(num);
+    if (n < 1000) return String(n);
+    if (n < 10000) return n.toLocaleString('ru-RU');
+    if (n < 1000000) return (n / 1000).toFixed(1).replace('.', ',') + 'K';
+    return (n / 1000000).toFixed(1).replace('.', ',') + 'M';
+}
+
+// =================== ПЛАШКА: ПОЛЬЗОВАТЕЛИ ===================
+async function loadGlobalUsersCount(force = false) {
+    const el = document.getElementById('globalTotalUsers');
+    if (!el) return;
+
+    let total = Cache.getAggregate('usersCount');
+
+    if (!total || force) {
+        try {
+            const snap = await firebase.firestore().collection('users').get();
+            total = snap.size;
+            Cache.setAggregate('usersCount', total);
+        } catch (e) {
+            el.textContent = '—';
+            return;
+        }
+    }
+
+    el.textContent = formatBigNumber(total);
+    const labelEl = document.getElementById('globalTotalUsersLabel');
+    if (labelEl) labelEl.textContent = declOfNum(total, ['человек', 'человека', 'человек']);
+}
+
+async function updatePremiumCounter(force = false) {
+    try {
+        const user = await getFirebaseUser();
+        if (!user) return 0;
+
+        let premiumCount = Cache.getAggregate('premiumCount');
+
+        if (premiumCount === null || premiumCount === undefined || force) {
+            const snapshot = await firebase.firestore().collection('users').get();
+            premiumCount = 0;
+            snapshot.forEach(doc => {
+                if (doc.data().premium === true) premiumCount++;
+            });
+            Cache.setAggregate('premiumCount', premiumCount);
+        }
+
+        document.querySelectorAll('#premiumCounter').forEach(el => {
+            el.textContent = `PREMIUM оформили: ${premiumCount} ${declOfNum(premiumCount, ['пользователь', 'пользователя', 'пользователей'])}`;
+        });
+
+        return premiumCount;
+    } catch (error) {
+        console.error('updatePremiumCounter:', error);
+        return 0;
+    }
+}
+
+// =================== ПЛАШКА: ОНЛАЙН СЕЙЧАС ===================
+async function loadOnlineUsersCount() {
+    const el = document.getElementById('globalOnlineUsers');
+    const labelEl = document.getElementById('globalOnlineUsersLabel');
+    if (!el) return;
+    el.textContent = '...';
+
+    try {
+        const user = await getFirebaseUser();
+        if (!user) { el.textContent = '—'; return; }
+
+        const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
+
+        const snapshot = await firebase.firestore()
+            .collection('users')
+            .where('lastSeenAt', '>=', fifteenMinAgo)
+            .get();
+
+        const count = snapshot.size;
+        el.textContent = formatBigNumber(count);
+
+        if (labelEl) {
+            labelEl.textContent = declOfNum(count, ['человек', 'человека', 'человек']);
+        }
+
+        console.log(`🟢 Онлайн сейчас: ${count}`);
+
+    } catch (error) {
+        console.error('❌ Ошибка загрузки онлайн-пользователей:', error);
+        el.textContent = '—';
+    }
+}
+
+// =================== ДОСТИЖЕНИЯ СООБЩЕСТВА ===================
+async function loadCommunityAchievements() {
+    const container = document.getElementById('communityAchievementsContainer');
+    if (!container) return;
+
+    const achievementsMap = {
+        friendly: 'communityPercFriendly',
+        marathoner: 'communityPercMarathoner',
+        fitnessMaster: 'communityPercFitnessMaster',
+        unstoppable: 'communityPercUnstoppable',
+        ironEndurance: 'communityPercIronEndurance',
+        masterOfStyles: 'communityPercMasterOfStyles',
+        vip: 'communityPercVip'
+    };
+
+    try {
+        const user = await getFirebaseUser();
+        if (!user) return;
+
+        // ★ КЭШ на 10 минут
+        let data = Cache.getAggregate('communityAchievements');
+
+        if (!data) {
+            const snapshot = await firebase.firestore().collection('users').get();
+            const totalUsers = snapshot.size;
+
+            const counts = {
+                friendly: 0, marathoner: 0, fitnessMaster: 0,
+                unstoppable: 0, ironEndurance: 0, masterOfStyles: 0, vip: 0
+            };
+            let myAchievements = {};
+
+            snapshot.forEach(doc => {
+                const d = doc.data();
+                const ach = d.achievements || {};
+                if (doc.id === user.uid) myAchievements = ach;
+                for (const key in counts) {
+                    if (ach[key] === true) counts[key]++;
+                }
+            });
+
+            data = { counts, totalUsers, myAchievements };
+            Cache.setAggregate('communityAchievements', data);
+        }
+
+        // ★ Рендер
+        for (const [key, count] of Object.entries(data.counts)) {
+            const percent = data.totalUsers > 0
+                ? Math.round((count / data.totalUsers) * 100)
+                : 0;
+            const el = document.getElementById(achievementsMap[key]);
+            if (el) el.textContent = percent + '%';
+
+            const tile = el?.closest('.community-achievement-tile');
+            const icon = tile?.querySelector('.community-achievement-icon');
+            if (icon) {
+                const hasIt = data.myAchievements[key] === true;
+                icon.classList.toggle('unlocked', hasIt);
+                icon.classList.toggle('locked', !hasIt);
+            }
+        }
+
+    } catch (error) {
+        console.error('❌ loadCommunityAchievements:', error);
+    }
+}
+
+
+// =================== ОЧЕРЕДЬ МОДАЛОК ===================
+const modalQueue = [];
+let isModalQueueProcessing = false;
+
+/**
+ * Добавить модалку в очередь.
+ */
+function enqueueModal(item) {
+    modalQueue.push(item);
+    processModalQueue();
+}
+
+/**
+ * Обработать очередь: показывает модалки по одной.
+ */
+function processModalQueue() {
+    if (isModalQueueProcessing) return;
+    if (modalQueue.length === 0) return;
+
+    // Не показываем модалки во время тренировки
+    const sessionPage = document.getElementById('page-training-session');
+    const taskSessionPage = document.getElementById('page-task-session');
+    const isTraining = (sessionPage && sessionPage.classList.contains('page-active'))
+                    || (taskSessionPage && taskSessionPage.classList.contains('page-active'));
+    if (isTraining) {
+        console.log('⏸️ Тренировка активна — очередь модалок ждёт');
+        return;
+    }
+
+    // Не показываем на экранах hero/loading/login/register
+    const forbidden = ['page-hero', 'page-loading', 'page-login', 'page-login-password',
+                       'page-register', 'page-register-email', 'page-register-password',
+                       'page-register-verify', 'page-inventory'];
+    for (const id of forbidden) {
+        const el = document.getElementById(id);
+        if (el && el.classList.contains('page-active')) {
+            console.log('⏸️ Экран ' + id + ' — очередь модалок ждёт');
+            return;
+        }
+    }
+
+    const openModalOverlay = document.querySelector(
+        '.modal-overlay[style*="display: flex"], .modal-overlay[style*="display:flex"]'
+    );
+    if (openModalOverlay) {
+        console.log('⏸️ Другая модалка открыта — очередь ждёт');
+        return;
+    }
+
+    isModalQueueProcessing = true;
+    const item = modalQueue.shift();
+
+    if (item.type === 'premium') {
+        const finishPremiumOffer = () => {
+            isModalQueueProcessing = false;
+            processModalQueue();
+        };
+
+        window.openPremiumSlideshow()
+            .then(() => {
+                const timeout = setTimeout(finishPremiumOffer, 30000);
+
+                watchModalClose('premiumModal', () => {
+                    clearTimeout(timeout);
+                    finishPremiumOffer();
+                });
+            })
+            .catch(error => {
+                console.error('Ошибка показа предложения PREMIUM:', error);
+                finishPremiumOffer();
+            });
+    } else {
+        console.warn('⚠️ Неизвестный тип модалки в очереди:', item.type);
+        isModalQueueProcessing = false;
+    }
+}
+
+/**
+ * Следит за закрытием модалки.
+ */
+function watchModalClose(modalId, callback) {
+    const modal = document.getElementById(modalId);
+    if (!modal) {
+        callback();
+        return;
+    }
+
+    // Если модалка уже закрыта — сразу вызываем
+    if (modal.style.display === 'none' || modal.style.display === '') {
+        callback();
+        return;
+    }
+
+    const observer = new MutationObserver(() => {
+        if (modal.style.display === 'none' || modal.style.display === '') {
+            observer.disconnect();
+            callback();
+        }
+    });
+    observer.observe(modal, { attributes: true, attributeFilter: ['style'] });
+}
+
+
+// =================== ГТО: ВОЗРАСТНЫЕ КАТЕГОРИИ (15 СТУПЕНЕЙ) ===================
+const GTO_AGE_MAP = {
+    '1 СТУПЕНЬ':  '6 - 7 лет',
+    '2 СТУПЕНЬ':  '8 - 9 лет',
+    '3 СТУПЕНЬ':  '10 - 11 лет',
+    '4 СТУПЕНЬ':  '12 - 13 лет',
+    '5 СТУПЕНЬ':  '14 - 15 лет',
+    '6 СТУПЕНЬ':  '16 - 17 лет',
+    '7 СТУПЕНЬ':  '18 - 19 лет',
+    '8 СТУПЕНЬ':  '20 - 24 года',
+    '9 СТУПЕНЬ':  '25 - 29 лет',
+    '10 СТУПЕНЬ': '30 - 34 года',
+    '11 СТУПЕНЬ': '35 - 39 лет',
+    '12 СТУПЕНЬ': '40 - 44 года',
+    '13 СТУПЕНЬ': '45 - 49 лет',
+    '14 СТУПЕНЬ': '50 - 54 года',
+    '15 СТУПЕНЬ': '55 - 59 лет'
+};
+
+// =================== СЕРИЯ ТРЕНИРОВОК ===================
+async function calculateStreak(userId) {
+    const cacheKey = `streak_${userId}`;
+    const cached = Cache.getAggregate(cacheKey);
+    if (cached !== null && cached !== undefined) return cached;
+
+    try {
+        const result = await getUserWorkoutsFromFirestore(userId); // ← уже кэш
+        if (!result.success) return 0;
+
+        const workouts = result.data.filter(w => {
+            const icon = getWorkoutIcon(w);
+            return icon && icon !== 'charging' && !w.isSingle;
+        });
+
+        if (workouts.length === 0) {
+            Cache.setAggregate(cacheKey, 0);
+            return 0;
+        }
+
+        const dates = new Set();
+        workouts.forEach(w => {
+            const d = new Date(w.date);
+            const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            dates.add(key);
+        });
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        let streak = 0;
+        let current = new Date(today);
+
+        const todayKey = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}-${String(current.getDate()).padStart(2, '0')}`;
+        if (!dates.has(todayKey)) current.setDate(current.getDate() - 1);
+
+        while (true) {
+            const key = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}-${String(current.getDate()).padStart(2, '0')}`;
+            if (dates.has(key)) { streak++; current.setDate(current.getDate() - 1); }
+            else break;
+        }
+
+        Cache.setAggregate(cacheKey, streak);
+        return streak;
+
+    } catch (error) {
+        console.error('❌ Ошибка подсчёта серии:', error);
+        return 0;
+    }
+}
+
+// =================== ОТОБРАЖЕНИЕ СЕРИИ ===================
+async function updateProfileStreak() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    const streakEl = document.getElementById('profileStreakValue');
+    const streakContainer = document.getElementById('profileStreak');
+    if (!streakEl || !streakContainer) return;
+    
+    const streak = await calculateStreak(user.uid);
+    streakEl.textContent = streak;
+
+    // ★★★ СОХРАНЯЕМ В FIRESTORE ★★★
+    const profileResult = await getUserProfile(user.uid);
+    if (profileResult.success && profileResult.data.streakDays !== streak) {
+        await updateUserProfile(user.uid, { streakDays: streak });
+    }
+        
+    // Если 0 — приглушаем цвет
+    if (streak === 0) {
+        streakContainer.classList.add('zero');
+    } else {
+        streakContainer.classList.remove('zero');
+    }
+    
+    console.log(`🔥 Серия: ${streak} дней`);
+    return streak;
+}
+
+// =================== МОДАЛКА: СЕРИЯ ТРЕНИРОВОК ===================
+async function openStreakModal() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+    
+    const streak = await calculateStreak(user.uid);
+    
+    // ★★★ ЗАПОЛНЯЕМ ЗНАЧЕНИЕ ★★★
+    const valueEl = document.getElementById('streakModalValue');
+    if (valueEl) valueEl.textContent = streak;
+    
+    // ★★★ МЕНЯЕМ ТЕКСТ В ЗАВИСИМОСТИ ОТ СЕРИИ ★★★
+    const text1 = document.getElementById('streakModalText1');
+    const text2 = document.getElementById('streakModalText2');
+    const text3 = document.getElementById('streakModalText3');
+    
+if (streak === 0) {
+    if (text1) text1.textContent = 'У вас пока нет активной серии.';
+    if (text2) text2.textContent = 'Выполните тренировку сегодня, чтобы начать серию.';
+    if (text3) text3.textContent = 'Тренируйтесь каждый день — серия будет расти.';
+} else if (streak < 21) {
+    if (text1) text1.textContent = `Вы тренируетесь ${streak} ${declOfNum(streak, ['день', 'дня', 'дней'])} подряд!`;
+    if (text2) text2.textContent = 'До достижения "21 день подряд" осталось совсем немного.';
+    if (text3) text3.textContent = 'Не пропускайте дни, чтобы не сбросить серию.';
+} else {
+    if (text1) text1.textContent = `Невероятно! ${streak} ${declOfNum(streak, ['день', 'дня', 'дней'])} подряд!`;
+    if (text2) text2.textContent = 'Вы настоящий чемпион дисциплины.';
+    if (text3) text3.textContent = 'Так держать! Продолжайте тренироваться каждый день.';
+}
+    
+    openModal('streakModal');
+}
+
+// ★★★ СКЛОНЕНИЕ СЛОВ ★★★
+function declOfNum(n, titles) {
+    const cases = [2, 0, 1, 1, 1, 2];
+    return titles[(n % 100 > 4 && n % 100 < 20) ? 2 : cases[(n % 10 < 5) ? n % 10 : 5]];
+}
+
+window.openStreakModal = openStreakModal;
+
+// =================== ИНВЕНТАРЬ ДЛЯ ФИЛЬТРАЦИИ УПРАЖНЕНИЙ ===================
+function getUserInventoryFromStorage() {
+    try {
+        const saved = localStorage.getItem('userInventory');
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed)) {
+                // ★★★ УБИРАЕМ УСТАРЕВШИЕ ЗНАЧЕНИЯ ★★★
+                const cleaned = parsed.filter(item => item !== 'barbell');
+                if (cleaned.length !== parsed.length) {
+                    localStorage.setItem('userInventory', JSON.stringify(cleaned));
+                    console.log('🧹 Удалён устаревший инвентарь "barbell"');
+                }
+                return cleaned;
+            }
+        }
+    } catch (e) {
+        console.warn('Ошибка получения инвентаря:', e);
+    }
+    return [];
+}
+
+/**
+ * Фильтровать упражнения по инвентарю
+ * Если у упражнения нет поля equipment — показываем всегда
+ * Если есть — показываем только если инвентарь подходит
+ */
+function filterExercisesByInventory(userInventory) {
+    if (typeof EXERCISES_CATALOG === 'undefined') return [];
+    
+    return EXERCISES_CATALOG.filter(ex => {
+        // Если у упражнения нет requirements — показываем всегда
+        if (!ex.equipment || !Array.isArray(ex.equipment) || ex.equipment.length === 0) {
+            return true;
+        }
+        
+        // Если у пользователя нет инвентаря — показываем только bodyweight
+        if (userInventory.length === 0) {
+            return ex.equipment.includes('bodyweight') || ex.equipment.includes('none');
+        }
+        
+        // Показываем, если хотя бы одно требование есть у пользователя
+        return ex.equipment.some(item => 
+            userInventory.includes(item) || item === 'bodyweight' || item === 'none'
+        );
+    });
+}
+
+// =================== КАРУСЕЛЬ И ПРОГРАММЫ ===================
+function shuffleArray(arr) {
+    const result = [...arr];
+    for (let i = result.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result;
+}
+
+// ─── Готовые программы ───
+const PRESET_PROGRAMS = [
+    {
+        id: 'abs_30',
+        title: 'Стальной пресс',
+        subtitle: 'за месяц',
+        icon: 'press',
+        image: 'images/program-abs-30.png',
+        emoji: '🔥',
+        category: 'Пресс',
+        durationDays: 30,
+        workoutsPerWeek: 4,
+        difficulty: 'Средний',
+        isPremium: true,
+        description: '4 тренировки в неделю: верхний и нижний пресс, косые мышцы, стабилизация корпуса, короткое кардио и растяжка.'
+    },
+    {
+        id: 'cut_60',
+        title: 'Сушка тела',
+        subtitle: 'за 2 месяца',
+        icon: 'cardio',
+        image: 'images/program-cut-60.png',
+        emoji: '💧',
+        category: 'Кардио',
+        durationDays: 60,
+        workoutsPerWeek: 5,
+        difficulty: 'Средний',
+        isPremium: true,
+        description: '5 тренировок в неделю: кардио, силовые на всё тело и интервальные комплексы. Снижение жировой массы зависит также от питания и общего энергобаланса.'
+    },
+    {
+        id: 'back_30',
+        title: 'Широкая спина',
+        subtitle: 'за месяц',
+        icon: 'back',
+        image: 'images/program-back-30.png',
+        emoji: '🦾',
+        category: 'Спина',
+        durationDays: 30,
+        workoutsPerWeek: 3,
+        difficulty: 'Средний',
+        isPremium: true,
+        description: '3 тренировки в неделю на широчайшие, середину спины и задние дельты. Тяги с гантелями, упражнения для разгибателей спины и корпуса. Нужны гантели и коврик.'
+    },
+    {
+        id: 'arms_30',
+        title: 'Мощные руки',
+        subtitle: 'за месяц',
+        icon: 'bodybuilding',
+        image: 'images/program-arms-30.png',
+        emoji: '💪',
+        category: 'Руки',
+        durationDays: 30,
+        workoutsPerWeek: 3,
+        difficulty: 'Средний',
+        isPremium: true,
+        description: '3 тренировки в неделю на бицепс, трицепс и плечевой пояс. Постепенно усложняются сгибания, разгибания и жимовые движения. Нужны гантели.'
+    },
+
+    // ★★★ НОВЫЕ ПРОГРАММЫ ★★★
+{
+    id: 'fullbody_90',
+    title: 'Всё тело',
+    subtitle: 'за 3 месяца',
+    icon: 'WholeBody',
+    image: 'images/program-fullbody-90.png',
+    emoji: '🏋️',
+    category: 'Всё тело',
+    durationDays: 90,
+    workoutsPerWeek: 3,
+    weekPattern: [true, false, true, false, true, false, false],
+    difficulty: 'Средний',
+    isPremium: false,
+    description: 'Бесплатная программа на 90 дней - три тренировки в неделю. Грудь, плечи и трицепс; ноги, ягодицы и пресс; спина, бицепс и корпус. Каждую неделю постепенно растут повторения и время удержания, каждые две недели добавляются подходы. Нужны гантели и коврик.'
+},
+    {
+        id: 'legs_30',
+        title: 'Сильные ноги',
+        subtitle: 'за месяц',
+        icon: 'legs',
+        image: 'images/program-legs-30.png',
+        emoji: '🦵',
+        category: 'Ноги',
+        durationDays: 30,
+        workoutsPerWeek: 3,
+        difficulty: 'Средний',
+        isPremium: true,
+        description: '3 тренировки в неделю на квадрицепсы, заднюю поверхность бедра, ягодицы и икры. Приседания, выпады, тяговые движения и ягодичные упражнения. Нужны гантели и коврик.'
+    },
+    {
+        id: 'endurance_60',
+        title: 'Выносливость',
+        subtitle: 'за 2 месяца',
+        icon: 'cardio',
+        image: 'images/program-endurance-60.png',
+        emoji: '🏃',
+        category: 'Кардио',
+        durationDays: 60,
+        workoutsPerWeek: 4,
+        difficulty: 'Средний',
+        isPremium: true,
+        description: '4 тренировки в неделю: аэробная работа, силовая выносливость, интервалы и восстановительное кардио. Нагрузка постепенно растёт, а восстановительные дни остаются в расписании.'
+    },
+    {
+        id: 'flexibility_60',
+        title: 'Гибкое тело',
+        subtitle: 'за 2 месяца',
+        icon: 'stretching',
+        image: 'images/program-flexibility-60.png',
+        emoji: '🧘',
+        category: 'Гибкость',
+        durationDays: 60,
+        workoutsPerWeek: 5,
+        difficulty: 'Низкий',
+        isPremium: true,
+        description: '5 занятий в неделю на мобильность спины, плеч, бёдер и тазобедренных суставов. Начинаем с мягкой амплитуды и постепенно увеличиваем время удержания. Без резкой боли и форсирования шпагата.'
+    }
+];
+
+// ─── Расписание: массив паттернов ───
+const WEEK_PATTERNS = {
+    2: ['workout', 'rest', 'rest', 'workout', 'rest', 'rest', 'rest'],
+    3: ['workout', 'rest', 'workout', 'rest', 'workout', 'rest', 'rest'],
+    4: ['workout', 'rest', 'workout', 'rest', 'workout', 'rest', 'workout'],
+    5: ['workout', 'workout', 'rest', 'workout', 'workout', 'workout', 'rest'],
+    6: ['workout', 'workout', 'workout', 'rest', 'workout', 'workout', 'workout']
+};
+
+
+// =================== КОНСТРУКТОР ЛИЧНЫХ ПРОГРАММ ===================
+
+let _newProgramDayAssignments = {};
+
+
+function getProgramWorkoutOptions() {
+    const options = [];
+    const seen = new Set();
+
+    // Готовые тренировки
+    if (typeof exercisesData !== 'undefined') {
+        Object.entries(exercisesData).forEach(([parent, categories]) => {
+            if (!categories || typeof categories !== 'object') return;
+
+            Object.entries(categories).forEach(([category, categoryData]) => {
+                if (!categoryData || typeof categoryData !== 'object') return;
+
+                // Определяем Premium по реальной структуре каталога
+                const isPremiumCategory =
+                    parent === 'PREMIUM' ||
+                    parent === 'Особые' ||
+                    categoryData._premium === true;
+
+                // Без Premium скрываем все премиум-категории
+                if (isPremiumCategory && !hasPremium()) return;
+
+                Object.keys(categoryData).forEach(level => {
+                    if (!/^\d+\s*LVL$/i.test(level)) return;
+
+                    const key = `${parent}|${category}|${level}`;
+                    if (seen.has(key)) return;
+
+                    const exercises = getExercisesForEdit(
+                        category,
+                        level,
+                        false
+                    );
+
+                    if (!Array.isArray(exercises) || !exercises.length) return;
+
+                    seen.add(key);
+
+                    options.push({
+                        source: 'ready',
+                        parent,
+                        category,
+                        level,
+                        title: `${category} - ${level}`,
+                        count: exercises.length
+                    });
+                });
+            });
+        });
+    }
+
+    // Личные тренировки
+    if (typeof getMyWorkouts === 'function') {
+        getMyWorkouts().forEach(workout => {
+            if (!workout._id || !workout.exercises?.length) return;
+
+            options.push({
+                source: 'personal',
+                workoutId: workout._id,
+                title: workout.title,
+                icon: workout.icon || null,
+                count: workout.exercises.length
+            });
+        });
+    }
+
+    return options;
+}
+
+function renderProgramScheduleBuilder() {
+    const container = document.getElementById('newProgramSchedule');
+    const duration = parseInt(
+        document.getElementById('newProgramDuration').value
+    );
+
+    if (!container || !duration) return;
+
+    const options = getProgramWorkoutOptions();
+
+    // Удаляем назначения дней, которые вышли за новую длительность
+    Object.keys(_newProgramDayAssignments).forEach(day => {
+        if (Number(day) > duration) {
+            delete _newProgramDayAssignments[day];
+        }
+    });
+
+    const readyOptions = options.filter(o => o.source === 'ready');
+    const personalOptions = options.filter(o => o.source === 'personal');
+
+    const optionsHtml = `
+        <option value="">Отдых</option>
+
+        ${readyOptions.length ? `
+            <optgroup label="Готовые тренировки">
+                ${readyOptions.map(o => {
+                    const value = encodeURIComponent(JSON.stringify(o));
+                    return `
+                        <option value="${value}">
+                            ${o.title} · ${o.count} упр.
+                        </option>`;
+                }).join('')}
+            </optgroup>
+        ` : ''}
+
+        ${personalOptions.length ? `
+            <optgroup label="Мои тренировки">
+                ${personalOptions.map(o => {
+                    const value = encodeURIComponent(JSON.stringify(o));
+                    return `
+                        <option value="${value}">
+                            ${o.title} · ${o.count} упр.
+                        </option>`;
+                }).join('')}
+            </optgroup>
+        ` : ''}
+    `;
+
+    container.innerHTML = Array.from(
+        { length: duration },
+        (_, index) => {
+            const day = index + 1;
+            const assignment = _newProgramDayAssignments[day];
+
+            let selectedValue = '';
+
+            if (assignment) {
+                selectedValue = encodeURIComponent(
+                    JSON.stringify(assignment)
+                );
+            }
+
+            return `
+                <div class="program-builder-day">
+                    <div class="program-builder-day-number">
+                        <span>День ${day}</span>
+                        <span class="program-builder-day-status"
+                              id="programDayStatus${day}">
+                            ${assignment ? 'Тренировка' : 'Отдых'}
+                        </span>
+                    </div>
+
+                    <select
+                        class="form-select program-builder-select"
+                        data-program-day="${day}"
+                        onchange="updateProgramDayAssignment(this)">
+                        ${optionsHtml}
+                    </select>
+                </div>
+            `;
+        }
+    ).join('');
+
+    // Восстанавливаем выбранные тренировки
+container.querySelectorAll('[data-program-day]').forEach(select => {
+    const day = Number(select.dataset.programDay);
+    const assignment = _newProgramDayAssignments[day];
+
+    if (!assignment) return;
+
+    const options = Array.from(select.options);
+
+    const matchingOption = options.find(option => {
+        if (!option.value) return false;
+
+        try {
+            const item = JSON.parse(decodeURIComponent(option.value));
+
+            if (item.source !== assignment.source) return false;
+
+            if (item.source === 'ready') {
+                return (
+                    item.category === assignment.category &&
+                    item.level === assignment.level
+                );
+            }
+
+            if (item.source === 'personal') {
+                return item.workoutId === assignment.workoutId;
+            }
+
+            return false;
+        } catch {
+            return false;
+        }
+    });
+
+    if (matchingOption) {
+        select.value = matchingOption.value;
+    }
+});
+
+    updateProgramDaysCount();
+}
+
+function updateProgramDayAssignment(select) {
+    const day = Number(select.dataset.programDay);
+
+    if (!select.value) {
+        delete _newProgramDayAssignments[day];
+    } else {
+        try {
+            _newProgramDayAssignments[day] = JSON.parse(
+                decodeURIComponent(select.value)
+            );
+        } catch (error) {
+            console.error('Ошибка выбора тренировки:', error);
+            delete _newProgramDayAssignments[day];
+        }
+    }
+
+    const status = document.getElementById(`programDayStatus${day}`);
+
+    if (status) {
+        status.textContent = select.value ? 'Тренировка' : 'Отдых';
+    }
+
+    updateProgramDaysCount();
+}
+
+function updateProgramDaysCount() {
+    const count = Object.keys(_newProgramDayAssignments).length;
+
+    const counter = document.getElementById('newProgramDaysCount');
+    const summary = document.getElementById('newProgramSummary');
+
+    if (counter) counter.textContent = count;
+
+    if (summary) {
+        summary.textContent = count
+            ? `Назначено тренировок: ${count}`
+            : 'Выбери хотя бы одну тренировку';
+    }
+}
+
+
+function generateProgramSchedule(
+    durationDays,
+    workoutsPerWeek,
+    category,
+    weekPattern = null,
+    programId = null
+) {
+    const customProgram = typeof getMyPrograms === 'function'
+        ? getMyPrograms().find(p => p.id === programId)
+        : null;
+
+    // Личные программы с индивидуальным расписанием
+    if (customProgram && Array.isArray(customProgram.dayWorkouts)) {
+        return Array.from({ length: durationDays }, (_, index) => {
+            const assignment = customProgram.dayWorkouts[index] || null;
+
+            return {
+                day: index + 1,
+                type: assignment ? 'workout' : 'rest',
+                category: assignment
+                    ? (assignment.category || category)
+                    : null,
+                workout: assignment
+            };
+        });
+    }
+
+    // Существующая логика готовых программ
+    const programPlan = typeof PROGRAM_WORKOUTS !== 'undefined'
+        ? PROGRAM_WORKOUTS[programId]
+        : null;
+
+    let pattern;
+
+    if (Array.isArray(weekPattern) && weekPattern.length === 7) {
+        pattern = weekPattern.map(isTraining =>
+            isTraining ? 'workout' : 'rest'
+        );
+    } else if (
+        Array.isArray(programPlan?.weekPattern) &&
+        programPlan.weekPattern.length === 7
+    ) {
+        pattern = programPlan.weekPattern.map(isTraining =>
+            isTraining ? 'workout' : 'rest'
+        );
+    } else {
+        pattern = WEEK_PATTERNS[workoutsPerWeek] || WEEK_PATTERNS[3];
+    }
+
+    const schedule = [];
+
+    for (let i = 0; i < durationDays; i++) {
+        const type = pattern[i % 7];
+        const dayPlan = programPlan?.weeklyPlan?.[i % 7] || null;
+
+        schedule.push({
+            day: i + 1,
+            type,
+            category: type === 'workout'
+                ? (dayPlan?.label || category)
+                : null
+        });
+    }
+
+    return schedule;
+}
+
+
+// ─── Карусель: карточки программ ───
+// ★ Эмодзи для карточек карусели (отдельно от PNG-иконок списка)
+const PROGRAM_EMOJI = {
+    'abs_30':  '🔥',
+    'cut_60':  '💧',
+    'back_30': '🦾',
+    'arms_30': '💪'
+};
+
+const CAROUSEL_CARDS = PRESET_PROGRAMS.map(p => ({
+    isProgram: true,
+    programId: p.id,
+    emoji: PROGRAM_EMOJI[p.id] || '🏆',
+    image: p.image || null,          // ★ ДОБАВИТЬ
+    title: p.title,
+    desc: p.subtitle,
+    action: () => {
+        window.navigateTo('programs');
+    }
+}));
+// ─── Инициализация и рендер ───
+let _carouselShuffleCache = null;
+let _carouselTimer = null;
+let _lastCarouselRenderTs = 0;
+let _carouselDataHash = '';
+const CAROUSEL_COOLDOWN = 1000;
+
+function _carouselHash() {
+    return `programs_${hasPremium() ? '1' : '0'}`;
+}
+
+function refreshAutoCarousel() {
+    const hash = _carouselHash();
+    if (hash === _carouselDataHash) return;
+    _carouselDataHash = hash;
+
+    if (_carouselTimer) return;
+    const elapsed = Date.now() - _lastCarouselRenderTs;
+    const delay = Math.max(0, CAROUSEL_COOLDOWN - elapsed);
+
+    _carouselTimer = setTimeout(() => {
+        _carouselTimer = null;
+        _lastCarouselRenderTs = Date.now();
+        _renderCarouselTrack();
+    }, delay);
+}
+
+function initAutoCarousel() {
+    _carouselDataHash = '';
+    _carouselShuffleCache = null;
+    _renderCarouselTrack();
+}
+
+function _renderCarouselTrack() {
+    const track = document.getElementById('autoCarouselTrack');
+    if (!track) return;
+
+    if (!_carouselShuffleCache) {
+        _carouselShuffleCache = shuffleArray([...CAROUSEL_CARDS]);
+    }
+
+    const html = _carouselShuffleCache.map(card => {
+        const idx = CAROUSEL_CARDS.indexOf(card);
+
+        // ★ Фото с fallback на эмодзи при ошибке загрузки
+        const visual = card.image
+            ? `<img src="${card.image}"
+                    class="carousel-card-img"
+                    alt=""
+                    onerror="this.outerHTML='<div class=&quot;carousel-card-emoji&quot;>${card.emoji}</div>'">`
+            : `<div class="carousel-card-emoji">${card.emoji}</div>`;
+
+        return `
+            <div class="carousel-card" data-card-index="${idx}">
+                ${visual}
+                <div class="carousel-card-info">
+                    <div class="carousel-card-title">${card.title}</div>
+                    <div class="carousel-card-desc">${card.desc}</div>
+                </div>
+            </div>`;
+    }).join('');
+
+    track.style.animation = 'none';
+    track.innerHTML = html + html;
+    void track.offsetWidth;
+    track.style.animation = '';
+}
+
+// Обработчик кликов по карусели
+document.addEventListener('click', function(e) {
+    const card = e.target.closest('#autoCarouselTrack .carousel-card');
+    if (!card) return;
+
+    const index = parseInt(card.dataset.cardIndex, 10);
+    if (isNaN(index)) return;
+
+    const cardData = CAROUSEL_CARDS[index];
+    if (cardData && typeof cardData.action === 'function') {
+        cardData.action();
+    }
+});
+
+// =================== СТРАНИЦА ПРОГРАММ ===================
+function switchProgramTab(tab) {
+    document.querySelectorAll('#page-programs .tab-btn').forEach(btn => {
+        btn.classList.toggle('tab-btn-active', btn.dataset.programTab === tab);
+    });
+    document.querySelectorAll('#page-programs .program-tab-content').forEach(el => {
+        el.classList.remove('program-tab-content-active');
+    });
+    const target = document.getElementById('programs-' + tab);
+    if (target) target.classList.add('program-tab-content-active');
+
+    if (tab === 'my') renderMyPrograms();
+}
+window.switchProgramTab = switchProgramTab;
+
+function renderProgramsPage() {
+    renderReadyPrograms();
+    renderMyPrograms();
+    switchProgramTab('ready');
+}
+window.renderProgramsPage = renderProgramsPage;
+
+// ─── Готовые программы ───
+function renderReadyPrograms() {
+    const freeList    = document.getElementById('freeProgramsList');
+    const premiumList = document.getElementById('premiumProgramsList');
+
+    // Если старый контейнер ещё где-то используется — не падаем
+    if (!freeList && !premiumList) {
+        // fallback на старый одиночный контейнер, если HTML не обновлён
+        const legacy = document.getElementById('readyProgramsList');
+        if (legacy) {
+            legacy.innerHTML = PRESET_PROGRAMS.map(p => buildProgramCardHTML(p)).join('');
+        }
+        return;
+    }
+
+    const freeHtml    = [];
+    const premiumHtml = [];
+
+    PRESET_PROGRAMS.forEach(p => {
+        const card = buildProgramCardHTML(p);
+        if (p.isPremium) {
+            premiumHtml.push(card);
+        } else {
+            freeHtml.push(card);
+        }
+    });
+
+    if (freeList) {
+        freeList.innerHTML = freeHtml.join('');
+        // ★ Скрываем блок «Бесплатные», если бесплатных программ нет
+        const block = freeList.closest('.section-block');
+        if (block) block.style.display = freeHtml.length ? '' : 'none';
+    }
+
+    if (premiumList) {
+        premiumList.innerHTML = premiumHtml.join('');
+        // ★ Скрываем блок PREMIUM, если premium-программ нет
+        const block = premiumList.closest('.section-block');
+        if (block) block.style.display = premiumHtml.length ? '' : 'none';
+    }
+}
+
+// ─── Карточка готовой программы (вынесено, чтобы не дублировать разметку) ───
+function buildProgramCardHTML(p) {
+    const totalWorkouts = typeof getProgramWorkoutCount === 'function' ? getProgramWorkoutCount(p) : generateProgramSchedule(p.durationDays, p.workoutsPerWeek, p.category, p.weekPattern, p.id).filter(d => d.type === 'workout').length;
+
+    // ★ Фото с fallback на эмодзи
+    const photoHtml = p.image
+        ? `<img src="${p.image}"
+                alt=""
+                onerror="this.outerHTML='<div class=&quot;program-list-emoji-fallback&quot;>${p.emoji || '🏆'}</div>'">`
+        : `<div class="program-list-emoji-fallback">${p.emoji || '🏆'}</div>`;
+
+    return `
+        <div class="program-list-card" data-program-id="${p.id}" onclick="openProgramDetail('${p.id}')">
+            <div class="program-list-cover">
+                ${photoHtml}
+            </div>
+            <div class="program-list-info">
+                <div class="program-list-title">${p.title} ${p.subtitle}</div>
+                <div class="program-list-subtitle">${p.description}</div>
+                <div class="program-list-meta">
+                    <span><i class="fa-solid fa-calendar"></i> ${p.durationDays} дн.</span>
+                    <span><i class="fa-solid fa-dumbbell"></i> ${totalWorkouts} трен.</span>
+                    <span><i class="fa-solid fa-gauge-high"></i> ${p.difficulty}</span>
+                </div>
+            </div>
+            <div class="program-list-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+        </div>
+    `;
+}
+
+// ─── Мои программы ───
+const MY_PROGRAMS_KEY = 'sportapp_my_programs';
+
+function getMyPrograms() {
+    try {
+        return JSON.parse(localStorage.getItem(MY_PROGRAMS_KEY) || '[]');
+    } catch (e) { return []; }
+}
+
+function saveMyPrograms(list) {
+    localStorage.setItem(MY_PROGRAMS_KEY, JSON.stringify(list));
+    syncSaveToFirestore('myPrograms', list);
+}
+
+function renderMyPrograms() {
+    const container = document.getElementById('myProgramsList');
+    if (!container) return;
+
+    const list = getMyPrograms();
+    const isEditing = window.myProgramsEditor && window.myProgramsEditor.isEditing;
+
+    if (list.length === 0) {
+container.innerHTML = `
+    <div class="empty-state">
+        <span class="empty-icon">📋</span>
+        <h3 class="empty-title">Нет своих программ</h3>
+        <p class="empty-text">Создайте первую программу — и следите за прогрессом по дням!</p>
+    </div>`;
+        return;
+    }
+
+    container.innerHTML = list.map(p => {
+        const catIconMap = {
+            'Пресс': 'press', 'Ноги': 'legs', 'Ягодицы': 'woman',
+            'Руки': 'bodybuilding', 'Плечи': 'shoulder', 'Спина': 'back',
+            'Грудь': 'breast', 'Кардио': 'cardio', 'Гибкость': 'stretching',
+            'Всё тело': 'WholeBody'
+        };
+        const icon = p.icon || catIconMap[p.category] || 'WholeBody';
+
+        // ★ Прогресс программы
+        const schedule = generateProgramSchedule(p.durationDays, p.workoutsPerWeek, p.category, p.weekPattern, p.id);
+        const totalWorkouts = schedule.filter(d => d.type === 'workout').length;
+        const progress = getProgramProgress(p.id);
+        const completedCount = (progress.completedDays || []).length;
+        const percent = totalWorkouts > 0
+            ? Math.min(100, Math.round((completedCount / totalWorkouts) * 100))
+            : 0;
+
+        // В режиме редактирования — мусорка, иначе — стрелка
+        const actionHtml = isEditing
+            ? `<button class="item-action program-delete"
+                       onclick="event.stopPropagation(); deleteProgramFromList('${p.id}')">
+                   <i class="fa-regular fa-trash-can"></i>
+               </button>`
+            : `<div class="program-list-arrow"><i class="fa-solid fa-chevron-right"></i></div>`;
+
+        return `
+            <div class="program-list-card" data-program-id="${p.id}"
+                 onclick="handleProgramClick('${p.id}', event)">
+                <div class="program-list-icon">
+                    <img src="images/${icon}.png" alt="">
+                </div>
+                <div class="program-list-info">
+                    <div class="program-list-title">${p.title}</div>
+                    <div class="program-list-progress">
+                        <div class="program-list-progress-line">
+                            <div class="program-list-progress-fill" style="width:${percent}%"></div>
+                        </div>
+                        <span class="program-list-progress-text">${completedCount}/${totalWorkouts}</span>
+                    </div>
+                    <div class="program-list-meta">
+                        <span><i class="fa-solid fa-calendar"></i> ${p.durationDays} дн.</span>
+                        <span><i class="fa-solid fa-dumbbell"></i> ${totalWorkouts} трен.</span>
+                    </div>
+                </div>
+                ${actionHtml}
+            </div>
+        `;
+    }).join('');
+}
+
+function handleProgramClick(programId, event) {
+    if (event) event.stopPropagation();
+    // ★ В режиме редактирования клик по карточке ничего не делает
+    if (window.myProgramsEditor && window.myProgramsEditor.isEditing) return;
+    openProgramDetail(programId);
+}
+
+function deleteProgramFromList(programId) {
+    if (!window.myProgramsEditor?.isEditing) return;
+
+    const list = getMyPrograms();
+    const program = list.find(p => p.id === programId);
+
+    if (!program) return;
+
+    showConfirmModal(
+        'Удалить программу?',
+        'Это действие нельзя отменить.',
+        () => {
+            const updatedList = getMyPrograms()
+                .filter(p => p.id !== programId);
+
+            saveMyPrograms(updatedList);
+            renderMyPrograms();
+
+            showToast('🗑️ Программа удалена');
+        },
+        'Удалить'
+    );
+}
+
+// =================== ДЕТАЛИ ПРОГРАММЫ ===================
+
+function openProgramDetail(programId) {
+    const programsPage = document.getElementById('page-programs');
+    if (programsPage && programsPage.classList.contains('page-active')) {
+        const activeTab = document.querySelector('#page-programs .tab-btn-active');
+        if (activeTab && activeTab.dataset.programTab) _programDetailReturnTab = activeTab.dataset.programTab;
+    }
+    let program = PRESET_PROGRAMS.find(p => p.id === programId);
+    let isCustom = false;
+
+    if (!program) {
+        const mine = getMyPrograms();
+        program = mine.find(p => p.id === programId);
+        isCustom = true;
+    }
+
+    if (!program) {
+        showToast('❌ Программа не найдена');
+        return;
+    }
+
+    if (!isCustom && program.isPremium && !hasPremium()) {
+        openModal('premiumModal');
+        return;
+    }
+
+    _activeProgramDetailId = programId;
+
+    // ── Иконка и заголовок ──
+const catIconMap = {
+    'Пресс': 'press', 'Ноги': 'legs', 'Ягодицы': 'woman',
+    'Руки': 'bodybuilding', 'Плечи': 'shoulder', 'Спина': 'back',
+    'Грудь': 'breast', 'Кардио': 'cardio', 'Гибкость': 'stretching',
+    'Всё тело': 'WholeBody'
+};
+
+const iconEl = document.getElementById('programDetailIcon');
+const emoji = program.emoji || PROGRAM_EMOJI[program.id] || '🏆';
+
+if (isCustom) {
+    // ★ Своя программа — иконка категории (как в блоке), фон оставляем
+    const catIcon = program.icon || catIconMap[program.category] || 'WholeBody';
+    iconEl.style.background = '';        // сброс → возьмётся accent-light из CSS
+    iconEl.innerHTML = `<img src="images/${catIcon}.png" alt="" class="program-detail-cat-icon">`;
+
+} else if (program.image) {
+    // ★ Готовая программа с фото — фото, ФОН УБИРАЕМ
+    iconEl.style.background = 'transparent';
+    iconEl.innerHTML = `<img src="${program.image}"
+        alt=""
+        onerror="this.outerHTML='<div class=&quot;program-detail-emoji-fallback&quot;>${emoji}</div>'">`;
+
+} else {
+    // Fallback — эмодзи с фоном (на случай программы без фото)
+    iconEl.style.background = '';
+    iconEl.innerHTML = `<div class="program-detail-emoji-fallback">${emoji}</div>`;
+}
+    document.getElementById('programDetailTitle').textContent = program.title;
+
+    const subEl = document.getElementById('programDetailSubtitle');
+    const totalProgramWorkouts = typeof getProgramWorkoutCount === 'function'
+        ? getProgramWorkoutCount(program)
+        : generateProgramSchedule(program.durationDays, program.workoutsPerWeek, program.category, program.weekPattern, program.id).filter(d => d.type === 'workout').length;
+    subEl.innerHTML =
+        '<i class="fa-solid fa-calendar"></i> ' + program.durationDays + ' дн. · ' +
+        '<i class="fa-solid fa-dumbbell"></i> ' + totalProgramWorkouts + ' трен. · ' +
+        '<i class="fa-solid fa-gauge-high"></i> ' + (program.difficulty || 'Своя');
+
+    // ── Прогресс ──
+    const progress = getProgramProgress(programId);
+    const completedDays = progress.completedDays || [];
+
+const schedule = generateProgramSchedule(
+    program.durationDays,
+    program.workoutsPerWeek,
+    program.category,
+    program.weekPattern,
+    program.id
+);
+
+    // текущий день = первый невыполненный workout
+    let currentDayNumber = null;
+    for (const d of schedule) {
+        if (d.type === 'workout' && !completedDays.includes(d.day)) {
+            currentDayNumber = d.day;
+            break;
+        }
+    }
+
+    // ── Верхний прогресс-бар (рендерим отдельно над «Расписание») ──
+    const totalWorkouts = schedule.filter(d => d.type === 'workout').length;
+    const doneWorkouts = completedDays.length;
+    const overallPercent = totalWorkouts > 0
+        ? Math.round((doneWorkouts / totalWorkouts) * 100)
+        : 0;
+
+    document.getElementById('programProgressBar').innerHTML = `
+        <div class="program-progress-bar">
+            <div class="program-progress-line">
+                <div class="program-progress-line-fill" style="width:${overallPercent}%"></div>
+            </div>
+            <div class="program-progress-text">${doneWorkouts} / ${totalWorkouts}</div>
+        </div>
+    `;
+
+    // ── Timeline ──
+    let scheduleHtml = `<div class="program-timeline">`;
+
+    const weeks = {};
+    schedule.forEach(day => {
+        const weekNum = Math.ceil(day.day / 7);
+        if (!weeks[weekNum]) weeks[weekNum] = [];
+        weeks[weekNum].push(day);
+    });
+
+    Object.entries(weeks).forEach(([weekNum, days]) => {
+        scheduleHtml += `<div class="program-week-sep">Неделя ${weekNum}</div>`;
+
+        days.forEach(d => {
+            const isCompleted = completedDays.includes(d.day);
+            const isCurrent = d.day === currentDayNumber;
+
+if (d.type === 'rest') {
+    const previousWorkout = [...schedule]
+        .reverse()
+        .find(day => day.day < d.day && day.type === 'workout');
+
+    const lastCompletedWorkoutDay = Math.max(
+        0,
+        ...schedule
+            .filter(day => day.type === 'workout' && completedDays.includes(day.day))
+            .map(day => day.day)
+    );
+
+    const restCompleted = (
+        previousWorkout && completedDays.includes(previousWorkout.day)
+    ) || d.day < lastCompletedWorkoutDay;
+
+    scheduleHtml += `
+        <div class="program-tl-item rest ${restCompleted ? 'rest-completed' : ''}">
+            <div class="program-tl-dot"></div>
+            <div class="program-tl-body">
+                <span class="program-tl-day">День ${d.day}</span>
+                <span class="program-tl-sep-dot">·</span>
+                <span class="program-tl-cat italic">Отдых</span>
+            </div>
+        </div>`;
+    return;
+}
+
+if (isCompleted) {
+    scheduleHtml += `
+        <div class="program-tl-item done">
+            <div class="program-tl-dot"></div>
+            <div class="program-tl-body">
+                <span class="program-tl-day">День ${d.day}</span>
+                <span class="program-tl-sep-dot">-</span>
+                <span class="program-tl-cat">${d.category}</span>
+            </div>
+            <button class="program-tl-btn program-tl-stats-btn"
+                    onclick="openProgramWorkoutStats('${programId}', ${d.day}, event)">Статистика</button>
+        </div>`;
+    return;
+}
+
+            if (isCurrent) {
+                scheduleHtml += `
+                    <div class="program-tl-item current">
+                        <div class="program-tl-dot"></div>
+                        <div class="program-tl-body">
+                            <span class="program-tl-day">День ${d.day}</span>
+                            <span class="program-tl-sep-dot">-</span>
+                            <span class="program-tl-cat">${d.category}</span>
+                        </div>
+                        <button class="program-tl-btn"
+                                onclick="startProgramDay('${programId}', ${d.day}, '${d.category}', event)">
+                            Старт
+                        </button>
+                    </div>`;
+                return;
+            }
+
+            // будущие дни — просто текст, без кнопки
+            scheduleHtml += `
+                <div class="program-tl-item future">
+                    <div class="program-tl-dot"></div>
+                    <div class="program-tl-body">
+                        <span class="program-tl-day">День ${d.day}</span>
+                        <span class="program-tl-sep-dot">-</span>
+                        <span class="program-tl-cat">${d.category}</span>
+                    </div>
+                </div>`;
+        });
+    });
+
+    scheduleHtml += `</div>`;
+    document.getElementById('programDetailSchedule').innerHTML = scheduleHtml;
+
+    // ── Кнопка «Начать» ──
+    const startBtn = document.getElementById('programDetailStartBtn');
+    startBtn.innerHTML = '<i class="fa-solid fa-play"></i> Начать';
+    startBtn.className = 'btn btn-primary';
+    startBtn.onclick = () => startProgram(programId);
+
+    const editProgramBtn = document.getElementById('editCustomProgramBtn');
+
+if (editProgramBtn) {
+    editProgramBtn.style.display = isCustom ? 'flex' : 'none';
+}
+
+const shareProgramBtn = document.getElementById('shareProgramLinkBtn');
+
+if (shareProgramBtn) {
+    shareProgramBtn.style.display = isCustom ? 'flex' : 'none';
+    shareProgramBtn.onclick = () => shareProgramLink(programId);
+}
+
+    window.navigateTo('program-detail');
+}
+window.openProgramDetail = openProgramDetail;
+
+function backFromProgramDetail() {
+    const tab = _programDetailReturnTab === 'my' ? 'my' : 'ready';
+    window.navigateTo('programs');
+    switchProgramTab(tab);
+}
+window.backFromProgramDetail = backFromProgramDetail;
+
+
+function startProgramDay(programId, day, category, event) {
+    if (event) event.stopPropagation();
+
+    const presetProgram = PRESET_PROGRAMS.find(
+        item => item.id === programId
+    );
+
+    const customProgram = !presetProgram
+        ? getMyPrograms().find(item => item.id === programId)
+        : null;
+
+    const program = presetProgram || customProgram;
+
+    if (!program) {
+        showToast('⚠️ Программа не найдена');
+        return;
+    }
+
+    let workout = null;
+
+    // Личная программа
+    if (customProgram) {
+        const assignment = customProgram.dayWorkouts?.[day - 1];
+
+        if (!assignment) {
+            showToast('⚠️ День отдыха');
+            return;
+        }
+
+        if (assignment.source === 'personal') {
+            const personalWorkout = getWorkoutById(assignment.workoutId);
+
+            if (!personalWorkout || !personalWorkout.exercises?.length) {
+                showToast('⚠️ Тренировка не найдена');
+                return;
+            }
+
+            workout = {
+                title: personalWorkout.title,
+                icon: personalWorkout.icon || null,
+                exercises: JSON.parse(
+                    JSON.stringify(personalWorkout.exercises)
+                )
+            };
+        }
+
+        if (assignment.source === 'ready') {
+            const exercises = getExercisesForEdit(
+                assignment.category,
+                assignment.level,
+                false
+            );
+
+            if (!exercises.length) {
+                showToast('⚠️ Тренировка недоступна');
+                return;
+            }
+
+            workout = {
+                title: assignment.title,
+                icon: null,
+                exercises
+            };
+        }
+    } else {
+        // Готовая программа
+        if (typeof buildProgramWorkout !== 'function') {
+            showToast('⚠️ Не загружены тренировки');
+            return;
+        }
+
+        workout = buildProgramWorkout(programId, day);
+    }
+
+
+if (assignment.source === 'shared') {
+    if (
+        !Array.isArray(assignment.exercises) ||
+        !assignment.exercises.length
+    ) {
+        showToast('⚠️ Тренировка программы повреждена');
+        return;
+    }
+
+    workout = {
+        title: assignment.title || 'Тренировка',
+        icon: assignment.icon || null,
+        exercises: JSON.parse(
+            JSON.stringify(assignment.exercises)
+        )
+    };
+}
+
+
+    if (!workout || !Array.isArray(workout.exercises) ||
+        workout.exercises.length === 0) {
+        showToast('⚠️ Не удалось загрузить тренировку');
+        return;
+    }
+
+    _pendingProgramDay = {
+        programId,
+        day,
+        category: program.category
+    };
+
+    startTrainingSession(
+        workout.exercises,
+        workout.title,
+        program.category,
+        workout.icon
+    );
+}
+
+window.startProgramDay = startProgramDay;
+
+
+function startProgram(programId) {
+
+    let program = PRESET_PROGRAMS.find(p => p.id === programId);
+    if (!program) program = getMyPrograms().find(p => p.id === programId);
+    if (!program) return;
+
+    const progress = getProgramProgress(programId);
+    const completedDays = progress.completedDays || [];
+
+const schedule = generateProgramSchedule(
+    program.durationDays,
+    program.workoutsPerWeek,
+    program.category,
+    program.weekPattern,
+    program.id
+);
+
+    const nextDay = schedule.find(d =>
+        d.type === 'workout' && !completedDays.includes(d.day)
+    );
+
+    if (!nextDay) {
+        showToast('🎉 Программа уже завершена!');
+        return;
+    }
+
+    setTimeout(() => {
+        startProgramDay(programId, nextDay.day, nextDay.category);
+    }, 300);
+}
+window.startProgram = startProgram;
+
+
+ // ─── Статистика отдельной тренировки из программы ───
+function openProgramWorkoutStats(programId, day, event) {
+    if (event) event.stopPropagation();
+    const progress = getProgramProgress(programId);
+    const stats = progress.workoutStats && progress.workoutStats[day];
+    const modal = document.getElementById('programWorkoutStatsModal');
+    if (!modal) return;
+    document.getElementById('programWorkoutStatsTitle').textContent = stats?.title || ('Тренировка - день ' + day);
+    const dateText = stats?.date ? new Date(stats.date).toLocaleDateString('ru-RU') : 'Дата не сохранена';
+    const duration = stats?.durationSeconds || 0;
+    const completed = stats?.completedCount || 0;
+    const total = stats?.totalCount || 0;
+    const xp = Number(stats?.xpEarned || 0).toFixed(1);
+    document.getElementById('programWorkoutStatsBody').innerHTML = stats ? `
+        <div class="program-workout-stats-date">${dateText}</div>
+        <div class="finish-stats">
+            <div class="finish-stat-item"><span class="finish-stat-label">Время</span><span class="finish-stat-value">${formatTime(duration)}</span></div>
+            <div class="finish-stat-item"><span class="finish-stat-label">Упражнения</span><span class="finish-stat-value">${completed}/${total}</span></div>
+            <div class="finish-stat-item"><span class="finish-stat-label">Опыт</span><span class="finish-stat-value">+${xp}</span></div>
+        </div>
+        <div class="program-workout-exercise-list">
+            ${(stats.exercises || []).map((exercise, index) => `
+                <div class="program-workout-exercise-row">
+                    <span class="program-workout-exercise-number">${index + 1}</span>
+                    <span class="program-workout-exercise-name">${exercise.name || 'Упражнение'}</span>
+                    <span class="program-workout-exercise-value">${exercise.sets || 0} × ${exercise.reps || '-'}</span>
+                    <span class="program-workout-exercise-status">${exercise.completed ? '✓' : '–'}</span>
+                </div>`).join('')}
+        </div>` : '<div class="empty-state"><p class="empty-text">Подробная статистика этого занятия ещё не сохранена. Она будет доступна для тренировок, завершённых после обновления.</p></div>';
+    openModal('programWorkoutStatsModal');
+}
+window.openProgramWorkoutStats = openProgramWorkoutStats;
+
+// ─── Создание своей программы ───
+let _editingCustomProgramId = null;
+let _newProgramIcon = 'bodybuilding';
+let _myProgramsEditBackup = null;
+
+function selectProgramIcon(icon) {
+    _newProgramIcon = icon;
+
+    document.querySelectorAll('#newProgramIconPicker .icon-option')
+        .forEach(el => {
+            el.classList.toggle(
+                'icon-option-active',
+                el.dataset.icon === icon
+            );
+        });
+}
+
+window.selectProgramIcon = selectProgramIcon;
+
+
+function editCustomProgram(programId) {
+    const program = getMyPrograms().find(p => p.id === programId);
+
+    if (!program) {
+        showToast('⚠️ Программа не найдена');
+        return;
+    }
+
+    _editingCustomProgramId = programId;
+    _newProgramIcon = program.icon || 'bodybuilding';
+
+    // Заголовок и кнопка
+    document.getElementById('createProgramModalTitle').textContent =
+        'Редактирование программы';
+
+    document.getElementById('saveCustomProgramBtn').textContent =
+        'Сохранить';
+
+    // Заполняем основные данные
+    document.getElementById('newProgramTitle').value =
+        program.title || '';
+
+    document.getElementById('newProgramDuration').value =
+        String(program.durationDays || 30);
+
+    document.getElementById('newProgramCategory').value =
+        program.category || 'Пресс';
+
+    document.getElementById('newProgramTitle').classList.remove('error');
+
+    // Восстанавливаем назначения тренировок по дням
+    _newProgramDayAssignments = {};
+
+    (program.dayWorkouts || []).forEach((workout, index) => {
+        if (workout) {
+            _newProgramDayAssignments[index + 1] = { ...workout };
+        }
+    });
+
+    selectProgramIcon(_newProgramIcon);
+
+    renderProgramScheduleBuilder();
+
+    document.getElementById('newProgramDuration').onchange =
+        renderProgramScheduleBuilder;
+
+    openModal('createProgramModal');
+}
+
+window.editCustomProgram = editCustomProgram;
+
+
+function openCreateProgramModal() {
+    _editingCustomProgramId = null;
+    _newProgramIcon = 'bodybuilding';
+    _newProgramDayAssignments = {};
+
+    // Заголовок и кнопка
+    document.getElementById('createProgramModalTitle').textContent =
+        'Новая программа';
+
+    document.getElementById('saveCustomProgramBtn').textContent =
+        'Создать';
+
+    document.getElementById('newProgramTitle').value = '';
+    document.getElementById('newProgramDuration').value = '30';
+    document.getElementById('newProgramCategory').value = 'Пресс';
+
+    document.getElementById('newProgramTitle').classList.remove('error');
+
+    selectProgramIcon(_newProgramIcon);
+
+    renderProgramScheduleBuilder();
+
+    document.getElementById('newProgramDuration').onchange =
+        renderProgramScheduleBuilder;
+
+    openModal('createProgramModal');
+}
+
+window.openCreateProgramModal = openCreateProgramModal;
+
+
+
+function saveCustomProgram() {
+    const title = document.getElementById('newProgramTitle').value.trim();
+    const durationDays = parseInt(
+        document.getElementById('newProgramDuration').value
+    );
+    const category = document.getElementById('newProgramCategory').value;
+    const titleInput = document.getElementById('newProgramTitle');
+
+    titleInput.classList.remove('error');
+
+    if (!title || title.length < 3) {
+        titleInput.classList.add('error');
+        showToast('⚠️ Введите название');
+        return;
+    }
+
+    const assignments = Object.keys(_newProgramDayAssignments)
+        .map(Number)
+        .filter(day => day >= 1 && day <= durationDays);
+
+    if (!assignments.length) {
+        showToast('⚠️ Добавьте тренировку');
+        return;
+    }
+
+    // Получаем доступные тренировки с учётом Premium
+    const availableOptions = getProgramWorkoutOptions();
+
+    // Проверяем каждое назначение
+    for (const day of assignments) {
+        const workout = _newProgramDayAssignments[day];
+
+        if (!workout) continue;
+
+        // Проверяем готовые тренировки
+        if (workout.source === 'ready') {
+            const isAvailable = availableOptions.some(option =>
+                option.source === 'ready' &&
+                option.category === workout.category &&
+                option.level === workout.level
+            );
+
+            if (!isAvailable) {
+                // Проверяем, относится ли тренировка к Premium
+                let isPremiumCategory = false;
+
+                for (const [parent, categories] of Object.entries(exercisesData)) {
+                    const categoryData = categories?.[workout.category];
+
+                    if (
+                        categoryData &&
+                        (
+                            parent === 'PREMIUM' ||
+                            parent === 'Особые' ||
+                            categoryData._premium === true
+                        )
+                    ) {
+                        isPremiumCategory = true;
+                        break;
+                    }
+                }
+
+                if (isPremiumCategory && !hasPremium()) {
+                    showToast('🔒 Нужен Premium');
+                } else {
+                    showToast('⚠️ Тренировка недоступна');
+                }
+
+                return;
+            }
+
+            const exercises = getExercisesForEdit(
+                workout.category,
+                workout.level,
+                false
+            );
+
+            if (!Array.isArray(exercises) || !exercises.length) {
+                showToast('⚠️ Тренировка недоступна');
+                return;
+            }
+        }
+
+        // Проверяем личные тренировки
+        else if (workout.source === 'personal') {
+            const personalWorkout = getWorkoutById(workout.workoutId);
+
+            if (!personalWorkout || !personalWorkout.exercises?.length) {
+                showToast('⚠️ Тренировка не найдена');
+                return;
+            }
+        }
+
+        else {
+            showToast('⚠️ Неверная тренировка');
+            return;
+        }
+    }
+
+    const dayWorkouts = Array.from(
+        { length: durationDays },
+        (_, index) => {
+            const assignment = _newProgramDayAssignments[index + 1];
+            return assignment ? { ...assignment } : null;
+        }
+    );
+
+    const list = getMyPrograms();
+
+    const existingIndex = _editingCustomProgramId
+        ? list.findIndex(p => p.id === _editingCustomProgramId)
+        : -1;
+
+    if (_editingCustomProgramId && existingIndex === -1) {
+        showToast('⚠️ Программа не найдена');
+        return;
+    }
+
+    const existingProgram = existingIndex >= 0
+        ? list[existingIndex]
+        : null;
+
+    const program = {
+        ...(existingProgram || {}),
+        id: existingProgram
+            ? existingProgram.id
+            : 'myprog_' + Date.now(),
+
+        title,
+        icon: _newProgramIcon,
+        category,
+        durationDays,
+        dayWorkouts,
+
+        workoutsPerWeek: Math.ceil(
+            assignments.length / (durationDays / 7)
+        ),
+
+        weekPattern: Array.from(
+            { length: 7 },
+            (_, index) => Boolean(dayWorkouts[index])
+        ),
+
+        createdAt: existingProgram
+            ? existingProgram.createdAt
+            : Date.now(),
+
+        isCustom: true
+    };
+
+    if (existingIndex >= 0) {
+        list[existingIndex] = program;
+    } else {
+        list.push(program);
+    }
+
+    saveMyPrograms(list);
+
+    closeModal('createProgramModal');
+
+    _newProgramDayAssignments = {};
+    _editingCustomProgramId = null;
+
+    showToast(
+        existingProgram
+            ? '✅ Программа обновлена'
+            : '✅ Программа создана'
+    );
+
+    if (existingProgram) {
+        openProgramDetail(program.id);
+    } else {
+        switchProgramTab('my');
+        renderMyPrograms();
+    }
+}
+
+window.saveCustomProgram = saveCustomProgram;
+
+
+function deleteCustomProgram(programId) {
+    setTimeout(() => {
+        showConfirmModal(
+            'Удалить программу?',
+            'Все настройки программы будут удалены. Это действие нельзя отменить.',
+            () => {
+                const list = getMyPrograms().filter(p => p.id !== programId);
+                saveMyPrograms(list);
+                renderMyPrograms();
+                showToast('🗑️ Программа удалена');
+            },
+            'Удалить'
+        );
+    }, 400);
+}
+window.deleteCustomProgram = deleteCustomProgram;
+
+// =================== СВЯЗЬ С АДМИНИСТРАЦИЕЙ ===================
+
+const SUPPORT_COOLDOWN_KEY = 'supportLastSent';
+const SUPPORT_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 часов между сообщениями
+
+async function openSupportModal() {
+    // ★★★ СИНХРОНИЗИРУЕМ С FIRESTORE ПЕРЕД ПРОВЕРКОЙ ★★★
+    try {
+        const user = await getFirebaseUser();
+        if (user) {
+            const fromFirestore = await syncLoadFromFirestore('supportLastSent');
+            if (fromFirestore !== null) {
+                const firestoreTs = parseInt(fromFirestore);
+                const localTs = parseInt(localStorage.getItem(SUPPORT_COOLDOWN_KEY) || '0');
+                if (firestoreTs > localTs) {
+                    localStorage.setItem(SUPPORT_COOLDOWN_KEY, String(firestoreTs));
+                }
+            }
+        }
+    } catch (e) {}
+
+    const lastSent = parseInt(localStorage.getItem(SUPPORT_COOLDOWN_KEY) || '0');
+    const now = Date.now();
+    const elapsed = now - lastSent;
+
+    if (elapsed < SUPPORT_COOLDOWN_MS) {
+        const remainingText = formatCooldownTime(SUPPORT_COOLDOWN_MS - elapsed);
+        showToast(`⏳ Сообщение можно отправить через ${remainingText}`);
+        return;
+    }
+
+    // Очищаем поля
+    document.getElementById('supportSubject').value = 'bug';
+    document.getElementById('supportMessage').value = '';
+    document.getElementById('supportContact').value = '';
+    document.getElementById('supportCharCount').textContent = '0';
+
+    openModal('supportModal');
+
+    const textarea = document.getElementById('supportMessage');
+    textarea.oninput = function() {
+        document.getElementById('supportCharCount').textContent = this.value.length;
+    };
+}
+
+// ★★★ ФОРМАТИРОВАНИЕ ОСТАВШЕГОСЯ ВРЕМЕНИ КУЛДАУНА ★★★
+function formatCooldownTime(ms) {
+    const totalSeconds = Math.ceil(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+
+    const hoursWord = declOfNum(hours, ['час', 'часа', 'часов']);
+    const minutesWord = declOfNum(minutes, ['минута', 'минуты', 'минут']);
+
+    if (hours > 0) {
+        return `${hours} ${hoursWord} ${minutes} ${minutesWord}`;
+    }
+    if (minutes > 0) {
+        return `${minutes} ${minutesWord}`;
+    }
+    return 'меньше минуты';
+}
+
+async function sendSupportMessage() {
+    const subject = document.getElementById('supportSubject').value;
+    const message = document.getElementById('supportMessage').value.trim();
+    const contact = document.getElementById('supportContact').value.trim();
+
+    // Валидация
+    if (!message || message.length < 5) {
+        showToast('⚠️ Опишите проблему подробнее (минимум 5 символов)');
+        document.getElementById('supportMessage').classList.add('error');
+        return;
+    }
+    document.getElementById('supportMessage').classList.remove('error');
+
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+
+    // ★★★ ПОВТОРНАЯ ПРОВЕРКА КУЛДАУНА ★★★
+    const lastSent = parseInt(localStorage.getItem(SUPPORT_COOLDOWN_KEY) || '0');
+    const now = Date.now();
+    if (now - lastSent < SUPPORT_COOLDOWN_MS) {
+        const remainingText = formatCooldownTime(SUPPORT_COOLDOWN_MS - (now - lastSent));
+        showToast(`⏳ Сообщение можно отправить через ${remainingText}`);
+        closeModal('supportModal');
+        return;
+    }
+
+    const btn = document.getElementById('supportSendBtn');
+    btn.disabled = true;
+    btn.textContent = 'Отправка...';
+
+    try {
+        const profileResult = await getUserProfile(user.uid);
+        const profile = profileResult.success ? profileResult.data : {};
+
+        // ★★★ 1. СОХРАНЯЕМ В FIRESTORE ★★★
+        await firebase.firestore().collection('supportMessages').add({
+            userName: profile.displayName || 'Пользователь',
+            userEmail: user.email || '',
+            userContact: contact || '—',
+            subject: subject,
+            message: message,
+            userId: user.uid,
+            status: 'new',
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            deviceInfo: navigator.userAgent.slice(0, 200)
+        });
+
+        console.log('✅ Сообщение сохранено в Firestore');
+
+        // После сохранения в Firestore
+const supportDataForVk = {
+    userName: profile.displayName || 'Пользователь',
+    userEmail: user.email,
+    userContact: contact, // из формы
+    subject: subject,     // из формы
+    message: message      // из формы
+};
+// Отправляем уведомление в VK (не дожидаясь завершения, чтобы не тормозить UI)
+sendVkNotification(supportDataForVk);
+
+        // ★★★ 2. СОХРАНЯЕМ ВРЕМЯ ОТПРАВКИ ★★★
+        const sentAt = Date.now();
+        localStorage.setItem(SUPPORT_COOLDOWN_KEY, String(sentAt));
+        syncSaveToFirestore('supportLastSent', sentAt);
+
+        closeModal('supportModal');
+        showToast('✅ Сообщение отправлено! Мы свяжемся с вами.');
+
+    } catch (error) {
+        console.error('❌ Ошибка отправки:', error);
+        showToast('❌ Не удалось отправить. Проверьте интернет.');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Отправить';
+    }
+}
+
+// ★★★ ЗАГРУЗКА КУЛДАУНА ИЗ FIRESTORE ★★★
+async function loadSupportCooldown() {
+    try {
+        const user = await getFirebaseUser();
+        if (!user) return;
+
+        const fromFirestore = await syncLoadFromFirestore('supportLastSent');
+        if (fromFirestore !== null) {
+            const firestoreTs = parseInt(fromFirestore);
+            const localTs = parseInt(localStorage.getItem(SUPPORT_COOLDOWN_KEY) || '0');
+            // Берём максимальное значение (более свежее)
+            const latest = Math.max(firestoreTs, localTs);
+            if (latest > 0) {
+                localStorage.setItem(SUPPORT_COOLDOWN_KEY, String(latest));
+            }
+        }
+    } catch (error) {
+        console.warn('⚠️ Ошибка загрузки кулдауна поддержки:', error);
+    }
+}
+
+// Привязка кнопки
+document.getElementById('supportSendBtn')?.addEventListener('click', sendSupportMessage);
+
+window.openSupportModal = openSupportModal;
+
+// =================== ПОДЕЛИТЬСЯ ПРОФИЛЕМ ===================
+async function shareProfile() {
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+
+    const profileResult = await getUserProfile(user.uid);
+    if (!profileResult.success) {
+        showToast('❌ Не удалось загрузить профиль');
+        return;
+    }
+    const profile = profileResult.data;
+    const name = profile.displayName || 'Пользователь';
+
+    // ★★★ ФОРМИРУЕМ ССЫЛКУ ★★★
+    const shareUrl = `${window.location.origin}${window.location.pathname}?addFriend=${user.uid}`;
+    const shareText = `${name} приглашает тебя в SportApp! Жми на ссылку, чтобы добавить в друзья:`;
+
+    // ★★★ ПРОБУЕМ НАТИВНЫЙ SHARE API ★★★
+    if (navigator.share) {
+        try {
+            await navigator.share({
+                title: 'SportApp',
+                text: shareText,
+                url: shareUrl
+            });
+            console.log('✅ Профиль отправлен через Web Share API');
+            return;
+        } catch (error) {
+            // Пользователь отменил или ошибка — падаем в fallback
+            if (error.name !== 'AbortError') {
+                console.warn('Web Share API не сработал:', error);
+            } else {
+                return; // Пользователь сам отменил, ничего не делаем
+            }
+        }
+    }
+
+    // ★★★ FALLBACK: КОПИРУЕМ В БУФЕР ★★★
+    copyProfileLink(shareUrl, shareText);
+}
+
+function copyProfileLink(url, text) {
+    const fullText = `${text}\n${url}`;
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(fullText).then(() => {
+            showToast('✅ Ссылка скопирована! Отправь другу');
+        }).catch(() => {
+            showFallbackCopyModal(url);
+        });
+    } else {
+        showFallbackCopyModal(url);
+    }
+}
+
+function showFallbackCopyModal(url) {
+    // Старый способ копирования через textarea
+    const textarea = document.createElement('textarea');
+    textarea.value = url;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+        document.execCommand('copy');
+        showToast('✅ Ссылка скопирована! Отправь другу');
+    } catch (e) {
+        // Совсем не получилось — показываем модалку
+        showConfirmModal(
+            'Ваша ссылка',
+            url,
+            null,
+            'OK'
+        );
+    }
+    document.body.removeChild(textarea);
+}
+
+// Привязка кнопки
+document.getElementById('shareProfileBtn')?.addEventListener('click', openQRCodeModal);
+
+window.shareProfile = shareProfile;
+
+// =================== ОБРАБОТКА ССЫЛКИ "ДОБАВИТЬ В ДРУЗЬЯ" ===================
+// =================== ОБРАБОТКА ССЫЛКИ "ДОБАВИТЬ В ДРУЗЬЯ" ===================
+async function checkFriendInviteLink() {
+    const params = new URLSearchParams(window.location.search);
+    const friendId = params.get('addFriend');
+
+    if (!friendId) return;
+
+    // Убираем параметр из URL
+    window.history.replaceState({}, '', window.location.pathname);
+
+    // ★★★ ВСЕГДА СОХРАНЯЕМ В localStorage — откроем, когда пользователь войдёт в приложение ★★★
+    localStorage.setItem('pendingFriendInvite', friendId);
+    console.log('💾 Приглашение сохранено, откроем после входа в приложение');
+
+    // ★★★ ЕСЛИ ПОЛЬЗОВАТЕЛЬ УЖЕ В ПРИЛОЖЕНИИ — ОТКРЫВАЕМ СРАЗУ ★★★
+    const user = await getFirebaseUser();
+    if (user && isInsideApp()) {
+        localStorage.removeItem('pendingFriendInvite');
+        await openFriendInviteModal(friendId);
+    }
+}
+
+// ★★★ ПРОВЕРКА: НАХОДИТСЯ ЛИ ПОЛЬЗОВАТЕЛЬ ВНУТРИ ПРИЛОЖЕНИЯ ★★★
+function isInsideApp() {
+    const appPages = ['page-workouts', 'page-stats', 'page-profile'];
+    return appPages.some(id => {
+        const el = document.getElementById(id);
+        return el && el.classList.contains('page-active');
+    });
+}
+
+// ★★★ ОТКРЫВАЕМ ОТЛОЖЕННОЕ ПРИГЛАШЕНИЕ, КОГДА ПОЛЬЗОВАТЕЛЬ В ПРИЛОЖЕНИИ ★★★
+function tryOpenPendingInvite() {
+    // Сначала — приглашение в друзья
+    const pendingInvite = localStorage.getItem('pendingFriendInvite');
+    if (pendingInvite && isInsideApp()) {
+        localStorage.removeItem('pendingFriendInvite');
+        console.log('🎯 Открываем отложенное приглашение:', pendingInvite);
+        setTimeout(() => openFriendInviteModal(pendingInvite), 500);
+    }
+
+    // ★ Плюс — тренировка из ссылки
+    const pendingWorkout = localStorage.getItem('pendingSharedWorkout');
+    if (pendingWorkout && isInsideApp()) {
+        localStorage.removeItem('pendingSharedWorkout');
+        try {
+            const payload = JSON.parse(pendingWorkout);
+            console.log('🎯 Применяем отложенную тренировку из ссылки');
+            setTimeout(() => applySharedWorkout(payload), 800);
+        } catch (e) {
+            console.warn('Ошибка разбора отложенной тренировки:', e);
+        }
+    }
+
+
+    // Программа из ссылки
+    const pendingProgramPostId = localStorage.getItem(
+        'pendingSharedProgramPostId'
+    );
+
+    if (pendingProgramPostId && isInsideApp()) {
+        localStorage.removeItem('pendingSharedProgramPostId');
+
+        setTimeout(() => {
+            addSharedProgramFromPost(pendingProgramPostId);
+        }, 900);
+    }
+
+}
+
+async function openFriendInviteModal(friendId) {
+    try {
+        const profileResult = await getUserProfile(friendId);
+        if (!profileResult.success) {
+            showToast('❌ Пользователь не найден');
+            return;
+        }
+
+        const profile = profileResult.data;
+        const name = profile.displayName || 'Пользователь';
+        const xp = profile.totalXp || 0;
+        const level = getCurrentLevel(xp);
+        const progress = getXpProgress(xp);
+        const nextLevel = getNextLevel(xp);
+        const xpRounded = Math.round(xp);
+        const progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+
+        // ★★★ ЗАПОЛНЯЕМ ТУ ЖЕ МОДАЛКУ ★★★
+        document.getElementById('friendProfileAvatar').textContent = name[0].toUpperCase();
+        document.getElementById('friendProfileName').textContent = name;
+        document.getElementById('friendProfileEmail').textContent = '';
+
+        document.getElementById('friendLevelLvl').textContent = level.id + ' LVL';
+        document.getElementById('friendLevelTitle').textContent = level.name;
+        document.getElementById('friendLevelProgressText').textContent = progressText;
+        document.getElementById('friendLevelFill').style.width = progress + '%';
+
+        const achievements = profile.achievements || {};
+        updateAchievementsUI('friendAchievements', achievements);
+        const visible = getAchievementsVisibility();
+        const achContainer = document.getElementById('friendAchievements');
+        if (achContainer) achContainer.classList.toggle('hidden', !visible);
+
+        // Статистика
+        let workouts = [];
+        let totalSeconds = 0;
+        let totalExercises = 0;
+        try {
+            const workoutsResult = await getUserWorkoutsFromFirestore(friendId);
+            if (workoutsResult.success) {
+                workouts = workoutsResult.data.filter(w => !(w.title || '').includes('Зарядка'));
+                totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+                totalExercises = workouts.reduce((sum, w) => {
+                    const completed = w.exercises?.filter(e => e.completed === true).length || 0;
+                    return sum + completed;
+                }, 0);
+            }
+        } catch (e) {}
+
+        document.getElementById('friendTotalWorkouts').textContent = workouts.length;
+        document.getElementById('friendTotalMinutes').textContent = Math.floor(totalSeconds / 60);
+        document.getElementById('friendTotalExercises').textContent = totalExercises;
+
+        // ★★★ РЕНДЕРИМ КНОПКИ ДЛЯ ПРИГЛАШЕНИЯ ★★★
+        const status = await getFriendshipStatus(friendId);
+        renderFriendProfileActions('invite', friendId, status);
+
+        openModal('friendProfileModal');
+
+    } catch (error) {
+        console.error('❌ Ошибка открытия приглашения:', error);
+        showToast('❌ Не удалось загрузить профиль');
+    }
+}
+
+// =================== РЕНДЕР КНОПОК В ПРОФИЛЕ ДРУГА ===================
+function renderFriendProfileActions(mode, friendId, status) {
+    const container = document.getElementById('friendProfileActions');
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    // ★★★ РЕЖИМ 1: ОБЫЧНЫЙ ПРОСМОТР ДРУГА ★★★
+    if (mode === 'friend') {
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'btn btn-danger';
+        removeBtn.style.flex = '1';
+        removeBtn.id = 'friendRemoveBtn';
+        removeBtn.textContent = 'Удалить';
+        removeBtn.onclick = function() {
+            if (!currentFriendId || !currentFriendData) {
+                showToast('❌ Данные друга не загружены');
+                return;
+            }
+            const friendName = currentFriendData.displayName || 'Пользователь';
+            showConfirmModal(
+                'Удалить друга?',
+                `Вы уверены, что хотите удалить ${friendName} из друзей?`,
+                async function() {
+                    const result = await removeFriendFromList(currentFriendId);
+                    if (result.success) {
+                        closeModal('friendProfileModal');
+                        currentFriendId = null;
+                        currentFriendData = null;
+                        await renderFriendsInProfile();
+                        showToast(`✅ ${result.friendName || friendName} удалён из друзей`);
+                    }
+                },
+                'Удалить'
+            );
+        };
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'btn btn-primary';
+        closeBtn.style.flex = '1';
+        closeBtn.textContent = 'Готово';
+        closeBtn.onclick = function() {
+            closeModal('friendProfileModal');
+            currentFriendId = null;
+            currentFriendData = null;
+        };
+
+        container.appendChild(removeBtn);
+        container.appendChild(closeBtn);
+        return;
+    }
+
+    // ★★★ РЕЖИМ 2: ПРИГЛАШЕНИЕ ПО ССЫЛКЕ ★★★
+    if (mode === 'invite') {
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'btn btn-secondary';
+        closeBtn.style.flex = '1';
+        closeBtn.textContent = 'Закрыть';
+        closeBtn.onclick = function() {
+            closeModal('friendProfileModal');
+        };
+
+        const actionBtn = document.createElement('button');
+        actionBtn.className = 'btn btn-primary';
+        actionBtn.style.flex = '1';
+
+        if (status === 'friends') {
+            actionBtn.textContent = 'Уже в друзьях';
+            actionBtn.disabled = true;
+            actionBtn.style.opacity = '0.6';
+            actionBtn.onclick = null;
+        } else if (status === 'pending_sent') {
+            actionBtn.textContent = 'Заявка отправлена';
+            actionBtn.disabled = true;
+            actionBtn.style.opacity = '0.6';
+            actionBtn.onclick = null;
+        } else if (status === 'pending_received') {
+            actionBtn.textContent = 'Принять заявку';
+            actionBtn.onclick = async function() {
+                actionBtn.disabled = true;
+                actionBtn.textContent = 'Принятие...';
+                const requests = await getFriendRequests();
+                if (requests.success) {
+                    const req = requests.data.find(r => r.from === friendId);
+                    if (req) {
+                        await acceptFriendRequest(req.id, friendId);
+                        closeModal('friendProfileModal');
+                    } else {
+                        showToast('❌ Заявка не найдена');
+                        actionBtn.disabled = false;
+                        actionBtn.textContent = 'Принять заявку';
+                    }
+                }
+            };
+        } else {
+            actionBtn.textContent = 'Добавить в друзья';
+            actionBtn.onclick = async function() {
+                actionBtn.disabled = true;
+                actionBtn.textContent = 'Отправка...';
+                const result = await sendFriendRequest(friendId);
+                if (result.success) {
+                    actionBtn.textContent = 'Заявка отправлена';
+                    actionBtn.style.opacity = '0.6';
+                    showToast('✅ Заявка отправлена!');
+                } else {
+                    actionBtn.disabled = false;
+                    actionBtn.textContent = 'Добавить в друзья';
+                    showToast('❌ ' + (result.error || 'Ошибка'));
+                }
+            };
+        }
+
+        container.appendChild(closeBtn);
+        container.appendChild(actionBtn);
+        return;
+    }
+}
+
+// ★★★ ЗАПУСКАЕМ ПРИ ЗАГРУЗКЕ СТРАНИЦЫ ★★★
+document.addEventListener('DOMContentLoaded', () => {
+    checkFriendInviteLink();
+    checkWorkoutShareLink();
+    checkProgramShareLink();
+});
+
+// =================== ЕЖЕМЕСЯЧНЫЕ ЗНАЧКИ ===================
+const MONTHLY_BADGES_KEY = 'sportapp_monthly_badges';
+const MONTHS_GOAL = 15;
+
+const MONTH_EMOJI = ['❄️', '💝', '🌷', '🌧️', '🌸', '☀️', '🏄', '🌻', '🍂', '🎃', '☕', '🎄'];
+const MONTH_NAMES = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                     'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+
+/** Получить объект значков */
+function getMonthlyBadges() {
+    try {
+        const saved = localStorage.getItem(MONTHLY_BADGES_KEY);
+        if (saved) return JSON.parse(saved);
+    } catch (e) {
+        console.warn('Ошибка чтения значков:', e);
+    }
+    return {};
+}
+
+/** Загрузить значки из Firestore и обновить кэш + UI */
+async function loadMonthlyBadgesFromFirestore() {
+    try {
+        const badgesData = await syncLoadWithFallback('monthlyBadges', MONTHLY_BADGES_KEY, null);
+        if (badgesData) {
+            const parsed = typeof badgesData === 'string' ? JSON.parse(badgesData) : badgesData;
+            localStorage.setItem(MONTHLY_BADGES_KEY, JSON.stringify(parsed));
+            console.log('✅ Значки загружены из Firestore:', parsed);
+        }
+        renderMonthlyBadges();
+    } catch (e) {
+        console.warn('⚠️ Ошибка загрузки значков:', e);
+    }
+}
+
+/** Сохранить значки */
+function saveMonthlyBadges(badges) {
+    localStorage.setItem(MONTHLY_BADGES_KEY, JSON.stringify(badges));
+    syncSaveToFirestore('monthlyBadges', badges);
+}
+
+/** Получить сегодняшнюю дату в формате "2026-01-15" */
+function getTodayKey() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Получить ключ текущего месяца "2026-01" */
+function getCurrentMonthKey() {
+    return getTodayKey().slice(0, 7);
+}
+
+/** Начислить балл, если все 3 задания сегодня выполнены */
+async function addMonthlyPointIfAllDone() {
+    if (!dailyTasksList || dailyTasksList.length === 0) return;
+
+    // Все задания выполнены?
+    if (!dailyTasksList.every(t => t.completed)) return;
+
+    const todayKey = getTodayKey();
+    const monthKey = getCurrentMonthKey();
+    const badges = getMonthlyBadges();
+    const month = badges[monthKey] || { points: 0, closedDays: [], golden: false };
+
+    // Уже засчитано сегодня?
+    if (month.closedDays.includes(todayKey)) return;
+
+    // Начисляем балл
+    month.closedDays.push(todayKey);
+    month.points = month.closedDays.length;
+
+    const justGotGolden = month.points >= MONTHS_GOAL && !month.golden;
+    if (justGotGolden) {
+        month.golden = true;
+    }
+
+    badges[monthKey] = month;
+    saveMonthlyBadges(badges);
+
+    // Обновляем UI
+    renderMonthlyBadges();
+
+    // Уведомление о золотом значке
+    if (justGotGolden) {
+        const user = await getFirebaseUser();
+        if (user) {
+            const profileResult = await getUserProfile(user.uid);
+            if (profileResult.success) {
+                const currentXp = profileResult.data.totalXp || 0;
+                await updateUserProfile(user.uid, { totalXp: currentXp + 50 });
+            }
+        }
+
+        showNotification(
+            '🏅',
+            `Золотой значок за ${MONTH_NAMES[new Date().getMonth()]} получен! +50 XP`,
+            null,
+            true,
+            function() {
+                TabManager.stats('personal');
+                window.navigateTo('stats');
+                setTimeout(() => {
+                    const block = document.getElementById('monthly-badges-block');
+                    if (block) {
+                        block.classList.add('open');
+                        block.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }, 300);
+            }
+        );
+    } else {
+        showToast(`⭐ +1 балл! Всего за месяц: ${month.points}/${MONTHS_GOAL}`);
+    }
+}
+
+/** Рендер значков в блоке */
+function renderMonthlyBadges() {
+    const container = document.getElementById('monthlyBadgesContainer');
+    if (!container) return;
+
+    const badges = getMonthlyBadges();
+    const currentYear = new Date().getFullYear();
+
+    let html = '';
+    for (let m = 0; m < 12; m++) {
+        const monthKey = `${currentYear}-${String(m + 1).padStart(2, '0')}`;
+        const month = badges[monthKey] || { points: 0, golden: false };
+        const emoji = MONTH_EMOJI[m];
+
+        html += `
+            <div class="month-badge ${month.golden ? 'golden' : ''}"
+                 onclick="openMonthBadgeModal('${monthKey}')"
+                 data-month="${m}"
+                 title="${MONTH_NAMES[m]} — ${month.points}/${MONTHS_GOAL}">
+                <span class="month-badge-emoji">${emoji}</span>
+            </div>
+        `;
+    }
+
+    container.innerHTML = html;
+}
+
+/** Открыть модалку с деталями месяца */
+function openMonthBadgeModal(monthKey) {
+    const [year, monthStr] = monthKey.split('-');
+    const monthIndex = parseInt(monthStr, 10) - 1;
+
+    const badges = getMonthlyBadges();
+    const data = badges[monthKey] || { points: 0, closedDays: [], golden: false };
+
+    document.getElementById('monthBadgeModalTitle').textContent = `${MONTH_NAMES[monthIndex]} ${year}`;
+    document.getElementById('monthBadgeModalEmoji').textContent = MONTH_EMOJI[monthIndex];
+    document.getElementById('monthBadgeModalProgress').textContent = `${data.points}/${MONTHS_GOAL}`;
+
+    const percent = Math.min(100, Math.round((data.points / MONTHS_GOAL) * 100));
+    document.getElementById('monthBadgeModalFill').style.width = percent + '%';
+
+    openModal('monthBadgeModal');
+}
+
+window.openMonthBadgeModal = openMonthBadgeModal;
+
+// =================== QR-КОД ПРОФИЛЯ (ТОЛЬКО ЧЕРЕЗ API) ===================
+async function openQRCodeModal() {
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+
+    const profileResult = await getUserProfile(user.uid);
+    const profile = profileResult.success ? profileResult.data : {};
+    const name = profile.displayName || 'Пользователь';
+
+    const url = `${window.location.origin}${window.location.pathname}?addFriend=${user.uid}`;
+    window._currentQRLink = url;
+
+    document.getElementById('qrCodeUserName').textContent = name;
+
+    const container = document.getElementById('qrCodeContainer');
+    container.innerHTML = '';
+
+    const img = document.createElement('img');
+    img.src = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(url)}`;
+    img.width = 240;
+    img.height = 240;
+    img.alt = 'QR-код профиля';
+    img.style.display = 'block';
+    img.style.borderRadius = '8px';
+
+    img.onerror = function() {
+        container.innerHTML = `
+            <div style="color:var(--slate);padding:1.5rem;text-align:center;font-size:0.85rem;">
+                <i class="fa-solid fa-wifi" style="font-size:2rem;margin-bottom:0.5rem;display:block;"></i>
+                Не удалось загрузить QR.<br>
+                Проверьте интернет или скопируйте ссылку.
+            </div>
+        `;
+    };
+
+    container.appendChild(img);
+
+    window._currentQRImageUrl = img.src;
+
+    openModal('qrCodeModal');
+}
+
+// ★★★ СКАЧАТЬ ★★★
+function downloadQRCode() {
+    const name = document.getElementById('qrCodeUserName').textContent;
+    const safeName = name.replace(/\s+/g, '-').replace(/[^\w\-]/g, '') || 'profile';
+
+    if (!window._currentQRImageUrl) {
+        showToast('❌ QR не сгенерирован');
+        return;
+    }
+
+    fetch(window._currentQRImageUrl)
+        .then(r => r.blob())
+        .then(blob => {
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.download = `sportapp-qr-${safeName}.png`;
+            link.href = blobUrl;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+            showToast('✅ QR-код сохранён');
+        })
+        .catch(() => {
+            window.open(window._currentQRImageUrl, '_blank');
+            showToast('⚠️ Скачайте картинку вручную');
+        });
+}
+
+// ★★★ СКОПИРОВАТЬ ССЫЛКУ ★★★
+async function copyProfileShareLink() {
+    if (!window._currentQRLink) {
+        showToast('❌ Ссылка не готова');
+        return;
+    }
+
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+
+    const profileResult = await getUserProfile(user.uid);
+    const name = profileResult.success
+        ? (profileResult.data.displayName || 'Пользователь')
+        : 'Пользователь';
+
+    const url = window._currentQRLink;
+    const text = `${name} приглашает тебя в SportApp! Открой ссылку, чтобы добавить в друзья:`;
+
+    // ★★★ ПРОБУЕМ НАТИВНОЕ МЕНЮ "ПОДЕЛИТЬСЯ" ★★★
+    if (navigator.share) {
+        try {
+            await navigator.share({
+                title: 'SportApp',
+                text: text,
+                url: url
+            });
+            console.log('✅ Открыто системное меню «Поделиться»');
+            return;
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                // Пользователь сам закрыл меню — ничего не делаем
+                return;
+            }
+            // Реальная ошибка — идём в fallback
+            console.warn('Web Share API не сработал:', error);
+        }
+    }
+
+    // ★★★ FALLBACK — КОПИРУЕМ В БУФЕР ★★★
+    const fullText = `${text}\n${url}`;
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+            await navigator.clipboard.writeText(fullText);
+            showToast('✅ Ссылка скопирована');
+            return;
+        } catch (err) { /* идём дальше */ }
+    }
+
+    // Старый способ через textarea
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = fullText;
+        textarea.style.position = 'fixed';
+        textarea.style.top = '-1000px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textarea);
+
+        if (ok) {
+            showToast('✅ Ссылка скопирована');
+        } else {
+            showLinkForManualCopy(url);
+        }
+    } catch (err) {
+        showLinkForManualCopy(url);
+    }
+}
+
+// ★★★ РЕЗЕРВ — МОДАЛКА С ПОЛЕМ ДЛЯ КОПИРОВАНИЯ ★★★
+function showLinkForManualCopy(url) {
+    const old = document.getElementById('manualCopyModal');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'manualCopyModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">Ваша ссылка</div>
+            <p class="modal-text" style="margin-bottom:1rem;">
+                Выделите ссылку и скопируйте вручную
+            </p>
+            <input
+                type="text"
+                id="manualCopyInput"
+                class="form-input"
+                value="${url}"
+                readonly
+                style="margin-bottom:1rem; text-align:center; font-size:0.8rem;"
+                onclick="this.select();"
+            />
+            <button class="btn btn-primary" onclick="closeModal('manualCopyModal')">
+                Понятно
+            </button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    setTimeout(() => {
+        const input = document.getElementById('manualCopyInput');
+        if (input) {
+            input.focus();
+            input.select();
+        }
+    }, 100);
+}
+
+// Привязка кнопок
+document.getElementById('shareProfileBtn')?.addEventListener('click', openQRCodeModal);
+document.getElementById('qrCodeCopyBtn')?.addEventListener('click', copyProfileShareLink);
+document.getElementById('qrCodeDownloadBtn')?.addEventListener('click', downloadQRCode);
+
+// =================== APPLE LIQUID GLASS TAB BAR ===================
+(function initAppleTabBar() {
+    const nav = document.getElementById('bottomNav');
+    const bubble = document.getElementById('navBubble');
+    if (!nav || !bubble) return;
+
+    const items = Array.from(nav.querySelectorAll('.nav-item'));
+    if (items.length === 0) return;
+
+    const PADDING = 5;
+    const DRAG_THRESHOLD = 4;
+
+    let isDragging = false;
+    let wasDragging = false;
+    let pointerId = null;
+    let dragStartX = 0;
+    let suppressNextClick = false;
+    let initialRenderDone = false;
+    let continuousIndex = Math.max(0, items.findIndex(i => i.classList.contains('nav-item-active')));
+
+    /* -------- ГЕОМЕТРИЯ -------- */
+
+    function getCenters() {
+        const navRect = nav.getBoundingClientRect();
+        return items.map(item => {
+            const r = item.getBoundingClientRect();
+            return r.left + r.width / 2 - navRect.left;
+        });
+    }
+
+    function getTabWidth() {
+        return items[0].getBoundingClientRect().width;
+    }
+
+    /* -------- РЕНДЕР ПУЗЫРЯ -------- */
+
+function renderBubble() {
+    const navRect = nav.getBoundingClientRect();
+    if (navRect.width === 0) return;
+
+    const centers = getCenters();
+    const tabWidth = getTabWidth();
+    const n = items.length;
+
+    const idx = Math.max(0, Math.min(n - 1, continuousIndex));
+    const floor = Math.floor(idx);
+    const ceil = Math.min(n - 1, Math.ceil(idx));
+
+    let width, center;
+
+    if (floor === ceil) {
+        width = tabWidth;
+        center = centers[floor];
+    } else {
+        const gap = centers[ceil] - centers[floor];
+        const fraction = idx - floor;
+        center = centers[floor] + gap * fraction;
+        width = tabWidth + gap * Math.pow(Math.sin(Math.PI * fraction), 1.5) * 0.7;
+    }
+
+    const maxWidth = navRect.width - PADDING * 2;
+    if (width > maxWidth) width = maxWidth;
+
+    let tx = center - width / 2;
+    const minTx = PADDING;
+    const maxTx = navRect.width - width - PADDING;
+    if (tx < minTx) tx = minTx;
+    if (tx > maxTx) tx = maxTx;
+
+    // ★★★ МЕНЯЕМ ТОЛЬКО transform И width — CSS сам всё анимирует ★★★
+    bubble.style.width = width + 'px';
+    bubble.style.transform = `translateX(${tx}px)`;
+
+    // ★★★ ПОДСВЕТКА ИКОНКИ ПОД ПУЗЫРЬКОМ ★★★
+    highlightIconUnderBubble(continuousIndex);
+}
+
+/**
+ * Подсвечивает иконку, которая находится ближе всего к центру пузырька.
+ * Все остальные иконки — в обычном (сером) состоянии.
+ */
+function highlightIconUnderBubble(index) {
+    // Округляем индекс — получаем номер иконки, над которой сейчас пузырёк
+    const activeIdx = Math.round(index);
+
+    items.forEach((item, i) => {
+        const icon = item.querySelector('i');
+        if (!icon) return;
+
+        if (i === activeIdx) {
+            icon.classList.add('icon-under-bubble');
+        } else {
+            icon.classList.remove('icon-under-bubble');
+        }
+    });
+}
+
+    /* -------- X → ИНДЕКС -------- */
+
+    function clientXToIndex(clientX) {
+        const centers = getCenters();
+        const navRect = nav.getBoundingClientRect();
+        const x = clientX - navRect.left;
+        const n = centers.length;
+
+        if (x <= centers[0]) return 0;
+        if (x >= centers[n - 1]) return n - 1;
+
+        for (let i = 0; i < n - 1; i++) {
+            if (x >= centers[i] && x <= centers[i + 1]) {
+                const t = (x - centers[i]) / (centers[i + 1] - centers[i]);
+                return i + t;
+            }
+        }
+        return 0;
+    }
+
+    /* -------- POINTER EVENTS -------- */
+
+    function onPointerDown(e) {
+        if (e.button !== undefined && e.button !== 0) return;
+
+        isDragging = true;
+        wasDragging = false;
+        pointerId = e.pointerId;
+        dragStartX = e.clientX;
+
+        document.addEventListener('pointermove', onPointerMove);
+        document.addEventListener('pointerup', onPointerUp);
+        document.addEventListener('pointercancel', onPointerUp);
+    }
+
+    function onPointerMove(e) {
+        if (!isDragging || e.pointerId !== pointerId) return;
+
+        if (!wasDragging) {
+            if (Math.abs(e.clientX - dragStartX) < DRAG_THRESHOLD) return;
+            wasDragging = true;
+            nav.classList.add('dragging');
+            try { nav.setPointerCapture(e.pointerId); } catch (_) {}
+        }
+
+        continuousIndex = clientXToIndex(e.clientX);
+        renderBubble();
+    }
+
+    function onPointerUp(e) {
+        if (!isDragging || e.pointerId !== pointerId) return;
+        isDragging = false;
+        pointerId = null;
+        nav.classList.remove('dragging');
+
+        document.removeEventListener('pointermove', onPointerMove);
+        document.removeEventListener('pointerup', onPointerUp);
+        document.removeEventListener('pointercancel', onPointerUp);
+
+        if (wasDragging) {
+            const targetIndex = Math.max(0, Math.min(items.length - 1, Math.round(continuousIndex)));
+            continuousIndex = targetIndex;
+            renderBubble();
+
+            suppressNextClick = true;
+            setTimeout(() => { suppressNextClick = false; }, 100);
+
+            const targetItem = items[targetIndex];
+            if (targetItem && targetItem.dataset.page && typeof window.navigateTo === 'function') {
+                window.navigateTo(targetItem.dataset.page);
+            }
+        }
+    }
+
+    nav.addEventListener('click', function (e) {
+        if (suppressNextClick) {
+            suppressNextClick = false;
+            e.stopImmediatePropagation();
+            e.preventDefault();
+        }
+    }, true);
+
+    nav.addEventListener('pointerdown', onPointerDown);
+
+    /* -------- СИНХРОНИЗАЦИЯ С АКТИВНОЙ ВКЛАДКОЙ -------- */
+    let lastActiveIndex = items.findIndex(i => i.classList.contains('nav-item-active'));
+
+    // ★★★ ОБЩАЯ ФУНКЦИЯ СИНХРОНИЗАЦИИ ПУЗЫРЬКА С АКТИВНОЙ ИКОНКОЙ ★★★
+    function syncBubbleToActive(force = false) {
+        // Не мешаем пользователю, пока он тянет пальцем
+        if (isDragging || wasDragging) return;
+
+        const activeIdx = items.findIndex(i => i.classList.contains('nav-item-active'));
+        if (activeIdx < 0) return;
+
+        // Если уже на месте — ничего не делаем
+        if (!force && activeIdx === lastActiveIndex && Math.abs(continuousIndex - activeIdx) < 0.01) {
+            return;
+        }
+
+        lastActiveIndex = activeIdx;
+        continuousIndex = activeIdx;
+        renderBubble();
+    }
+
+    // MutationObserver — основной механизм
+    const classObserver = new MutationObserver(() => {
+        syncBubbleToActive();
+    });
+
+    items.forEach(item => {
+        classObserver.observe(item, { attributes: true, attributeFilter: ['class'] });
+    });
+
+    // ★★★ СТРАХОВКА №1: после клика по иконке — форсим синхронизацию ★★★
+    // Ловит случай, когда MutationObserver не сработал (класс не изменился,
+    // т.к. он уже был активным, но визуально пузырёк не там).
+    nav.addEventListener('click', function (e) {
+        const navItem = e.target.closest('.nav-item');
+        if (!navItem) return;
+        if (suppressNextClick) return;
+
+        setTimeout(() => syncBubbleToActive(true), 30);
+    });
+
+    // ★★★ СТРАХОВКА №2: оборачиваем navigateTo ★★★
+    // Любой программный переход (после логина, сохранения тренировки,
+    // из туториала и т.д.) — гарантированно синхронизирует пузырёк.
+    if (typeof window.navigateTo === 'function' && !window._navigateToWrapped) {
+        const originalNavigateTo = window.navigateTo;
+        window.navigateTo = function(page, params) {
+            const result = originalNavigateTo.apply(this, arguments);
+            syncBubbleToActive(true);
+            requestAnimationFrame(() => syncBubbleToActive(true));
+            return result;
+        };
+        window._navigateToWrapped = true;
+    }
+
+    /* -------- ПЕРВИЧНЫЙ РЕНДЕР -------- */
+    function tryInitialRender() {
+        if (initialRenderDone) return;
+        if (nav.offsetWidth === 0) return;
+
+        initialRenderDone = true;
+        bubble.style.transition = 'none';
+        renderBubble();
+        void bubble.offsetWidth;
+        requestAnimationFrame(() => {
+            bubble.style.transition = '';
+        });
+    }
+
+    const styleObserver = new MutationObserver(() => {
+        if (nav.style.display !== 'none') tryInitialRender();
+    });
+    styleObserver.observe(nav, { attributes: true, attributeFilter: ['style'] });
+
+    if (nav.style.display !== 'none') {
+        requestAnimationFrame(tryInitialRender);
+    }
+
+    window.addEventListener('resize', renderBubble);
+        // Ручной вызов из консоли / других мест, если понадобится
+    window.refreshNavBubble = syncBubbleToActive;
+})();
+
+// =================== AUTO-HIDE BOTTOM NAV ON SCROLL ===================
+(function initAutoHideNav() {
+    const nav = document.getElementById('bottomNav');
+    if (!nav) return;
+
+    const HIDE_THRESHOLD = 10;  // минимальный сдвиг (px), чтобы реагировать
+    const TOP_ZONE = 80;        // в верхней зоне не скрываем
+    let lastScrollY = window.scrollY || window.pageYOffset;
+    let ticking = false;
+    let isHidden = false;
+
+function updateNav() {
+    const currentY = window.scrollY || window.pageYOffset;
+    const delta = currentY - lastScrollY;
+
+    const fab = document.querySelector('.feed-fab');
+
+    if (delta < -HIDE_THRESHOLD || currentY < TOP_ZONE) {
+        if (isHidden) {
+            nav.classList.remove('bottom-nav-hidden');
+            if (fab) fab.classList.remove('nav-hidden');
+            isHidden = false;
+        }
+    }
+    else if (delta > HIDE_THRESHOLD && currentY > TOP_ZONE) {
+        if (!isHidden) {
+            nav.classList.add('bottom-nav-hidden');
+            if (fab) fab.classList.add('nav-hidden');
+            isHidden = true;
+        }
+    }
+
+    lastScrollY = currentY;
+    ticking = false;
+}
+
+    window.addEventListener('scroll', () => {
+        if (!ticking) {
+            requestAnimationFrame(updateNav);
+            ticking = true;
+        }
+    }, { passive: true });
+
+    console.log('📜 Авто-скрытие нижнего меню активно');
+})();
+
+// =================== АВТО-СКРЫТИЕ ПОИСКА В ЛЕНТЕ ===================
+(function initFeedSearchAutoHide() {
+    const search = document.getElementById('feedSearchPanel');
+    if (!search) return;
+
+    const HIDE_THRESHOLD = 8;
+    const TOP_ZONE = 60;
+    let lastScrollY = 0;
+    let ticking = false;
+    let isHidden = false;
+
+    function update() {
+        const feedPage = document.getElementById('page-feed');
+        if (!feedPage || !feedPage.classList.contains('page-active')) {
+            ticking = false;
+            return;
+        }
+
+        const currentY = window.scrollY || window.pageYOffset;
+        const delta = currentY - lastScrollY;
+
+        if (currentY < TOP_ZONE) {
+            if (isHidden) {
+                search.classList.remove('search-hidden');
+                isHidden = false;
+            }
+        } else if (delta > HIDE_THRESHOLD) {
+            if (!isHidden) {
+                search.classList.add('search-hidden');
+                isHidden = true;
+            }
+        } else if (delta < -HIDE_THRESHOLD) {
+            if (isHidden) {
+                search.classList.remove('search-hidden');
+                isHidden = false;
+            }
+        }
+
+        lastScrollY = currentY;
+        ticking = false;
+    }
+
+    window.addEventListener('scroll', () => {
+        if (!ticking) {
+            requestAnimationFrame(update);
+            ticking = true;
+        }
+    }, { passive: true });
+
+    // ★ Сброс при входе на ленту
+    window._resetFeedSearchScroll = function() {
+        lastScrollY = window.scrollY || window.pageYOffset;
+        if (isHidden) {
+            search.classList.remove('search-hidden');
+            isHidden = false;
+        }
+    };
+})();
+
+// =================== HAPTIC FEEDBACK ===================
+(function initHaptics() {
+    // Проверяем поддержку вибрации один раз
+    const canVibrate = 'vibrate' in navigator;
+    if (!canVibrate) {
+        console.log('ℹ️ Вибрация не поддерживается на этом устройстве');
+        return;
+    }
+
+    function vibrateTap() {
+        try { navigator.vibrate(10); } catch (e) {}
+    }
+
+    // Один глобальный обработчик на все клики по вкладкам
+    document.addEventListener('click', (e) => {
+        const el = e.target.closest('.nav-item, .tab-btn, .profile-tab-btn');
+        if (el) vibrateTap();
+    }, { passive: true });
+
+    console.log('📳 Haptic-отклик активен');
+})();
+
+// =================== ВЫБОР ПОЛА ===================
+let tempGender = null;
+
+/**
+ * Выбор пола — визуально + сразу меняет аватар на превью
+ */
+function selectGender(gender) {
+    tempGender = gender;
+
+    // Подсветка активной кнопки
+    document.querySelectorAll('#profileEdit .toggle-btn[data-gender]').forEach(btn => {
+        btn.classList.toggle('toggle-btn-active', btn.dataset.gender === gender);
+    });
+
+    // Меняем картинку аватара на превью
+    const avatarImg = document.querySelector('.profile-avatar img');
+    if (avatarImg) {
+        avatarImg.src = gender === 'female'
+            ? 'images/avatar-woman.png'
+            : 'images/avatar-men.png';
+    }
+}
+
+/**
+ * Применить пол к UI (при загрузке профиля)
+ */
+function applyGenderToUI(gender) {
+    const g = gender || 'male';
+    tempGender = g;
+
+    document.querySelectorAll('#profileEdit .toggle-btn[data-gender]').forEach(btn => {
+        btn.classList.toggle('toggle-btn-active', btn.dataset.gender === g);
+    });
+}
+
+/**
+ * Отправляет уведомление о новом сообщении в поддержку в личные сообщения VK.
+ * @param {Object} supportData - Данные из формы поддержки.
+ */
+async function sendVkNotification(supportData) {
+    // ⚠️ ВАЖНО: Замените на ваш реальный токен и ID.
+    // В целях безопасности лучше хранить их в переменных окружения (например, на сервере),
+    // а не в клиентском коде.
+    const VK_ACCESS_TOKEN = 'vk1.a.wpCQAKqGslU2sTOYFF0tmcf-sHMcCCvTVB_vgKireR3-ja-tDd5XD495bbfWebuBO9xloM04YIRuiq3FbQRyZRent8GWydI0yfvOwKWT84WfUY9uUfV5FfomyxWpS1wpYkTfMm37Ih8ElWhggH3_IiUErNGFPnmSnx6LvrkImIzm75E_5OrjFF5ec9-GHEKP_7ZZq0byF8FbTZT-B6p0Zg'; 
+    const YOUR_VK_USER_ID = '624264487'; // Числовой ID, например 12345678
+    const VK_API_VERSION = '5.199';
+
+    // Формируем текст уведомления
+    const message = `
+🔔 Новое сообщение из SportApp!
+
+👤 От: ${supportData.userName || 'Пользователь'} (${supportData.userEmail || 'без email'})
+📞 Контакт: ${supportData.userContact || 'не указан'}
+📂 Тема: ${supportData.subject}
+
+💬 Сообщение:
+${supportData.message}
+    `.trim();
+
+    try {
+        const response = await fetch('https://api.vk.com/method/messages.send', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+                'user_id': YOUR_VK_USER_ID,      // Кому отправляем
+                'message': message,              // Текст сообщения
+                'access_token': VK_ACCESS_TOKEN, // Токен сообщества
+                'v': VK_API_VERSION,             // Версия API
+                'random_id': Math.floor(Math.random() * 2**31) // Уникальный ID, чтобы избежать дублей
+            })
+        });
+
+        const result = await response.json();
+        if (result.error) {
+            console.error('VK API error:', result.error);
+        } else {
+            console.log('VK уведомление отправлено!', result);
+        }
+    } catch (error) {
+        console.error('Не удалось отправить VK уведомление:', error);
+    }
+}
+
+// =================== ПРОГРЕСС ТЕЛА (ЗАМЕРЫ) ===================
+let _cachedMeasurements = [];
+let _bodyProgressMonthOffset = 0;
+
+const BODY_PARAMS = [
+    { key: 'weight', label: 'Вес',    unit: 'кг', color: '#DC143C' },
+    { key: 'height', label: 'Рост',   unit: 'см', color: '#3B82F6' },
+    { key: 'chest',  label: 'Грудь',  unit: 'см', color: '#22C55E' },
+    { key: 'waist',  label: 'Талия',  unit: 'см', color: '#F59E0B' },
+    { key: 'hips',   label: 'Бёдра',  unit: 'см', color: '#8B5CF6' },
+    { key: 'arm',    label: 'Бицепс', unit: 'см', color: '#EC4899' }
+];
+
+const MONTH_NAMES_RU = ['Январь','Февраль','Март','Апрель','Май','Июнь',
+                        'Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+
+async function loadBodyMeasurements() {
+    const user = await getFirebaseUser();
+    if (!user) return;
+
+    try {
+        const snap = await firebase.firestore()
+            .collection('measurements')
+            .where('userId', '==', user.uid)
+            .orderBy('date', 'desc')
+            .limit(300)
+            .get();
+
+        const list = [];
+        snap.forEach(doc => list.push({ id: doc.id, ...doc.data() }));
+
+        _cachedMeasurements = list;
+        renderBodyProgress(list);
+    } catch (e) {
+        console.error('Ошибка загрузки замеров:', e);
+    }
+}
+
+function changeBodyProgressMonth(delta) {
+    _bodyProgressMonthOffset += delta;
+    renderBodyProgress(_cachedMeasurements);
+}
+window.changeBodyProgressMonth = changeBodyProgressMonth;
+
+function renderBodyProgress(list) {
+    const chartBox = document.getElementById('bodyProgressChart');
+    const titleEl = document.getElementById('bodyProgressMonthTitle');
+    if (!chartBox) return;
+
+    // ★ Отображаемый месяц
+    const now = new Date();
+    now.setDate(1);
+    now.setMonth(now.getMonth() + _bodyProgressMonthOffset);
+    const year = now.getFullYear();
+    const month = now.getMonth();
+
+    if (titleEl) titleEl.textContent = MONTH_NAMES_RU[month] + ' ' + year;
+
+    // ★ Диапазон месяца
+    const monthStart = new Date(year, month, 1, 0, 0, 0, 0);
+    const monthEnd = new Date(year, month + 1, 0, 23, 59, 59, 999);
+
+    const monthMeasurements = (list || [])
+        .filter(m => {
+            const d = new Date(m.date);
+            return d >= monthStart && d <= monthEnd;
+        })
+        .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    // ★ Активные параметры = те, по которым есть хотя бы одна точка за месяц
+    const activeParams = BODY_PARAMS.filter(p =>
+        monthMeasurements.some(m => typeof m[p.key] === 'number' && m[p.key] > 0)
+    );
+
+    if (activeParams.length === 0) {
+        chartBox.innerHTML = `
+            <div class="body-progress-empty-state">
+                <div class="body-progress-empty-icon">📏</div>
+                <div class="body-progress-empty-title">Нет замеров за ${MONTH_NAMES_RU[month].toLowerCase()}</div>
+                <div class="body-progress-empty-text">
+                    Добавьте первый замер, чтобы увидеть динамику на графике.
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    // ★ Рисуем SVG
+    chartBox.innerHTML = buildBodyChartSVG(activeParams, monthMeasurements, monthStart, monthEnd);
+}
+
+function buildBodyChartSVG(activeParams, monthMeasurements, monthStart, monthEnd) {
+    const W = 500;
+    const H = 260;
+    const PAD = { left: 34, right: 14, top: 30, bottom: 28 };
+    const innerW = W - PAD.left - PAD.right;
+    const innerH = H - PAD.top - PAD.bottom;
+
+    const totalMs = monthEnd.getTime() - monthStart.getTime();
+    const getX = (date) => PAD.left + ((date.getTime() - monthStart.getTime()) / totalMs) * innerW;
+
+    // Все значения всех параметров — для общей Y-шкалы
+    const allValues = [];
+    activeParams.forEach(param => {
+        monthMeasurements
+            .filter(m => typeof m[param.key] === 'number' && m[param.key] > 0)
+            .forEach(m => allValues.push(m[param.key]));
+    });
+
+    if (allValues.length === 0) return '';
+
+    const minAll = Math.min(...allValues);
+    const maxAll = Math.max(...allValues);
+    const rangeAll = maxAll - minAll || 1;
+    const padV = Math.max(rangeAll * 0.1, 3);
+    const yMin = minAll - padV;
+    const yMax = maxAll + padV;
+    const yRange = yMax - yMin;
+
+    const getY = (val) => PAD.top + ((yMax - val) / yRange) * innerH;
+
+    // ── Y-метки ──
+    const ySteps = 6;
+    let yLabels = '';
+    for (let i = 0; i <= ySteps; i++) {
+        const val = yMin + (yRange / ySteps) * i;
+        const y = getY(val);
+        const r = Math.round(val * 10) / 10;
+        yLabels += `<text x="${PAD.left - 10}" y="${y + 3}" text-anchor="end" font-size="9" fill="#94A3B8">${Number.isInteger(r) ? r : r.toFixed(1)}</text>`;
+    }
+
+    // ── ★ X-метки — только реальные даты замеров ──
+    const uniqueDates = [...new Set(
+        monthMeasurements.map(m => new Date(m.date).getTime())
+    )].sort((a, b) => a - b);
+
+    const MAX_LABELS = 6;
+    const labelStep = Math.max(1, Math.ceil(uniqueDates.length / MAX_LABELS));
+
+    let xLabels = '';
+    uniqueDates.forEach((ts, i) => {
+        const isFirst = i === 0;
+        const isLast  = i === uniqueDates.length - 1;
+        if (!isFirst && !isLast && i % labelStep !== 0) return;
+
+        const x = getX(new Date(ts));
+        const d = new Date(ts);
+        const label = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getFullYear()).slice(-2)}`;
+
+        let anchor = 'middle';
+        if (isFirst && uniqueDates.length > 1) anchor = 'start';
+        if (isLast  && uniqueDates.length > 1) anchor = 'end';
+
+        xLabels += `<text x="${x}" y="${H - 8}" text-anchor="${anchor}" font-size="9" fill="#94A3B8">${label}</text>`;
+    });
+
+    // ── Линии по параметрам ──
+    let lines = '';
+    activeParams.forEach(param => {
+        const pts = monthMeasurements
+            .filter(m => typeof m[param.key] === 'number' && m[param.key] > 0)
+            .map(m => ({ date: new Date(m.date), value: m[param.key] }));
+
+        if (pts.length === 0) return;
+
+        const xy = pts.map(p => ({ x: getX(p.date), y: getY(p.value), v: p.value }));
+
+        if (xy.length >= 2) {
+            let path = `M ${xy[0].x},${xy[0].y}`;
+            for (let j = 0; j < xy.length - 1; j++) {
+                const p0 = xy[j - 1] || xy[j];
+                const p1 = xy[j];
+                const p2 = xy[j + 1];
+                const p3 = xy[j + 2] || p2;
+                const cp1x = p1.x + (p2.x - p0.x) / 6;
+                const cp1y = p1.y + (p2.y - p0.y) / 6;
+                const cp2x = p2.x - (p3.x - p1.x) / 6;
+                const cp2y = p2.y - (p3.y - p1.y) / 6;
+                path += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${p2.x},${p2.y}`;
+            }
+            lines += `<path d="${path}" fill="none" stroke="${param.color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />`;
+        }
+
+        xy.forEach(p => {
+            lines += `<circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${param.color}" stroke="var(--chart-dot-stroke)" stroke-width="1.5" />`;
+        });
+    });
+
+    const legendHtml = activeParams.map(p =>
+        `<span style="color:${p.color};font-weight:700;flex:1;text-align:center;white-space:nowrap;">${p.label}</span>`
+    ).join('');
+
+    return `
+        <div class="weekly-load-Chart">
+            <div style="position:relative; padding:0.5rem;
+                background-image:
+                    linear-gradient(rgba(100, 100, 100, 0.1) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(100, 100, 100, 0.1) 1px, transparent 1px);
+                background-size: 20px 20px;
+                border-radius:12px;">
+                <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" style="width:100%; height:auto; display:block;">
+                    ${yLabels}
+                    ${xLabels}
+                    ${lines}
+                </svg>
+
+<!-- ★ ЛЕГЕНДА ★ -->
+<div class="weekly-load-info">
+    ${legendHtml}
+</div>
+            </div>
+        </div>
+    `;
+}
+
+function openAddMeasurementModal() {
+    window._editingMeasurementId = null;
+
+    // ★ Меняем заголовок на «Новый замер»
+    const titleEl = document.getElementById('measurementModalTitle');
+    if (titleEl) titleEl.textContent = 'Новый замер';
+
+    ['measureHeight', 'measureWeight', 'measureChest', 'measureWaist', 'measureHips', 'measureArm']
+        .forEach(id => {
+            const el = document.getElementById(id);
+            if (el) { el.value = ''; el.classList.remove('error'); }
+        });
+    openModal('addMeasurementModal');
+}
+window.openAddMeasurementModal = openAddMeasurementModal;
+
+async function saveMeasurement() {
+    const user = await getFirebaseUser();
+    if (!user) { showToast('❌ Не авторизован'); return; }
+
+    const getVal = (id) => {
+        const el = document.getElementById(id);
+        if (!el) return null;
+        const v = el.value.trim();
+        return v === '' ? null : parseFloat(v);
+    };
+
+    const data = {
+        userId: user.uid,
+        date: new Date().toISOString(),
+        height: getVal('measureHeight'),
+        weight: getVal('measureWeight'),
+        chest:  getVal('measureChest'),
+        waist:  getVal('measureWaist'),
+        hips:   getVal('measureHips'),
+        arm:    getVal('measureArm')
+    };
+
+    const hasAny = ['height', 'weight', 'chest', 'waist', 'hips', 'arm'].some(k => data[k] !== null);
+    if (!hasAny) { showToast('⚠️ Заполни хотя бы одно поле'); return; }
+
+    const limits = {
+        height: [100, 250],
+        weight: [20, 500],
+        chest:  [30, 300],
+        waist:  [30, 300],
+        hips:   [30, 300],
+        arm:    [10, 100]
+    };
+    for (const key in limits) {
+        if (data[key] !== null) {
+            const [min, max] = limits[key];
+            if (data[key] < min || data[key] > max) {
+                showToast(`⚠️ Значение должно быть от ${min} до ${max}`);
+                return;
+            }
+        }
+    }
+
+    try {
+        if (window._editingMeasurementId) {
+            // ★ ОБНОВЛЕНИЕ ★
+            await firebase.firestore()
+                .collection('measurements')
+                .doc(window._editingMeasurementId)
+                .update(data);
+            window._editingMeasurementId = null;
+            showToast('✅ Замер обновлён');
+        } else {
+            // ★ СОЗДАНИЕ ★
+            data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+            await firebase.firestore().collection('measurements').add(data);
+            showToast('✅ Замер сохранён');
+        }
+
+        closeModal('addMeasurementModal');
+        await loadBodyMeasurements();
+
+        // Если открыта модалка просмотра — обновляем её
+        const viewModal = document.getElementById('bodyProgressViewModal');
+        if (viewModal && viewModal.classList.contains('modal-overlay-visible')) {
+            renderBodyProgressView();
+        }
+    } catch (e) {
+        console.error('Ошибка сохранения замера:', e);
+        showToast('❌ Не удалось сохранить');
+    }
+}
+window.saveMeasurement = saveMeasurement;
+
+function openBodyProgressInfo() {
+    openModal('bodyProgressInfoModal');
+}
+window.openBodyProgressInfo = openBodyProgressInfo;
+
+// =================== ПРОСМОТР ДАННЫХ: ГРАФИК + ИСТОРИЯ ===================
+
+let _bodyViewSelectedParam = 'weight'; // по умолчанию — вес
+
+/**
+ * Заменяем старую scrollToBodyProgress — теперь открывает НОВУЮ модалку
+ */
+function scrollToBodyProgress() {
+    closeModal('bodyProgressInfoModal');
+    setTimeout(() => {
+        // Сброс на вес при каждом открытии
+        _bodyViewSelectedParam = 'weight';
+        renderBodyProgressView();
+        openModal('bodyProgressViewModal');
+    }, 250);
+}
+window.scrollToBodyProgress = scrollToBodyProgress;
+
+/**
+ * Полный рендер модалки
+ */
+function renderBodyProgressView() {
+    renderBodyParamButtons();
+    renderBodyViewChart();
+    renderBodyViewHistory();
+}
+
+/**
+ * Кнопки параметров
+ */
+function renderBodyParamButtons() {
+    const container = document.getElementById('bodyParamsRow');
+    if (!container) return;
+
+    container.innerHTML = BODY_PARAMS.map(p => `
+        <button class="body-param-btn ${p.key === _bodyViewSelectedParam ? 'active' : ''}"
+                data-param="${p.key}"
+                onclick="selectBodyViewParam('${p.key}')">
+            ${p.label}
+        </button>
+    `).join('');
+}
+
+function selectBodyViewParam(key) {
+    _bodyViewSelectedParam = key;
+    renderBodyParamButtons();
+    renderBodyViewChart();
+    renderBodyViewHistory();
+}
+window.selectBodyViewParam = selectBodyViewParam;
+
+/**
+ * График — только для выбранного параметра
+ */
+function renderBodyViewChart() {
+    const chartBox = document.getElementById('bodyViewChart');
+    if (!chartBox) return;
+
+    const param = BODY_PARAMS.find(p => p.key === _bodyViewSelectedParam);
+    if (!param) return;
+
+    // Берём замеры, где есть это значение
+    const withValues = (_cachedMeasurements || []).filter(m =>
+        typeof m[param.key] === 'number' && m[param.key] > 0
+    );
+
+    if (withValues.length === 0) {
+        chartBox.innerHTML = `
+            <div class="body-progress-empty-state" style="min-height:180px;">
+                <div class="body-progress-empty-icon">📏</div>
+                <div class="body-progress-empty-title">Нет данных по параметру «${param.label}»</div>
+                <div class="body-progress-empty-text">Добавьте первый замер, чтобы увидеть динамику.</div>
+            </div>
+        `;
+        return;
+    }
+
+    chartBox.innerHTML = buildSingleParamChart(param, withValues);
+}
+
+/**
+ * SVG-график по одному параметру (все даты)
+ */
+function buildSingleParamChart(param, measurements) {
+    const W = 500;
+    const H = 220;
+    const PAD = { left: 34, right: 14, top: 20, bottom: 28 };
+    const innerW = W - PAD.left - PAD.right;
+    const innerH = H - PAD.top - PAD.bottom;
+
+    const sorted = [...measurements].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    const startMs = new Date(sorted[0].date).getTime();
+    const endMs   = new Date(sorted[sorted.length - 1].date).getTime();
+    const totalMs = Math.max(1, endMs - startMs);
+
+    const getX = (date) => PAD.left + ((new Date(date).getTime() - startMs) / totalMs) * innerW;
+
+    const values = sorted.map(m => m[param.key]);
+    const minV = Math.min(...values);
+    const maxV = Math.max(...values);
+    const range = maxV - minV || 1;
+    const padV = Math.max(range * 0.15, 1);
+    const yMin = minV - padV;
+    const yMax = maxV + padV;
+    const yRange = yMax - yMin;
+
+    const getY = (val) => PAD.top + ((yMax - val) / yRange) * innerH;
+
+    // Y-метки
+    let yLabels = '';
+    const ySteps = 4;
+    for (let i = 0; i <= ySteps; i++) {
+        const val = yMin + (yRange / ySteps) * i;
+        const y = getY(val);
+        const r = Math.round(val * 10) / 10;
+        yLabels += `<text x="${PAD.left - 10}" y="${y + 3}" text-anchor="end" font-size="9" fill="#94A3B8">${Number.isInteger(r) ? r : r.toFixed(1)}</text>`;
+    }
+
+// X-метки — реальные даты замеров
+let xLabels = '';
+const totalPoints = sorted.length;
+
+sorted.forEach((m, i) => {
+    const isFirst = i === 0;
+    const isLast  = i === totalPoints - 1;
+    const x = getX(m.date);
+    const d = new Date(m.date);
+    const label = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getFullYear()).slice(-2)}`;
+
+    let anchor = 'middle';
+    if (isFirst && totalPoints > 1) anchor = 'start';
+    if (isLast  && totalPoints > 1) anchor = 'end';
+
+    xLabels += `<text x="${x}" y="${H - 8}" text-anchor="${anchor}" font-size="9" fill="#94A3B8">${label}</text>`;
+});
+
+    // Точки + сглаженная линия
+    const pts = sorted.map(m => ({ x: getX(m.date), y: getY(m[param.key]) }));
+
+    let path = '';
+    if (pts.length >= 2) {
+        path = `M ${pts[0].x},${pts[0].y}`;
+        for (let j = 0; j < pts.length - 1; j++) {
+            const p0 = pts[j - 1] || pts[j];
+            const p1 = pts[j];
+            const p2 = pts[j + 1];
+            const p3 = pts[j + 2] || p2;
+            const cp1x = p1.x + (p2.x - p0.x) / 6;
+            const cp1y = p1.y + (p2.y - p0.y) / 6;
+            const cp2x = p2.x - (p3.x - p1.x) / 6;
+            const cp2y = p2.y - (p3.y - p1.y) / 6;
+            path += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${p2.x},${p2.y}`;
+        }
+    }
+
+    const pointsHtml = pts.map(p =>
+        `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${param.color}" stroke="var(--chart-dot-stroke)" stroke-width="2" />`
+    ).join('');
+
+    return `
+        <div style="position:relative; padding:0.5rem;
+            background-image:
+                linear-gradient(rgba(100, 100, 100, 0.1) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(100, 100, 100, 0.1) 1px, transparent 1px);
+            background-size: 20px 20px;
+            border-radius:12px;">
+            <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" style="width:100%; height:auto; display:block;">
+                ${yLabels}
+                ${xLabels}
+                ${path ? `<path d="${path}" fill="none" stroke="${param.color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />` : ''}
+                ${pointsHtml}
+            </svg>
+        </div>
+    `;
+}
+
+/**
+ * История замеров по выбранному параметру
+ */
+function renderBodyViewHistory() {
+    const container = document.getElementById('bodyViewHistory');
+    if (!container) return;
+
+    const param = BODY_PARAMS.find(p => p.key === _bodyViewSelectedParam);
+    if (!param) return;
+
+    const items = (_cachedMeasurements || [])
+        .filter(m => typeof m[param.key] === 'number' && m[param.key] > 0)
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    if (items.length === 0) {
+        container.innerHTML = `<div style="text-align:center; color: var(--slate); padding: 1rem; font-size: 0.8rem;">Нет замеров по этому параметру</div>`;
+        return;
+    }
+
+    container.innerHTML = items.map(m => {
+const d = new Date(m.date);
+const dateStr = d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+
+return `
+    <div class="body-history-item">
+        <div class="body-history-info">
+            <div class="body-history-date">${dateStr}</div>
+            <div class="body-history-value">${m[param.key]} ${param.unit}</div>
+        </div>
+                <div class="body-history-actions">
+                    <button class="body-history-btn edit" onclick="editMeasurement('${m.id}')" title="Изменить">
+                        <i class="fa-regular fa-pen-to-square"></i>
+                    </button>
+                    <button class="body-history-btn delete" onclick="deleteMeasurement('${m.id}')" title="Удалить">
+                        <i class="fa-regular fa-trash-can"></i>
+                    </button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function editMeasurement(id) {
+    const m = _cachedMeasurements.find(x => x.id === id);
+    if (!m) { showToast('❌ Замер не найден'); return; }
+
+    closeModal('bodyProgressViewModal');
+
+    const fields = {
+        measureHeight: 'height',
+        measureWeight: 'weight',
+        measureChest:  'chest',
+        measureWaist:  'waist',
+        measureHips:   'hips',
+        measureArm:    'arm'
+    };
+
+    Object.entries(fields).forEach(([elId, key]) => {
+        const el = document.getElementById(elId);
+        if (el) {
+            el.value = (m[key] !== null && m[key] !== undefined) ? m[key] : '';
+            el.classList.remove('error');
+        }
+    });
+
+    window._editingMeasurementId = id;
+
+    // ★ Меняем заголовок на «Редактировать замер»
+    const titleEl = document.getElementById('measurementModalTitle');
+    if (titleEl) titleEl.textContent = 'Редактировать замер';
+
+    setTimeout(() => openModal('addMeasurementModal'), 250);
+}
+window.editMeasurement = editMeasurement;
+
+function deleteMeasurement(id) {
+    const param = BODY_PARAMS.find(p => p.key === _bodyViewSelectedParam);
+    if (!param) return;
+
+    // ★★★ Находим замер, чтобы взять его дату ★★★
+    const measurement = _cachedMeasurements.find(m => m.id === id);
+    if (!measurement) {
+        showToast('❌ Замер не найден');
+        return;
+    }
+
+    const d = new Date(measurement.date);
+    const dateStr = d.toLocaleDateString('ru-RU', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric'
+    });
+
+    showConfirmModal(
+        `Удалить «${param.label} ${dateStr}»?`,
+        `Это действие нельзя отменить.`,
+        async function() {
+            try {
+                const docRef = firebase.firestore()
+                    .collection('measurements')
+                    .doc(id);
+
+                const docSnap = await docRef.get();
+                if (!docSnap.exists) {
+                    showToast('❌ Замер не найден');
+                    return;
+                }
+
+                const data = docSnap.data();
+
+                // ★★★ Проверяем: остались ли ещё какие-то значения? ★★★
+                const allKeys = ['height', 'weight', 'chest', 'waist', 'hips', 'arm'];
+                const hasOtherValues = allKeys.some(k =>
+                    k !== param.key &&
+                    typeof data[k] === 'number' && data[k] > 0
+                );
+
+                if (hasOtherValues) {
+                    // ★ В документе есть другие параметры — обнуляем только наш ★
+                    const update = {};
+                    update[param.key] = null;
+                    await docRef.update(update);
+                    showToast(`🗑️ Параметр «${param.label}» удалён`);
+                } else {
+                    // ★ В документе больше ничего нет — удаляем целиком ★
+                    await docRef.delete();
+                    showToast('🗑️ Замер удалён');
+                }
+
+                // Обновляем кэш и перерисовываем
+                await loadBodyMeasurements();
+                renderBodyProgressView();
+
+            } catch (e) {
+                console.error('Ошибка удаления замера:', e);
+                showToast('❌ Не удалось удалить');
+            }
+        },
+        'Удалить'
+    );
+}
+window.deleteMeasurement = deleteMeasurement;
+
+// =================== ЮРИДИЧЕСКИЕ ДОКУМЕНТЫ ===================
+
+/** Открыть Пользовательское соглашение */
+function openTermsModal() {
+    openModal('termsModal');
+}
+window.openTermsModal = openTermsModal;
+
+/** Открыть Политику конфиденциальности */
+function openPrivacyModal() {
+    openModal('privacyModal');
+}
+window.openPrivacyModal = openPrivacyModal;
+
+function openConsentModal() {
+    openModal('consentModal');
+}
+window.openConsentModal = openConsentModal;
+
+// ─────────────────────────────────────────────────────────────
+// ★★★ ТЕКСТЫ-ЗАГЛУШКИ ★★★
+// Перед публикацией заменить на реальные документы от юриста!
+// ─────────────────────────────────────────────────────────────
+
+const LEGAL_UPDATED_DATE = '28.09.2026';
+
+// ---------- ПОЛЬЗОВАТЕЛЬСКОЕ СОГЛАШЕНИЕ ----------
+const TERMS_TEXT = `
+    <span class="legal-updated">Редакция от ${LEGAL_UPDATED_DATE}</span>
+
+    <h3>1. Общие положения</h3>
+    <p>
+        Настоящее Пользовательское соглашение (далее — «Соглашение») регулирует
+        отношения между администрацией приложения <strong>SportApp</strong>
+        (далее — «Администрация») и пользователем (далее — «Пользователь»).
+    </p>
+    <p>
+        Используя приложение, Пользователь подтверждает, что ознакомлен с условиями
+        Соглашения и принимает их в полном объёме.
+    </p>
+
+    <h3>2. Предмет соглашения</h3>
+    <p>
+        Администрация предоставляет Пользователю доступ к функционалу приложения
+        для ведения учёта тренировок, отслеживания прогресса и взаимодействия
+        с другими пользователями.
+    </p>
+
+    <h3>3. Права и обязанности Пользователя</h3>
+    <ul>
+        <li>предоставлять достоверные данные при регистрации;</li>
+        <li>не использовать приложение в противоправных целях;</li>
+        <li>не передавать доступ к своему аккаунту третьим лицам;</li>
+        <li>соблюдать правила общения с другими пользователями.</li>
+    </ul>
+
+    <h3>4. Ответственность</h3>
+    <p>
+        Приложение предоставляется «как есть». Администрация не несёт ответственности
+        за возможный вред здоровью, полученный в результате выполнения тренировок.
+        Пользователь самостоятельно оценивает свои физические возможности.
+    </p>
+
+    <h3>5. Изменение условий</h3>
+    <p>
+        Администрация вправе изменять условия Соглашения. Актуальная версия всегда
+        доступна внутри приложения.
+    </p>
+
+    <h3>6. Контакты</h3>
+    <p>
+        По всем вопросам — через раздел «Связь с администрацией» в настройках приложения.
+    </p>
+`;
+
+// ---------- ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ ----------
+const PRIVACY_TEXT = `
+    <span class="legal-updated">Редакция от ${LEGAL_UPDATED_DATE}</span>
+
+    <h3>1. Какие данные мы собираем</h3>
+    <ul>
+        <li><strong>Email</strong> — для авторизации и связи;</li>
+        <li><strong>Имя</strong> — для отображения в профиле и рейтингах;</li>
+        <li><strong>Пол</strong> — для подбора тренировок (например, ГТО);</li>
+        <li><strong>Данные о тренировках</strong> — для статистики и прогресса;</li>
+        <li><strong>Параметры тела</strong> (вес, рост, обхваты) — по желанию, для отслеживания прогресса;</li>
+        <li><strong>Список друзей</strong> — для социальных функций.</li>
+    </ul>
+
+    <h3>2. Как мы используем данные</h3>
+    <p>
+        Данные используются исключительно для работы функционала приложения:
+        отображения статистики, подбора тренировок, рейтингов, уведомлений.
+    </p>
+
+    <h3>3. Кому мы передаём данные</h3>
+    <p>
+        Данные хранятся в защищённой облачной инфраструктуре (Google Firebase).
+        Мы не продаём и не передаём данные третьим лицам в маркетинговых целях.
+    </p>
+
+    <h3>4. Хранение и защита</h3>
+    <p>
+        Все данные передаются по защищённому протоколу HTTPS. Доступ к аккаунту
+        защищён паролем, который хранится в зашифрованном виде.
+    </p>
+
+    <h3>5. Ваши права</h3>
+    <ul>
+        <li>изменить или удалить свои данные в любой момент;</li>
+        <li>запросить полное удаление аккаунта через настройки приложения;</li>
+        <li>отозвать согласие, прекратив использование приложения.</li>
+    </ul>
+
+    <h3>6. Cookie и локальное хранилище</h3>
+    <p>
+        Приложение использует localStorage браузера для сохранения настроек
+        (тема, цвет, раскладки страниц). Эти данные не передаются на сервер
+        без вашего действия.
+    </p>
+
+    <h3>7. Контакты</h3>
+    <p>
+        По вопросам, связанным с обработкой персональных данных — через раздел
+        «Связь с администрацией» в настройках приложения.
+    </p>
+`;
+
+const CONSENT_TEXT = `
+    <span class="legal-updated">Редакция от ${LEGAL_UPDATED_DATE}</span>
+
+    <p>
+        Настоящим я, субъект персональных данных, в соответствии с Федеральным законом
+        от 27.07.2006 № 152-ФЗ «О персональных данных» даю своё согласие администрации
+        приложения <strong>SportApp</strong> на обработку моих персональных данных
+        на следующих условиях.
+    </p>
+
+    <h3>1. Перечень данных</h3>
+    <ul>
+        <li>фамилия, имя (или псевдоним);</li>
+        <li>адрес электронной почты;</li>
+        <li>пол;</li>
+        <li>параметры тела (рост, вес, обхваты) — по желанию;</li>
+        <li>данные о физической активности и тренировках;</li>
+        <li>технические данные (IP, тип устройства, версия ОС).</li>
+    </ul>
+
+    <h3>2. Цели обработки</h3>
+    <ul>
+        <li>работа функционала приложения (учёт тренировок, статистика);</li>
+        <li>персонализация тренировок и рекомендаций;</li>
+        <li>социальные функции (друзья, рейтинги, совместные тренировки);</li>
+        <li>информирование об обновлениях и важных событиях.</li>
+    </ul>
+
+    <h3>3. Способы обработки</h3>
+    <p>
+        Обработка включает сбор, запись, хранение, уточнение, использование,
+        обезличивание, блокирование и удаление данных с использованием
+        средств автоматизации и без таковых.
+    </p>
+
+    <h3>4. Передача третьим лицам</h3>
+    <p>
+        Данные хранятся в облачной инфраструктуре Google Firebase. Передача иным
+        третьим лицам, кроме случаев, предусмотренных законом, не осуществляется.
+    </p>
+
+    <h3>5. Срок действия согласия</h3>
+    <p>
+        Согласие действует с момента его предоставления до момента отзыва.
+        Согласие может быть отозвано в любой момент путём удаления аккаунта
+        в настройках приложения либо направления запроса через раздел
+        «Связь с администрацией».
+    </p>
+
+    <h3>6. Подтверждение</h3>
+    <p>
+        Я подтверждаю, что ознакомлен(а) с условиями настоящего согласия,
+        мне понятны мои права, и я даю согласие добровольно и в своих интересах.
+    </p>
+`;
+
+/** Заполнить модалки текстами при загрузке */
+document.addEventListener('DOMContentLoaded', () => {
+    const termsEl = document.getElementById('termsText');
+    if (termsEl) termsEl.innerHTML = TERMS_TEXT;
+
+    const privacyEl = document.getElementById('privacyText');
+    if (privacyEl) privacyEl.innerHTML = PRIVACY_TEXT;
+
+    const consentEl = document.getElementById('consentText');   // ← добавили
+    if (consentEl) consentEl.innerHTML = CONSENT_TEXT;          // ← добавили
+});
+
+// =================== ПОДЕЛИТЬСЯ ТРЕНИРОВКОЙ ПО ССЫЛКЕ ===================
+
+/**
+ * Кодирует строку в URL-safe base64
+ */
+function _encodeShareBase64(str) {
+    return btoa(unescape(encodeURIComponent(str)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+/**
+ * Декодирует URL-safe base64 в строку
+ */
+function _decodeShareBase64(str) {
+    const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+    return decodeURIComponent(escape(atob(padded)));
+}
+
+/**
+ * Поделиться тренировкой через ссылку
+ */
+async function shareWorkoutLink(title, exercises, icon, restTime) {
+    if (!exercises || exercises.length === 0) {
+        showToast('⚠️ Нечего делиться — нет упражнений');
+        return;
+    }
+
+    // ★ Компактный формат: массив массивов вместо объектов
+    // [name, sets, reps, weight, icon]
+    const payload = {
+        t: title,
+        i: icon || null,
+        r: parseInt(restTime) || 30,
+        e: exercises.map(ex => [
+            String(ex.name || ''),
+            parseInt(ex.sets) || 3,
+            String(ex.reps || '12'),
+            parseFloat(ex.weight) || 0,
+            ex.icon || null
+        ])
+    };
+
+    let encoded;
+    try {
+        encoded = _encodeShareBase64(JSON.stringify(payload));
+    } catch (e) {
+        console.error('Ошибка кодирования:', e);
+        showToast('❌ Не удалось создать ссылку');
+        return;
+    }
+
+    const base = window.location.origin + window.location.pathname;
+    const url = `${base}?w=${encoded}`;
+    const text = `Тренировка "${title}" в SportApp. Открой ссылку, чтобы добавить её себе:`;
+
+    // ★ Если ссылка слишком длинная — предупреждаем
+    if (url.length > 1800) {
+        showToast('⚠️ Тренировка слишком большая для ссылки');
+        return;
+    }
+
+    // ★ Пробуем нативное меню «Поделиться»
+    if (navigator.share) {
+        try {
+            await navigator.share({
+                title: 'Тренировка в SportApp',
+                text: text,
+                url: url
+            });
+            console.log('✅ Открыто системное меню «Поделиться»');
+            return;
+        } catch (err) {
+            if (err.name === 'AbortError') {
+                // Пользователь сам закрыл меню — выходим тихо
+                return;
+            }
+            console.warn('Share API не сработал:', err);
+        }
+    }
+
+    // ★ Fallback — копируем в буфер + тост
+    const fullText = `${text}\n${url}`;
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(fullText);
+            showToast('✅ Тренировка скопирована!');
+            return;
+        }
+
+        // Старый способ через textarea
+        const ta = document.createElement('textarea');
+        ta.value = fullText;
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+
+        if (ok) {
+            showToast('✅ Тренировка скопирована!');
+        } else {
+            showShareWorkoutLinkManual(url);
+        }
+    } catch (err) {
+        console.error('Копирование не удалось:', err);
+        showShareWorkoutLinkManual(url);
+    }
+}
+
+/**
+ * Резервная модалка со ссылкой для ручного копирования
+ */
+function showShareWorkoutLinkManual(url) {
+    const old = document.getElementById('manualWorkoutLinkModal');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'manualWorkoutLinkModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">Ссылка на тренировку</div>
+            <p class="modal-text" style="margin-bottom:1rem;">
+                Выделите ссылку и скопируйте вручную
+            </p>
+            <input type="text" id="manualWorkoutLinkInput"
+                   class="form-input"
+                   value="${url}"
+                   readonly
+                   style="margin-bottom:1rem; text-align:center; font-size:0.75rem;"
+                   onclick="this.select();" />
+            <button class="btn btn-primary" onclick="closeModal('manualWorkoutLinkModal')">
+                Понятно
+            </button>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    setTimeout(() => {
+        const input = document.getElementById('manualWorkoutLinkInput');
+        if (input) {
+            input.focus();
+            input.select();
+        }
+    }, 100);
+}
+
+/**
+ * Применяет тренировку из ссылки — добавляет в личные
+ */
+async function applySharedWorkout(payload) {
+    if (!payload || !Array.isArray(payload.e) || payload.e.length === 0) {
+        showToast('❌ Тренировка пустая');
+        return false;
+    }
+
+    const exercises = payload.e.map(arr => ({
+        name: String(arr[0] || 'Упражнение'),
+        sets: parseInt(arr[1]) || 3,
+        reps: String(arr[2] || '12'),
+        weight: parseFloat(arr[3]) || 0,
+        icon: arr[4] || null
+    }));
+
+    const title = payload.t || 'Тренировка из ссылки';
+    const icon = payload.i || null;
+    const restTime = parseInt(payload.r) || 30;
+
+    const existing = getMyWorkouts();
+    const duplicate = existing.find(w =>
+        w.title === title &&
+        Array.isArray(w.exercises) &&
+        w.exercises.length === exercises.length
+    );
+
+    if (duplicate) {
+        console.log('ℹ️ Такая тренировка уже есть:', duplicate._id);
+        showSharedWorkoutAddedModal(duplicate, exercises.length, true);
+        return false;                       // ★ дубликат — не считаем
+    }
+
+    const newWorkout = {
+        _id: Date.now().toString(),
+        title: title,
+        icon: icon,
+        exercises: exercises,
+        restTime: restTime
+    };
+
+    existing.push(newWorkout);
+    saveMyWorkouts(existing);
+
+    console.log('✅ Тренировка добавлена в личные:', newWorkout._id);
+    showSharedWorkoutAddedModal(newWorkout, exercises.length, false);
+    return true;                            // ★ реально добавили
+}
+
+/**
+ * Модалка после добавления тренировки из ссылки
+ */
+function showSharedWorkoutAddedModal(workout, exercisesCount, isDuplicate) {
+    const old = document.getElementById('sharedWorkoutModal');
+    if (old) old.remove();
+
+    const exercisesWord = declOfNum(exercisesCount, ['упражнение', 'упражнения', 'упражнений']);
+    const titleText = isDuplicate ? 'Тренировка уже у вас' : 'Тренировка добавлена!';
+    const messageText = isDuplicate
+        ? `Тренировка "${workout.title}" уже есть в ваших личных.`
+        : `Тренировка "${workout.title}" (${exercisesCount} ${exercisesWord}) добавлена в ваши личные тренировки.`;
+    const iconClass = isDuplicate ? 'fa-solid fa-circle-info' : 'fa-solid fa-circle-check';
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'sharedWorkoutModal';
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-title">${titleText}</div>
+            <div style="text-align:center; font-size:3rem; color: var(--accent); margin: 0.5rem 0;">
+                <i class="${iconClass}"></i>
+            </div>
+            <p class="modal-text">${messageText}</p>
+            <div style="display: flex; gap: 0.5rem; width: 100%;">
+                <button class="btn btn-secondary" id="sharedWorkoutCloseBtn" style="flex: 1;">
+                    Позже
+                </button>
+                <button class="btn btn-primary" id="sharedWorkoutOpenBtn" style="flex: 1;">
+                    Открыть
+                </button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    document.getElementById('sharedWorkoutOpenBtn').addEventListener('click', () => {
+        closeModal('sharedWorkoutModal');
+        window.navigateTo('workout-detail', {
+            category: workout.title,
+            isCustom: true,
+            id: workout._id
+        });
+    });
+
+    document.getElementById('sharedWorkoutCloseBtn').addEventListener('click', () => {
+        closeModal('sharedWorkoutModal');
+    });
+}
+
+
+/**
+ * Обработка ссылки на программу:
+ * SportApp/?p=ID_ПОСТА
+ */
+async function checkProgramShareLink() {
+    const params = new URLSearchParams(window.location.search);
+    const postId = params.get('p');
+
+    if (!postId) return;
+
+    // Убираем параметр из адресной строки
+    window.history.replaceState(
+        {},
+        '',
+        window.location.pathname
+    );
+
+    // Сохраняем ссылку, если пользователь ещё не вошёл
+    localStorage.setItem(
+        'pendingSharedProgramPostId',
+        postId
+    );
+
+    const user = await getFirebaseUser();
+
+    if (user && isInsideApp()) {
+        localStorage.removeItem('pendingSharedProgramPostId');
+
+        await addSharedProgramFromPost(postId);
+    }
+}
+
+window.checkProgramShareLink = checkProgramShareLink;
+
+
+/**
+ * Проверка ссылки ?w=... при загрузке страницы
+ */
+async function checkWorkoutShareLink() {
+    const params = new URLSearchParams(window.location.search);
+    const encoded = params.get('w');
+    if (!encoded) return;
+
+    // Убираем параметр из URL, чтобы не залипал
+    window.history.replaceState({}, '', window.location.pathname);
+
+    // Декодируем
+    let payload;
+    try {
+        payload = JSON.parse(_decodeShareBase64(encoded));
+    } catch (e) {
+        console.warn('Не удалось разобрать ссылку на тренировку:', e);
+        showToast('❌ Ссылка повреждена или устарела');
+        return;
+    }
+
+    // ★ Сохраняем на случай, если пользователь ещё не залогинен
+    localStorage.setItem('pendingSharedWorkout', JSON.stringify(payload));
+    console.log('💾 Тренировка из ссылки сохранена, применим после входа в приложение');
+
+    // Если уже в приложении — применяем сразу
+    const user = await getFirebaseUser();
+    if (user && isInsideApp()) {
+        localStorage.removeItem('pendingSharedWorkout');
+        await applySharedWorkout(payload);
+    }
+}
+
+// Экспорт
+window.shareWorkoutLink = shareWorkoutLink;
+window.applySharedWorkout = applySharedWorkout;
+window.checkWorkoutShareLink = checkWorkoutShareLink;
+
+// =================== ЛЕНТА (FEED) ===================
+const POST_DATE_KEY = 'sportapp_lastPostDate';   // локальный кэш
+
+/** Сегодняшняя дата в формате YYYY-MM-DD по локальному времени устройства */
+function getLocalDateKey() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+}
+
+/** Проверка: может ли пользователь публиковать сегодня */
+/** Проверка: может ли пользователь публиковать сегодня */
+async function canPostToday() {
+    // ★★★ ВРЕМЕННО: лимит «1 пост в день» отключён для теста ★★★
+    // Чтобы вернуть — раскомментируйте блок ниже и удалите `return { allowed: true };`
+    return { allowed: true };
+
+    /*
+    const user = await getFirebaseUser();
+    if (!user) return { allowed: false, reason: 'no-auth' };
+
+    try {
+        const profileResult = await getUserProfile(user.uid);
+        const profile = profileResult.success ? profileResult.data : {};
+
+        const lastPostDate = profile.lastPostDate
+            || localStorage.getItem(POST_DATE_KEY)
+            || '';
+
+        const today = getLocalDateKey();
+
+        if (lastPostDate === today) {
+            return { allowed: false, reason: 'limit' };
+        }
+        return { allowed: true };
+    } catch (e) {
+        // При ошибке — разрешаем, чтобы не блокировать пользователя зря
+        console.warn('canPostToday: ошибка проверки, разрешаем пост', e);
+        return { allowed: true };
+    }
+    */
+}
+
+/** Секунд до полуночи локального времени */
+function secondsUntilMidnight() {
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setHours(24, 0, 0, 0);
+    return Math.floor((tomorrow - now) / 1000);
+}
+
+let _feedFilter = 'all';
+let _feedPosts = [];
+let _feedSearchQuery = '';
+let _postImageBlob = null;
+let _postShareLink = true;   // по умолчанию «Да»
+
+/**
+ * Переключение фильтра: Все / Друзья
+ */
+function setFeedFilter(filter) {
+    _feedFilter = filter;
+    document.querySelectorAll('#page-feed .tab-btn').forEach(btn => {
+        btn.classList.toggle('tab-btn-active', btn.dataset.feedFilter === filter);
+    });
+    return loadFeed();
+}
+window.setFeedFilter = setFeedFilter;
+
+// Вешаем обработчик на кнопки фильтра
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('#page-feed .tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => setFeedFilter(btn.dataset.feedFilter));
+    });
+});
+
+/**
+ * Загрузка постов из Firestore
+ */
+async function loadFeed() {
+    const container = document.getElementById('feedContainer');
+    if (!container) return;
+    container.innerHTML = `<div class="feed-container">${Skeleton.feedPostList(3)}</div>`;
+
+    try {
+        const user = await getFirebaseUser();
+        if (!user) {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <span class="empty-icon">🔒</span>
+                    <h3 class="empty-title">Авторизуйтесь</h3>
+                    <p class="empty-text">Войдите, чтобы увидеть ленту.</p>
+                </div>`;
+            return;
+        }
+
+// Фильтр «Моя» — только свои посты
+let allowedIds = null;
+if (_feedFilter === 'my') {
+    allowedIds = [user.uid];
+}
+
+        // Запрос постов
+        const snapshot = await firebase.firestore()
+            .collection('posts')
+            .orderBy('createdAt', 'desc')
+            .limit(50)
+            .get();
+
+        _feedPosts = [];
+        snapshot.forEach(doc => {
+const data = doc.data();
+
+// Не показываем технические записи для передачи программ
+if (
+    data.contentType === 'program' &&
+    data.programData &&
+    !data.imageData
+) return;
+
+if (allowedIds && !allowedIds.includes(data.userId)) return;
+
+_feedPosts.push({ id: doc.id, ...data });
+        });
+
+        renderFeed();
+    } catch (error) {
+        console.error('❌ Ошибка загрузки ленты:', error);
+        let message = 'Ошибка загрузки. Проверьте интернет.';
+        if (error.code === 'failed-precondition' && error.message.includes('index')) {
+            message = 'Требуется создать индекс в Firebase (posts + createdAt).';
+        }
+        container.innerHTML = `
+            <div class="empty-state">
+                <span class="empty-icon">⚠️</span>
+                <h3 class="empty-title">Не удалось загрузить</h3>
+                <p class="empty-text">${message}</p>
+            </div>`;
+    }
+}
+window.loadFeed = loadFeed;
+
+/**
+ * Рендер постов (с поиском и лайками)
+ */
+function renderFeed() {
+    const container = document.getElementById('feedContainer');
+    if (!container) return;
+
+    const scrollTopBtn = document.getElementById('feedScrollTopBtn');
+
+    // ★ Поиск поверх уже отфильтрованного _feedPosts
+    const displayPosts = _feedPosts.filter(post => {
+        if (!_feedSearchQuery) return true;
+        const title = (post.workoutTitle || '').toLowerCase();
+        const author = (post.userName || '').toLowerCase();
+        return title.includes(_feedSearchQuery) || author.includes(_feedSearchQuery);
+    });
+
+    if (scrollTopBtn) {
+        scrollTopBtn.style.display = (_feedFilter === 'all' && displayPosts.length > 0)
+            ? 'flex' : 'none';
+    }
+
+if (displayPosts.length === 0) {
+    const noPosts = _feedPosts.length === 0;
+    const isSearch = _feedSearchQuery && !noPosts;
+
+    let title, text, actionHtml = '';
+
+    if (noPosts) {
+        if (_feedFilter === 'my') {
+            title = 'Пока нет ваших постов';
+            text = 'Поделитесь своей тренировкой — покажите прогресс друзьям!';
+        } else {
+            title = 'Пока нет постов';
+            text = 'Станьте первым, кто поделится тренировкой!';
+        }
+        actionHtml = `
+            <button class="btn btn-primary" onclick="tryOpenCreatePostModal()">
+                <i class="fa-solid fa-plus"></i> Сделать пост
+            </button>`;
+    } else {
+        title = 'Ничего не найдено';
+        text = 'По вашему запросу ничего не найдено';
+    }
+
+    container.innerHTML = `
+        <div class="empty-state">
+            <span class="empty-icon">${noPosts ? '📷' : '🔍'}</span>
+            <h3 class="empty-title">${title}</h3>
+            <p class="empty-text">${text}</p>
+            ${actionHtml}
+        </div>`;
+    return;
+}
+
+    const currentUser = firebase.auth().currentUser;
+    const currentUserId = currentUser ? currentUser.uid : null;
+
+    container.innerHTML = displayPosts.map(post => {
+        const isMe = post.userId === currentUserId;
+        const avatarSrc = post.userGender === 'female'
+            ? 'images/avatar-woman.png'
+            : 'images/avatar-men.png';
+        const timeStr = formatRelativeTime(post.createdAt);
+        const s = post.stats || {};
+        const isProgramPost = post.contentType === 'program';
+
+        // ★ Лайки
+        const likes = post.likes || [];
+        const isLiked = currentUserId && likes.includes(currentUserId);
+        const likeCount = likes.length;
+
+        return `
+            <div class="feed-post" data-post-id="${post.id}">
+                <div class="feed-post-header"
+                     style="cursor:pointer;"
+                     onclick="openPostAuthorProfile('${post.userId}', event)">
+                    <div class="feed-post-avatar">
+                        <img src="${avatarSrc}" alt="">
+                    </div>
+                    <div class="feed-post-info">
+                        <div class="feed-post-name">${post.userName || 'Пользователь'}</div>
+                        <div class="feed-post-time">${timeStr}</div>
+                    </div>
+${isMe ? `
+    <button class="feed-post-action-btn" title="Удалить"
+            onclick="deletePost('${post.id}', event)">
+        <i class="fa-regular fa-trash-can"></i>
+    </button>
+` : ''}
+                </div>
+
+                <div class="feed-post-content">
+                    <div class="feed-post-image">
+                        <img src="${post.imageData}" alt="" loading="lazy">
+                    </div>
+                    <div class="feed-post-body">
+                        <div class="feed-post-title">${post.workoutTitle || 'Тренировка'}</div>
+
+${isProgramPost ? `
+    <div class="feed-post-stats">
+        <div class="feed-post-stat">
+            <span class="feed-post-stat-label">Длительность</span>
+            <span class="feed-post-stat-value">${s.durationDays || 0} дн.</span>
+        </div>
+        <div class="feed-post-stat">
+            <span class="feed-post-stat-label">Тренировок</span>
+            <span class="feed-post-stat-value">${s.totalWorkouts || 0}</span>
+        </div>
+        <div class="feed-post-stat">
+            <span class="feed-post-stat-label">В неделю</span>
+            <span class="feed-post-stat-value">${s.weeklyWorkouts || 0}/7</span>
+        </div>
+    </div>
+` : `
+    <div class="feed-post-stats">
+        <div class="feed-post-stat">
+            <span class="feed-post-stat-label">Время</span>
+            <span class="feed-post-stat-value">${s.minutes || 0}</span>
+        </div>
+        <div class="feed-post-stat">
+            <span class="feed-post-stat-label">Упражнений</span>
+            <span class="feed-post-stat-value">${s.completed || 0}/${s.total || 0}</span>
+        </div>
+        <div class="feed-post-stat">
+            <span class="feed-post-stat-label">Прогресс</span>
+            <span class="feed-post-stat-value">+${s.xp || 0}</span>
+        </div>
+    </div>
+`}
+
+                    </div>
+                </div>
+
+                <!-- ★★★ СКАЧИВАНИЯ + ЛАЙКИ ★★★ -->
+                <div class="feed-post-footer">
+${post.shareLink || post.programShareLink ? `
+<span class="feed-download-stat ${isPostDownloaded(post.id) ? 'downloaded' : ''}"
+      data-post-id="${post.id}"
+      title="${post.contentType === 'program'
+    ? `Добавить программу. Скачали ${post.downloads || 0} раз`
+    : `Скачали тренировку ${post.downloads || 0} раз`}"
+      onclick="openPostDownloadModal('${post.id}', event)">
+    <i class="fa-solid fa-download"></i>
+    <span>${post.downloads || 0}</span>
+</span>
+` : ''}
+                    <button class="feed-like-btn ${isLiked ? 'liked' : ''}"
+                            data-post-id="${post.id}"
+                            onclick="toggleFeedLike('${post.id}', event)">
+                        <i class="${isLiked ? 'fa-solid' : 'fa-regular'} fa-heart"></i>
+                        <span>${likeCount}</span>
+                    </button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+// =================== СЧЁТЧИК СКАЧИВАНИЙ ТРЕНИРОВКИ ===================
+async function incrementPostDownloads(postId) {
+    if (!postId) return;
+
+    const user = await getFirebaseUser();
+    if (!user) return;
+
+    // ★ Уже скачивал на этом устройстве — не увеличиваем повторно
+    if (isPostDownloaded(postId)) return;
+
+    try {
+        // ★ Пишем ТОЛЬКО downloads — это правило пропустит.
+        // increment(1) гарантирует условие «старое + 1».
+        await firebase.firestore()
+            .collection('posts')
+            .doc(postId)
+            .update({
+                downloads: firebase.firestore.FieldValue.increment(1)
+            });
+
+        markPostDownloaded(postId);
+
+        const post = _feedPosts.find(p => p.id === postId);
+        if (post) {
+            post.downloads = (post.downloads || 0) + 1;
+            updateFeedDownloadCount(postId, post.downloads);
+        }
+        console.log('✅ Счётчик скачиваний увеличен:', postId);
+
+    } catch (error) {
+        console.error('❌ Не удалось увеличить счётчик:', error);
+        if (error.code === 'permission-denied') {
+            showToast('⚠️ Нет прав на обновление счётчика');
+        } else {
+            showToast('⚠️ Не удалось обновить счётчик скачиваний');
+        }
+    }
+}
+
+const DOWNLOADED_POSTS_KEY = 'downloadedPostIds';
+
+function getDownloadedPosts() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(DOWNLOADED_POSTS_KEY) || '[]');
+        return Array.isArray(raw) ? raw : [];
+    } catch { return []; }
+}
+function isPostDownloaded(postId) {
+    return getDownloadedPosts().includes(postId);
+}
+function markPostDownloaded(postId) {
+    const list = getDownloadedPosts();
+    if (!list.includes(postId)) {
+        list.push(postId);
+        localStorage.setItem(DOWNLOADED_POSTS_KEY, JSON.stringify(list));
+    }
+}
+
+function updateFeedDownloadCount(postId, count) {
+    const el = document.querySelector(`.feed-download-stat[data-post-id="${postId}"]`);
+    if (!el) return;
+
+    const span = el.querySelector('span');
+    if (span) span.textContent = count;
+
+    if (isPostDownloaded(postId)) {
+        el.classList.add('downloaded');
+    }
+}
+
+// =================== ЛАЙКИ В ЛЕНТЕ ===================
+window.toggleFeedLike = async function(postId, event) {
+    if (event) event.stopPropagation();
+
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Войдите, чтобы ставить лайки');
+        return;
+    }
+
+    const post = _feedPosts.find(p => p.id === postId);
+    if (!post) return;
+
+    const likes = post.likes || [];
+    const isLiked = likes.includes(user.uid);
+
+    // ★ Оптимистичное обновление + пульс (только при постановке лайка)
+    if (isLiked) {
+        post.likes = likes.filter(id => id !== user.uid);
+    } else {
+        post.likes = [...likes, user.uid];
+    }
+    updateFeedLikeButton(postId, post.likes, user.uid, true);
+
+    try {
+        await firebase.firestore().collection('posts').doc(postId).update({
+            likes: isLiked
+                ? firebase.firestore.FieldValue.arrayRemove(user.uid)
+                : firebase.firestore.FieldValue.arrayUnion(user.uid)
+        });
+    } catch (error) {
+        console.error('❌ Ошибка лайка:', error);
+        // ★ Откат без анимации
+        post.likes = likes;
+        updateFeedLikeButton(postId, likes, user.uid, false);
+        showToast('❌ Не удалось поставить лайк');
+    }
+};
+
+function updateFeedLikeButton(postId, likes, userId, animate = false) {
+    const btn = document.querySelector(`.feed-like-btn[data-post-id="${postId}"]`);
+    if (!btn) return;
+    const isLiked = likes.includes(userId);
+    btn.classList.toggle('liked', isLiked);
+    const icon = btn.querySelector('i');
+    if (icon) icon.className = isLiked ? 'fa-solid fa-heart' : 'fa-regular fa-heart';
+    const span = btn.querySelector('span');
+    if (span) span.textContent = likes.length;
+
+    // ★ Пульс — только если явно попросили (при клике)
+    if (animate && isLiked) {
+        btn.classList.remove('like-pulse');
+        void btn.offsetWidth;                 // ★ force reflow, чтобы animation перезапустилась
+        btn.classList.add('like-pulse');
+        setTimeout(() => btn.classList.remove('like-pulse'), 450);
+    }
+}
+
+// =================== УМНЫЙ ПОИСК ПО ЛЕНТЕ ===================
+function initFeedSearch() {
+    const input = document.getElementById('feedSearchInput');
+    const btn = document.getElementById('feedSearchBtn');
+    if (!input || !btn) return;
+
+    let timer = null;
+    input.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            _feedSearchQuery = input.value.trim().toLowerCase();
+            renderFeed();
+        }, 200);
+    });
+
+    btn.addEventListener('click', () => {
+        _feedSearchQuery = input.value.trim().toLowerCase();
+        renderFeed();
+    });
+
+    input.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            _feedSearchQuery = input.value.trim().toLowerCase();
+            renderFeed();
+        }
+    });
+}
+
+async function openPostAuthorProfile(userId, event) {
+    if (event) event.stopPropagation();
+
+    if (!userId) {
+        showToast('❌ Автор не найден');
+        return;
+    }
+
+    // ★ Всегда открываем модалку профиля с одной кнопкой «Готово»
+    await openProfileFromPost(userId);
+}
+window.openPostAuthorProfile = openPostAuthorProfile;
+
+/**
+ * Открывает модалку профиля по userId (для постов).
+ * Всегда с одной кнопкой «Готово» — независимо от того, чей это профиль.
+ */
+async function openProfileFromPost(userId) {
+    try {
+        const result = await getUserProfile(userId);
+        if (!result.success) {
+            showToast('❌ Не удалось загрузить профиль');
+            return;
+        }
+
+        const profile = result.data;
+        const name = profile.displayName || 'Пользователь';
+
+        // ★ Шапка
+        document.getElementById('friendProfileAvatar').textContent = name[0].toUpperCase();
+        document.getElementById('friendProfileName').textContent = name;
+        document.getElementById('friendProfileEmail').textContent = '';
+
+        // ★ Уровень
+        const xp = profile.totalXp || 0;
+        const currentLevel = getCurrentLevel(xp);
+        const progress = getXpProgress(xp);
+        const nextLevel = getNextLevel(xp);
+        const xpRounded = Math.round(xp);
+        const progressText = nextLevel ? `${xpRounded}/${nextLevel.minXp} XP` : `${xpRounded}+ XP`;
+
+        document.getElementById('friendLevelLvl').textContent = currentLevel.id + ' LVL';
+        document.getElementById('friendLevelTitle').textContent = currentLevel.name;
+        document.getElementById('friendLevelProgressText').textContent = progressText;
+        document.getElementById('friendLevelFill').style.width = progress + '%';
+
+        // ★ Достижения
+        const achievements = profile.achievements || {};
+        updateAchievementsUI('friendAchievements', achievements);
+        const visible = getAchievementsVisibility();
+        const achContainer = document.getElementById('friendAchievements');
+        if (achContainer) achContainer.classList.toggle('hidden', !visible);
+
+        // ★ Статистика
+        let workouts = [];
+        let totalSeconds = 0;
+        let totalExercises = 0;
+
+        try {
+            const workoutsResult = await getUserWorkoutsFromFirestore(userId);
+            if (workoutsResult.success) {
+                workouts = workoutsResult.data.filter(w => !(w.title || '').includes('Зарядка'));
+                totalSeconds = workouts.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+                totalExercises = workouts.reduce((sum, w) => {
+                    const completed = w.exercises?.filter(e => e.completed === true).length || 0;
+                    return sum + completed;
+                }, 0);
+            }
+        } catch (e) {
+            console.warn('⚠️ Ошибка загрузки тренировок:', e);
+        }
+
+        document.getElementById('friendTotalWorkouts').textContent = workouts.length;
+        document.getElementById('friendTotalMinutes').textContent = Math.floor(totalSeconds / 60);
+        document.getElementById('friendTotalExercises').textContent = totalExercises;
+
+        // ★ Кнопки: ВСЕГДА только «Готово»
+        const container = document.getElementById('friendProfileActions');
+        if (container) {
+            container.innerHTML = `
+                <button class="btn btn-primary" id="profileFromPostCloseBtn" style="flex:1;">
+                    Готово
+                </button>
+            `;
+            document.getElementById('profileFromPostCloseBtn').addEventListener('click', function() {
+                closeModal('friendProfileModal');
+            });
+        }
+
+        openModal('friendProfileModal');
+
+        // ★ Ежедневные задания: посмотреть профиль друга
+        const currentUser = firebase.auth().currentUser;
+        if (currentUser && currentUser.uid !== userId) {
+            checkDailyTasksAfterFriendProfile(userId);
+        }
+
+    } catch (error) {
+        console.error('❌ Ошибка открытия профиля:', error);
+        showToast('❌ Не удалось открыть профиль');
+    }
+}
+window.openProfileFromPost = openProfileFromPost;
+
+
+function openPostDownloadModal(postId, event) {
+    if (event) event.stopPropagation();
+
+    const post = _feedPosts.find(p => p.id === postId);
+
+    if (!post) {
+        showToast('❌ Пост не найден');
+        return;
+    }
+
+    const currentUser = firebase.auth().currentUser;
+    const currentUserId = currentUser ? currentUser.uid : null;
+    const isMe = post.userId === currentUserId;
+
+    const isProgram = post.contentType === 'program';
+    const hasShareLink = isProgram
+        ? post.programShareLink === true
+        : !!post.shareLink;
+
+    const old = document.getElementById('postDownloadModal');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'postDownloadModal';
+
+    const titleText = isMe
+        ? 'Ваш пост'
+        : 'Пост пользователя';
+
+    const messageText = isMe
+        ? 'Скачать фото из этого поста?'
+        : isProgram
+            ? `Скачать фото или добавить программу «${post.workoutTitle || 'Программа'}» себе?`
+            : `Скачать фото или добавить тренировку «${post.workoutTitle || 'Тренировка'}» себе?`;
+
+    let buttonsHtml = '';
+
+if (isMe) {
+    buttonsHtml = `
+        <div style="display:flex; gap:0.5rem; width:100%;">
+            <button class="btn btn-secondary" id="postDlCancelBtn" style="flex:1;">
+                Отмена
+            </button>
+            <button class="btn btn-primary" id="postDlPhotoBtn" style="flex:1;">
+                Скачать фото
+            </button>
+        </div>
+    `;
+} else {
+        buttonsHtml = `
+            <div style="display:flex; gap:0.5rem; width:100%;">
+                <button class="btn btn-primary" id="postDlPhotoBtn" style="flex:1;">
+                    Скачать фото
+                </button>
+
+                ${hasShareLink ? `
+                    <button class="btn btn-primary" id="postDlShareBtn" style="flex:1;">
+                        ${isProgram ? 'Добавить программу' : 'Загрузить тренировку'}
+                    </button>
+                ` : ''}
+            </div>
+
+            <button class="btn btn-secondary" id="postDlCancelBtn" style="width:100%;">
+                Отмена
+            </button>
+        `;
+    }
+
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:440px; width:95%;">
+            <div class="modal-title">${titleText}</div>
+            <p class="modal-text" style="margin-bottom:1rem;">
+                ${messageText}
+            </p>
+            <div style="display:flex; flex-direction:column; gap:0.5rem; width:100%;">
+                ${buttonsHtml}
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    document.getElementById('postDlCancelBtn').addEventListener('click', () => {
+        closeModal('postDownloadModal');
+    });
+
+    document.getElementById('postDlPhotoBtn').addEventListener('click', () => {
+        closeModal('postDownloadModal');
+        downloadPostImage(post);
+    });
+
+    const shareBtn = document.getElementById('postDlShareBtn');
+
+    if (shareBtn) {
+        shareBtn.addEventListener('click', () => {
+            closeModal('postDownloadModal');
+
+            if (isProgram) {
+                addSharedProgramFromPost(post.id);
+            } else {
+                addSharedWorkoutFromPost(
+                    post.shareLink,
+                    null,
+                    post.id
+                );
+            }
+        });
+    }
+}
+
+window.openPostDownloadModal = openPostDownloadModal;
+
+
+/**
+ * Скачивает готовое изображение поста (фото + статистика),
+ * отрисованное на canvas — точно такое же, как в ленте.
+ * @param {Object} post — объект поста
+ */
+async function downloadPostImage(post) {
+    if (!post || !post.imageData) {
+        showToast('❌ Фото не найдено');
+        return;
+    }
+
+    showToast('⏳ Готовим изображение...');
+
+    try {
+        // ★ 1. Загружаем оригинальное фото
+        const img = await loadImageFromDataUrl(post.imageData);
+
+        // ★ 2. Готовим canvas (квадрат)
+        const SIZE = 1080;
+        const canvas = document.createElement('canvas');
+        canvas.width = SIZE;
+        canvas.height = SIZE;
+        const ctx = canvas.getContext('2d');
+        const SANS = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+        // ★ 3. Рисуем фото с обрезкой по центру (object-fit: cover)
+        drawImageCover(ctx, img, 0, 0, SIZE, SIZE);
+
+        // ★ 4. Градиент снизу (как в CSS: 55% высоты)
+        const gradientHeight = SIZE * 0.55;
+        const gradient = ctx.createLinearGradient(
+            0, SIZE - gradientHeight,
+            0, SIZE
+        );
+        gradient.addColorStop(0, 'rgba(0, 0, 0, 0)');
+        gradient.addColorStop(0.45, 'rgba(0, 0, 0, 0.35)');
+        gradient.addColorStop(1, 'rgba(0, 0, 0, 0.75)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, SIZE - gradientHeight, SIZE, gradientHeight);
+
+        // ★ 5. Заголовок тренировки
+        const title = post.workoutTitle || 'Тренировка';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = `700 34px ${SANS}`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+        ctx.shadowBlur = 8;
+        ctx.shadowOffsetY = 2;
+
+        // Обрезаем длинный заголовок
+        const maxTitleWidth = SIZE - 80;
+        const truncatedTitle = truncateText(ctx, title, maxTitleWidth);
+        ctx.fillText(truncatedTitle, 40, SIZE - 170);
+
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetY = 0;
+
+        // ★ 6. Три плитки со статистикой
+        const s = post.stats || {};
+const stats = post.contentType === 'program'
+    ? [
+        {
+            label: 'ДЛИТЕЛЬНОСТЬ',
+            value: `${s.durationDays || 0} дн.`
+        },
+        {
+            label: 'ТРЕНИРОВОК',
+            value: String(s.totalWorkouts || 0)
+        },
+        {
+            label: 'В НЕДЕЛЮ',
+            value: `${s.weeklyWorkouts || 0}/7`
+        }
+    ]
+    : [
+        { label: 'ВРЕМЯ', value: String(s.minutes || 0) },
+        { label: 'УПРАЖНЕНИЙ', value: `${s.completed || 0}/${s.total || 0}` },
+        { label: 'ПРОГРЕСС', value: `+${s.xp || 0}` }
+    ];
+
+        const padding = 40;
+        const gap = 16;
+        const totalWidth = SIZE - padding * 2;
+        const tileWidth = (totalWidth - gap * 2) / 3;
+        const tileHeight = 110;
+        const tileY = SIZE - padding - tileHeight;
+        const radius = 20;
+
+        stats.forEach((stat, i) => {
+            const x = padding + i * (tileWidth + gap);
+
+            // Фон плитки: полупрозрачный белый
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
+            roundRect(ctx, x, tileY, tileWidth, tileHeight, radius);
+            ctx.fill();
+
+            // Тонкая белая обводка
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.lineWidth = 2;
+            roundRect(ctx, x, tileY, tileWidth, tileHeight, radius);
+            ctx.stroke();
+
+            // Лейбл (мелкий, сверху плитки)
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+            ctx.font = `600 20px ${SANS}`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(stat.label, x + tileWidth / 2, tileY + 32);
+
+            // Значение (крупное, снизу плитки)
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `700 40px ${SANS}`;
+            ctx.fillText(stat.value, x + tileWidth / 2, tileY + 76);
+        });
+
+        // ★ 7. Отдаём готовый PNG на скачивание
+        const fileName = `sportapp-${sanitizeFileName(post.workoutTitle || 'post')}-${Date.now()}.png`;
+
+        canvas.toBlob(function(blob) {
+            if (!blob) {
+                showToast('❌ Не удалось создать изображение');
+                return;
+            }
+
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.download = fileName;
+            link.href = blobUrl;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+
+            setTimeout(() => {
+                document.body.removeChild(link);
+                URL.revokeObjectURL(blobUrl);
+            }, 500);
+
+            showToast('✅ Изображение сохранено');
+        }, 'image/png');
+
+    } catch (error) {
+        console.error('❌ Ошибка генерации:', error);
+        showToast('❌ Не удалось сохранить изображение');
+    }
+}
+
+/**
+ * Загружает картинку из data URL.
+ */
+function loadImageFromDataUrl(dataUrl) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('Image load error'));
+        img.src = dataUrl;
+    });
+}
+
+/**
+ * Рисует картинку с обрезкой по центру (аналог CSS object-fit: cover).
+ */
+function drawImageCover(ctx, img, dx, dy, dWidth, dHeight) {
+    const imgRatio = img.width / img.height;
+    const targetRatio = dWidth / dHeight;
+
+    let sx, sy, sWidth, sHeight;
+
+    if (imgRatio > targetRatio) {
+        // Картинка шире — обрезаем по бокам
+        sHeight = img.height;
+        sWidth = sHeight * targetRatio;
+        sx = (img.width - sWidth) / 2;
+        sy = 0;
+    } else {
+        // Картинка выше — обрезаем сверху/снизу
+        sWidth = img.width;
+        sHeight = sWidth / targetRatio;
+        sx = 0;
+        sy = (img.height - sHeight) / 2;
+    }
+
+    ctx.drawImage(img, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight);
+}
+
+/**
+ * Рисует закруглённый прямоугольник.
+ */
+function roundRect(ctx, x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + width - radius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+    ctx.lineTo(x + width, y + height - radius);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+    ctx.lineTo(x + radius, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+}
+
+/**
+ * Обрезает текст, если он не влезает, добавляя «…».
+ */
+function truncateText(ctx, text, maxWidth) {
+    if (ctx.measureText(text).width <= maxWidth) return text;
+
+    let truncated = text;
+    while (truncated.length > 0 && ctx.measureText(truncated + '…').width > maxWidth) {
+        truncated = truncated.slice(0, -1);
+    }
+    return truncated + '…';
+}
+
+/**
+ * Очищает строку для использования в имени файла.
+ */
+function sanitizeFileName(str) {
+    return String(str)
+        .replace(/\s+/g, '-')
+        .replace(/[^\w\-]/g, '')
+        .slice(0, 30) || 'post';
+}
+
+window.downloadPostImage = downloadPostImage;
+
+/**
+ * Форматирование времени: «только что», «5 мин назад», «2 часа назад», «3 дня назад», «12.08»
+ */
+function formatRelativeTime(timestamp) {
+    if (!timestamp) return 'только что';
+    const ms = timestamp.seconds ? timestamp.seconds * 1000 : new Date(timestamp).getTime();
+    const diff = Date.now() - ms;
+    const min = Math.floor(diff / 60000);
+    const hr = Math.floor(diff / 3600000);
+    const day = Math.floor(diff / 86400000);
+
+    if (min < 1) return 'только что';
+    if (min < 60) return `${min} ${declOfNum(min, ['минуту', 'минуты', 'минут'])} назад`;
+    if (hr < 24) return `${hr} ${declOfNum(hr, ['час', 'часа', 'часов'])} назад`;
+    if (day < 7) return `${day} ${declOfNum(day, ['день', 'дня', 'дней'])} назад`;
+
+    const d = new Date(ms);
+    return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+}
+
+/**
+ * Удаление поста
+ */
+async function deletePost(postId, event) {
+    if (event) event.stopPropagation();
+    showConfirmModal(
+        'Удалить пост?',
+        'Это действие нельзя отменить.',
+        async function() {
+            try {
+                await firebase.firestore().collection('posts').doc(postId).delete();
+                _feedPosts = _feedPosts.filter(p => p.id !== postId);
+                renderFeed();
+                showToast('🗑️ Пост удалён');
+            } catch (error) {
+                console.error('Ошибка удаления:', error);
+                showToast('❌ Не удалось удалить');
+            }
+        },
+        'Удалить'
+    );
+}
+window.deletePost = deletePost;
+
+
+/**
+ * Добавляет полученную программу в личные программы.
+ */
+async function applySharedProgramData(programData, postId) {
+    if (
+        !programData ||
+        !Array.isArray(programData.dayWorkouts) ||
+        !programData.dayWorkouts.some(Boolean)
+    ) {
+        showToast('❌ Данные программы повреждены');
+        return false;
+    }
+
+    if (programData.isPremium && !hasPremium()) {
+        openModal('premiumModal');
+        return false;
+    }
+
+    const existingPrograms = getMyPrograms();
+
+    // Не добавляем одну и ту же программу из одного поста повторно
+    const duplicate = existingPrograms.find(
+        p => p.sharedFromPostId === postId
+    );
+
+    if (duplicate) {
+        showSharedProgramAddedModal(duplicate, true);
+        return false;
+    }
+
+    const durationDays = Number(programData.durationDays) || 0;
+
+    if (
+        durationDays < 1 ||
+        programData.dayWorkouts.length !== durationDays
+    ) {
+        showToast('❌ Неверное расписание программы');
+        return false;
+    }
+
+    // Проверяем, что все тренировочные дни содержат упражнения
+    const dayWorkouts = programData.dayWorkouts.map(day => {
+        if (!day) return null;
+
+        if (
+            day.source !== 'shared' ||
+            !Array.isArray(day.exercises) ||
+            !day.exercises.length
+        ) {
+            return null;
+        }
+
+        return {
+            source: 'shared',
+            title: day.title || 'Тренировка',
+            icon: day.icon || null,
+            exercises: JSON.parse(JSON.stringify(day.exercises))
+        };
+    });
+
+    if (!dayWorkouts.some(Boolean)) {
+        showToast('❌ В программе нет доступных тренировок');
+        return false;
+    }
+
+    const weekPattern = Array.from(
+        { length: 7 },
+        (_, index) => Boolean(dayWorkouts[index])
+    );
+
+    const program = {
+        id: 'myprog_shared_' + Date.now(),
+
+        title: programData.title || 'Программа',
+        icon: programData.icon || 'WholeBody',
+        category: programData.category || 'Всё тело',
+
+        durationDays,
+        dayWorkouts,
+
+        workoutsPerWeek: weekPattern.filter(Boolean).length,
+        weekPattern,
+
+        difficulty: programData.difficulty || 'Средний',
+        description: programData.description || '',
+
+        isCustom: true,
+        sharedFromPostId: postId,
+        createdAt: Date.now()
+    };
+
+    existingPrograms.push(program);
+    saveMyPrograms(existingPrograms);
+
+    showSharedProgramAddedModal(program, false);
+
+    return true;
+}
+
+
+/**
+ * Получает программу из опубликованного поста.
+ */
+async function addSharedProgramFromPost(postId) {
+    if (!postId) {
+        showToast('❌ Ссылка на программу повреждена');
+        return false;
+    }
+
+    try {
+        const user = await getFirebaseUser();
+
+        if (!user) {
+            showToast('🔒 Войдите в SportApp, чтобы добавить программу');
+            return false;
+        }
+
+        const doc = await firebase.firestore()
+            .collection('posts')
+            .doc(postId)
+            .get();
+
+        if (!doc.exists) {
+            showToast('❌ Пост с программой не найден');
+            return false;
+        }
+
+        const post = doc.data();
+
+        if (
+            post.contentType !== 'program' ||
+            post.programShareLink !== true ||
+            !post.programData
+        ) {
+            showToast('❌ Ссылка на программу недоступна');
+            return false;
+        }
+
+        const result = await applySharedProgramData(
+            post.programData,
+            postId
+        );
+
+        if (result) {
+            incrementPostDownloads(postId);
+        }
+
+        return result;
+
+    } catch (error) {
+        console.error('Ошибка добавления программы:', error);
+        showToast('❌ Не удалось добавить программу');
+        return false;
+    }
+}
+
+window.addSharedProgramFromPost = addSharedProgramFromPost;
+
+
+/**
+ * Модалка после добавления программы.
+ */
+function showSharedProgramAddedModal(program, isDuplicate) {
+    const old = document.getElementById('sharedProgramModal');
+    if (old) old.remove();
+
+    const titleText = isDuplicate
+        ? 'Программа уже у вас'
+        : 'Программа добавлена!';
+
+    const messageText = isDuplicate
+        ? `Программа «${program.title}» уже есть в ваших личных программах.`
+        : `Программа «${program.title}» добавлена в ваши личные программы.`;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'sharedProgramModal';
+
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:400px;">
+            <div class="modal-title">${titleText}</div>
+
+            <div style="text-align:center; font-size:3rem; color:var(--accent); margin:0.5rem 0;">
+                <i class="fa-solid fa-circle-check"></i>
+            </div>
+
+            <p class="modal-text">${messageText}</p>
+
+            <div style="display:flex; gap:0.5rem; width:100%;">
+                <button class="btn btn-secondary" id="sharedProgramCloseBtn" style="flex:1;">
+                    Позже
+                </button>
+
+                <button class="btn btn-primary" id="sharedProgramOpenBtn" style="flex:1;">
+                    Открыть
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    document.getElementById('sharedProgramCloseBtn')
+        .addEventListener('click', () => {
+            closeModal('sharedProgramModal');
+        });
+
+    document.getElementById('sharedProgramOpenBtn')
+        .addEventListener('click', () => {
+            closeModal('sharedProgramModal');
+            openProgramDetail(program.id);
+        });
+}
+
+
+async function addSharedWorkoutFromPost(encoded, event, postId = null) {
+    if (event) event.stopPropagation();
+
+    if (!encoded) {
+        showToast('❌ Ссылка повреждена');
+        return;
+    }
+
+    let payload;
+    try {
+        payload = JSON.parse(_decodeShareBase64(encoded));
+    } catch (e) {
+        console.error('Ошибка декодирования:', e);
+        showToast('❌ Ссылка повреждена');
+        return;
+    }
+
+    // ★ Сразу применяем — без промежуточной модалки «Добавить тренировку?»
+    // applySharedWorkout сам покажет showSharedWorkoutAddedModal
+    // (и учтёт случай, когда такая тренировка уже есть)
+    const ok = await applySharedWorkout(payload);
+    if (ok && postId) {
+        incrementPostDownloads(postId);
+    }
+}
+window.addSharedWorkoutFromPost = addSharedWorkoutFromPost;
+// =================== СОЗДАНИЕ ПОСТА ===================
+/** Обёртка: проверяет лимит, потом открывает модалку создания */
+async function tryOpenCreatePostModal() {
+    const check = await canPostToday();
+
+    if (check.allowed) {
+        openCreatePostModal();
+        return;
+    }
+
+    if (check.reason === 'no-auth') {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+
+    // Лимит — показываем модалку с таймером
+    openPostLimitModal();
+}
+window.tryOpenCreatePostModal = tryOpenCreatePostModal;
+
+/**
+ * Плавно прокручивает страницу ленты к самому верху.
+ */
+function scrollFeedToTop() {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+window.scrollFeedToTop = scrollFeedToTop;
+
+/**
+ * Получить упражнения готовой тренировки
+ * по точным parent, category и level из каталога.
+ */
+function getPostReadyWorkoutExercises(option) {
+    const levelData =
+        exercisesData?.[option.parent]?.[option.category]?.[option.level];
+
+    if (!levelData) return [];
+
+    // Старый формат - массив упражнений
+    if (Array.isArray(levelData)) {
+        return JSON.parse(JSON.stringify(levelData));
+    }
+
+    // Формат с пользовательским переопределением
+    if (Array.isArray(levelData._exercises)) {
+        return JSON.parse(JSON.stringify(levelData._exercises));
+    }
+
+    // Адаптивный формат
+    if (typeof levelData === 'object') {
+        const exercises = buildWorkoutForUser(
+            levelData,
+            getUserInventoryFromStorage()
+        );
+
+        return Array.isArray(exercises)
+            ? JSON.parse(JSON.stringify(exercises))
+            : [];
+    }
+
+    return [];
+}
+
+
+/**
+ * Сформировать список тренировок:
+ * сначала готовые, затем личные.
+ * Premium-фильтрация готовых тренировок
+ * выполняется существующей getProgramWorkoutOptions().
+ */
+function getPostWorkoutItems() {
+    const options = getProgramWorkoutOptions();
+
+    const readyWorkouts = options
+        .filter(option => option.source === 'ready')
+        .map(option => {
+            const exercises = getPostReadyWorkoutExercises(option);
+
+            if (!exercises.length) return null;
+
+            return {
+                _postType: 'workout',
+                _postSource: 'ready',
+                title: option.title,
+                icon: null,
+                exercises,
+                restTime: 30,
+                category: option.category,
+                parentCategory: option.parent,
+                level: option.level
+            };
+        })
+        .filter(Boolean);
+
+    const personalWorkouts = getMyWorkouts()
+        .filter(workout =>
+            workout &&
+            workout._id &&
+            Array.isArray(workout.exercises) &&
+            workout.exercises.length > 0
+        )
+        .map(workout => ({
+            ...workout,
+            _postType: 'workout',
+            _postSource: 'personal'
+        }));
+
+    return [...readyWorkouts, ...personalWorkouts];
+}
+
+
+/**
+ * Переключение между тренировками и программами.
+ */
+function handlePostTypeChange() {
+    const typeSelect = document.getElementById('postTypeSelect');
+    const itemLabel = document.getElementById('postItemLabel');
+    const itemSelect = document.getElementById('postWorkoutSelect');
+    const previewBody = document.getElementById('postPreviewBody');
+    const linkBlock = document.getElementById('postShareLinkBlock');
+
+    if (!typeSelect || !itemSelect || !itemLabel) return;
+
+    const type = typeSelect.value;
+
+    itemSelect.innerHTML = '';
+    itemSelect._items = [];
+    itemSelect._workouts = [];
+
+    previewBody.style.display = 'none';
+
+    if (linkBlock) {
+        linkBlock.style.display = 'none';
+    }
+
+    if (type === 'program') {
+        itemLabel.textContent = 'Выберите программу';
+
+        _postShareLink = false;
+
+        // Готовые программы - сначала
+        const readyPrograms = PRESET_PROGRAMS
+            .filter(program =>
+                !program.isPremium || hasPremium()
+            )
+            .map(program => ({
+                ...program,
+                _postType: 'program',
+                _postSource: 'ready'
+            }));
+
+        // Личные программы - после готовых
+        const personalPrograms = getMyPrograms()
+            .map(program => ({
+                ...program,
+                _postType: 'program',
+                _postSource: 'personal'
+            }));
+
+        itemSelect._items = [
+            ...readyPrograms,
+            ...personalPrograms
+        ];
+
+    } else {
+        itemLabel.textContent = 'Выберите тренировку';
+
+        _postShareLink = true;
+
+        itemSelect._items = getPostWorkoutItems();
+    }
+
+    // Сохраняем совместимость со старым кодом
+    itemSelect._workouts = itemSelect._items;
+
+    const items = itemSelect._items;
+
+    if (!items.length) {
+        const option = document.createElement('option');
+        option.value = '';
+
+        option.textContent = type === 'program'
+            ? 'Нет доступных программ'
+            : 'Нет доступных тренировок';
+
+        itemSelect.appendChild(option);
+        return;
+    }
+
+    // Заполняем список в исходном порядке:
+    // готовые элементы, затем личные.
+    items.forEach((item, index) => {
+        const option = document.createElement('option');
+
+        option.value = String(index);
+        option.textContent = item.subtitle
+            ? `${item.title} ${item.subtitle}`
+            : item.title || (
+                type === 'program' ? 'Программа' : 'Тренировка'
+            );
+
+        itemSelect.appendChild(option);
+    });
+
+    // По умолчанию выбираем самый верхний элемент
+    itemSelect.selectedIndex = 0;
+
+    handlePostWorkoutChange();
+}
+
+window.handlePostTypeChange = handlePostTypeChange;
+
+
+/**
+ * Открыть модалку создания поста.
+ */
+async function openCreatePostModal(options = {}) {
+    _postImageDataUrl = null;
+    _postShareLink = true;
+
+    const previewImage = document.getElementById('postPreviewImage');
+    const previewBody = document.getElementById('postPreviewBody');
+    const photoInput = document.getElementById('postPhotoInput');
+    const typeSelect = document.getElementById('postTypeSelect');
+    const itemSelect = document.getElementById('postWorkoutSelect');
+    const linkBlock = document.getElementById('postShareLinkBlock');
+
+    // Сбрасываем фото
+    previewImage.innerHTML = `
+        <div class="upload-zone-placeholder">
+            <i class="fa-solid fa-camera upload-zone-icon"></i>
+            <div class="upload-zone-text">Нажмите, чтобы загрузить фото</div>
+        </div>
+    `;
+
+    previewBody.style.display = 'none';
+    photoInput.value = '';
+
+    if (linkBlock) {
+        linkBlock.style.display = 'none';
+    }
+
+    // Каждый раз начинаем с выбора тренировки
+    typeSelect.value = 'workout';
+
+    itemSelect.innerHTML = '<option value="">Загрузка...</option>';
+    itemSelect._items = [];
+    itemSelect._workouts = [];
+
+    openModal('createPostModal');
+
+    try {
+        // Наполняем селекторы из существующих данных SportApp
+        handlePostTypeChange();
+    } catch (error) {
+        console.error('Ошибка загрузки элементов поста:', error);
+
+        itemSelect.innerHTML =
+            '<option value="">Ошибка загрузки</option>';
+    }
+}
+
+window.openCreatePostModal = openCreatePostModal;
+
+
+let _postImageDataUrl = null;   // ← переименовали переменную
+
+function handlePostPhotoSelect(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    // ★ Мгновенное превью из файла
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const previewImage = document.getElementById('postPreviewImage');
+        previewImage.innerHTML = `<img src="${e.target.result}" alt="preview">`;
+    };
+    reader.readAsDataURL(file);
+
+    // ★ Сжатие в base64 для отправки в Firestore
+    compressImageToDataURL(file, 600, 180000)
+        .then(dataUrl => {
+            _postImageDataUrl = dataUrl;
+            console.log(`📷 Фото сжато: ~${Math.round(dataUrl.length / 1024)} КБ`);
+            if (dataUrl.length > 900000) {
+                showToast('⚠️ Фото слишком большое, попробуйте другое');
+                _postImageDataUrl = null;
+            }
+        })
+        .catch(err => {
+            console.error('Сжатие не удалось:', err);
+            showToast('❌ Не удалось обработать фото');
+            _postImageDataUrl = null;
+        });
+}
+window.handlePostPhotoSelect = handlePostPhotoSelect;
+
+/**
+ * Сжатие картинки под Firestore (лимит 1 МБ на документ).
+ * Возвращает data-URL (base64), готовый к записи в поле.
+ * @param {File} file
+ * @param {number} maxSize  — максимальная сторона (px)
+ * @param {number} maxBytes — целевой размер base64-строки
+ */
+function compressImageToDataURL(file, maxSize = 600, maxBytes = 180000) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const img = new Image();
+            img.onload = () => {
+                // Пробуем сжимать с уменьшающимся качеством, пока не влезем
+                let size = maxSize;
+                let quality = 0.85;
+                let attempts = 0;
+
+                const tryCompress = () => {
+                    attempts++;
+                    const canvas = document.createElement('canvas');
+                    let w = img.width, h = img.height;
+                    if (w > h) {
+                        if (w > size) { h *= size / w; w = size; }
+                    } else {
+                        if (h > size) { w *= size / h; h = size; }
+                    }
+                    canvas.width = w;
+                    canvas.height = h;
+                    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+                    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+
+                    if (dataUrl.length <= maxBytes) {
+                        resolve(dataUrl);
+                        return;
+                    }
+
+                    // Ещё не влезли — уменьшаем
+                    if (quality > 0.5) {
+                        quality -= 0.1;
+                    } else if (size > 300) {
+                        size -= 100;
+                        quality = 0.7;
+                    } else {
+                        // Совсем не влезает — отдаём что есть
+                        resolve(dataUrl);
+                        return;
+                    }
+
+                    if (attempts > 10) {
+                        resolve(dataUrl);
+                        return;
+                    }
+                    tryCompress();
+                };
+
+                tryCompress();
+            };
+            img.onerror = reject;
+            img.src = e.target.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
+
+/**
+ * Статистика программы для превью и публикации.
+ * Число тренировок берётся из реального расписания.
+ */
+function getPostProgramStats(program) {
+    if (!program) {
+        return {
+            durationDays: 0,
+            totalWorkouts: 0,
+            weeklyWorkouts: 0
+        };
+    }
+
+    const durationDays = Number(program.durationDays) || 0;
+
+    const totalWorkouts = typeof getProgramWorkoutCount === 'function'
+        ? getProgramWorkoutCount(program)
+        : 0;
+
+    const pattern = Array.isArray(program.weekPattern)
+        ? program.weekPattern
+        : PROGRAM_WORKOUTS[program.id]?.weekPattern;
+
+    const weeklyWorkouts = Array.isArray(pattern)
+        ? pattern.filter(Boolean).length
+        : Number(program.workoutsPerWeek) || 0;
+
+    return {
+        durationDays,
+        totalWorkouts,
+        weeklyWorkouts
+    };
+}
+
+
+/**
+ * Создаёт самостоятельную копию программы для передачи другому пользователю.
+ * Упражнения каждого тренировочного дня встраиваются в программу.
+ * Поэтому копия не зависит от личных тренировок автора.
+ */
+function createShareableProgramData(program) {
+    if (!program) {
+        throw new Error('Программа не найдена');
+    }
+
+    const durationDays = Number(program.durationDays) || 0;
+
+    const schedule = generateProgramSchedule(
+        durationDays,
+        program.workoutsPerWeek,
+        program.category,
+        program.weekPattern,
+        program.id
+    );
+
+    const isCustom = getMyPrograms().some(p => p.id === program.id);
+
+    const dayWorkouts = Array.from(
+        { length: durationDays },
+        (_, index) => {
+            const day = index + 1;
+            const scheduleDay = schedule.find(d => d.day === day);
+
+            if (!scheduleDay || scheduleDay.type !== 'workout') {
+                return null;
+            }
+
+            let workout = null;
+
+            if (isCustom) {
+                const assignment = program.dayWorkouts?.[index];
+
+                if (!assignment) return null;
+
+                if (assignment.source === 'personal') {
+                    const personalWorkout = getWorkoutById(
+                        assignment.workoutId
+                    );
+
+                    if (personalWorkout) {
+                        workout = {
+                            title: personalWorkout.title,
+                            icon: personalWorkout.icon || null,
+                            exercises: personalWorkout.exercises
+                        };
+                    }
+                } else if (assignment.source === 'ready') {
+                    const exercises = getExercisesForEdit(
+                        assignment.category,
+                        assignment.level,
+                        false
+                    );
+
+                    workout = {
+                        title: assignment.title || scheduleDay.category,
+                        icon: null,
+                        exercises
+                    };
+                } else if (assignment.source === 'shared') {
+                    workout = assignment;
+                }
+            } else {
+                // Для готовых программ используем их настоящий план.
+                workout = buildProgramWorkout(program.id, day);
+            }
+
+            if (
+                !workout ||
+                !Array.isArray(workout.exercises) ||
+                !workout.exercises.length
+            ) {
+                throw new Error(
+                    `Не удалось подготовить тренировку для дня ${day}`
+                );
+            }
+
+            return {
+                source: 'shared',
+                title: workout.title || scheduleDay.category || 'Тренировка',
+                icon: workout.icon || null,
+                exercises: JSON.parse(
+                    JSON.stringify(workout.exercises)
+                )
+            };
+        }
+    );
+
+    if (!dayWorkouts.some(Boolean)) {
+        throw new Error('В программе нет тренировок для передачи');
+    }
+
+    return {
+        title: program.title || 'Программа',
+        icon: program.icon || null,
+        category: program.category || 'Всё тело',
+        durationDays,
+        workoutsPerWeek: program.workoutsPerWeek || 0,
+        weekPattern: program.weekPattern || null,
+        difficulty: program.difficulty || null,
+        description: program.description || '',
+        isPremium: program.isPremium === true,
+        dayWorkouts,
+        isCustom: true
+    };
+}
+
+/**
+ * Поделиться личной программой через ссылку.
+ * Программа сохраняется в Firestore и передаётся целиком.
+ */
+async function shareProgramLink(programId) {
+    const program = getMyPrograms().find(p => p.id === programId);
+
+    if (!program) {
+        showToast('❌ Программа не найдена');
+        return;
+    }
+
+    try {
+        const user = await getFirebaseUser();
+
+        if (!user) {
+            showToast('🔒 Войдите в SportApp');
+            return;
+        }
+
+        showToast('Подготавливаем программу...');
+
+        // Создаём независимую копию расписания и упражнений
+        const programData = createShareableProgramData(program);
+        const profileResult = await getUserProfile(user.uid);
+        const profile = profileResult.success
+            ? profileResult.data
+            : {};
+
+        const stats = getPostProgramStats(program);
+
+        // Сохраняем скрытую запись для передачи программы.
+        // Пустое imageData отличает её от обычных постов.
+        const shareRef = await firebase.firestore()
+            .collection('posts')
+            .add({
+                userId: user.uid,
+                userName: profile.displayName || 'Пользователь',
+                userGender: profile.gender || 'male',
+
+                contentType: 'program',
+                workoutTitle: program.title || 'Программа',
+                workoutIcon: program.icon || null,
+
+                imageData: '',
+                programData: programData,
+                programId: program.id,
+                programTitle: program.title || 'Программа',
+                programShareLink: true,
+
+                stats: {
+                    durationDays: stats.durationDays,
+                    totalWorkouts: stats.totalWorkouts,
+                    weeklyWorkouts: stats.weeklyWorkouts
+                },
+
+                likes: [],
+                downloads: 0,
+
+                createdAt:
+                    firebase.firestore.FieldValue.serverTimestamp()
+            });
+
+        const url =
+            `${window.location.origin}${window.location.pathname}?p=${shareRef.id}`;
+
+        const shareText =
+            `Программа «${program.title}» в SportApp. Открой ссылку, чтобы добавить её себе:`;
+
+        // Сначала пробуем системное меню «Поделиться»
+        if (navigator.share) {
+            try {
+                await navigator.share({
+                    title: 'Программа в SportApp',
+                    text: shareText,
+                    url: url
+                });
+
+                return;
+            } catch (error) {
+                if (error.name === 'AbortError') return;
+
+                console.warn('Меню «Поделиться» недоступно:', error);
+            }
+        }
+
+        // Если системное меню недоступно - копируем ссылку
+        const fullText = `${shareText}\n${url}`;
+
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(fullText);
+            showToast('✅ Ссылка на программу скопирована!');
+            return;
+        }
+
+        // Резервное копирование
+        const textarea = document.createElement('textarea');
+        textarea.value = fullText;
+        textarea.style.position = 'fixed';
+        textarea.style.top = '-1000px';
+
+        document.body.appendChild(textarea);
+        textarea.select();
+
+        const copied = document.execCommand('copy');
+        document.body.removeChild(textarea);
+
+        if (copied) {
+            showToast('✅ Ссылка на программу скопирована!');
+        } else {
+            showShareProgramLinkManual(url);
+        }
+
+    } catch (error) {
+        console.error('Ошибка передачи программы:', error);
+        showToast('❌ Не удалось создать ссылку на программу');
+    }
+}
+
+
+/**
+ * Резервная модалка со ссылкой на программу.
+ */
+function showShareProgramLinkManual(url) {
+    const old = document.getElementById('manualProgramLinkModal');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'manualProgramLinkModal';
+
+    overlay.innerHTML = `
+        <div class="modal-content" style="max-width:420px; width:95%;">
+            <div class="modal-title">Ссылка на программу</div>
+
+            <p class="modal-text" style="margin-bottom:1rem;">
+                Выделите ссылку и скопируйте вручную
+            </p>
+
+            <input type="text"
+                   id="manualProgramLinkInput"
+                   class="form-input"
+                   value="${url}"
+                   readonly
+                   style="margin-bottom:1rem; text-align:center; font-size:0.75rem;"
+                   onclick="this.select();" />
+
+            <button class="btn btn-primary"
+                    onclick="closeModal('manualProgramLinkModal')">
+                Понятно
+            </button>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    void overlay.offsetWidth;
+    overlay.classList.add('modal-overlay-visible');
+
+    setTimeout(() => {
+        const input = document.getElementById('manualProgramLinkInput');
+
+        if (input) {
+            input.focus();
+            input.select();
+        }
+    }, 100);
+}
+
+function handlePostWorkoutChange() {
+    const typeSelect = document.getElementById('postTypeSelect');
+    const itemSelect = document.getElementById('postWorkoutSelect');
+
+    const previewBody = document.getElementById('postPreviewBody');
+    const previewTitle = document.getElementById('postPreviewTitle');
+    const statsBlock = previewBody.querySelector('.feed-post-stats');
+
+    const linkBlock = document.getElementById('postShareLinkBlock');
+    const linkLabel = document.getElementById('postShareLinkLabel');
+    const checkbox = document.getElementById('postShareLinkCheckbox');
+
+    const type = typeSelect?.value || 'workout';
+    const index = itemSelect.value;
+    const items = itemSelect._items || [];
+
+    if (index === '' || !items[index]) {
+        previewBody.style.display = 'none';
+
+        if (linkBlock) linkBlock.style.display = 'none';
+
+        return;
+    }
+
+    const item = items[index];
+
+    if (type === 'program') {
+        const stats = getPostProgramStats(item);
+
+        previewTitle.textContent = item.title || 'Программа';
+
+        statsBlock.innerHTML = `
+            <div class="feed-post-stat">
+                <span class="feed-post-stat-label">Длительность</span>
+                <span class="feed-post-stat-value">
+                    ${stats.durationDays} дн.
+                </span>
+            </div>
+            <div class="feed-post-stat">
+                <span class="feed-post-stat-label">Тренировок</span>
+                <span class="feed-post-stat-value">
+                    ${stats.totalWorkouts}
+                </span>
+            </div>
+            <div class="feed-post-stat">
+                <span class="feed-post-stat-label">В неделю</span>
+                <span class="feed-post-stat-value">
+                    ${stats.weeklyWorkouts}/7
+                </span>
+            </div>
+        `;
+
+        _postShareLink = true;
+
+        if (linkLabel) {
+            linkLabel.textContent = 'Добавить ссылку на программу?';
+        }
+
+    } else {
+        const totalEx = item.exercises?.length || 0;
+
+        const completedEx =
+            item.exercises?.filter(ex => ex.completed === true).length || 0;
+
+        const minutes = Math.floor(
+            (item.durationSeconds || 0) / 60
+        );
+
+        const xp = Math.round(item.xpEarned || 0);
+
+        previewTitle.textContent = item.title || 'Тренировка';
+
+        statsBlock.innerHTML = `
+            <div class="feed-post-stat">
+                <span class="feed-post-stat-label">Время</span>
+                <span class="feed-post-stat-value" id="postPreviewMinutes">
+                    ${minutes}
+                </span>
+            </div>
+            <div class="feed-post-stat">
+                <span class="feed-post-stat-label">Упражнений</span>
+                <span class="feed-post-stat-value" id="postPreviewExercises">
+                    ${completedEx}/${totalEx}
+                </span>
+            </div>
+            <div class="feed-post-stat">
+                <span class="feed-post-stat-label">Прогресс</span>
+                <span class="feed-post-stat-value" id="postPreviewXp">
+                    +${xp}
+                </span>
+            </div>
+        `;
+
+        _postShareLink = true;
+
+        if (linkLabel) {
+            linkLabel.textContent = 'Добавить ссылку на тренировку?';
+        }
+    }
+
+    if (checkbox) {
+        checkbox.checked = true;
+    }
+
+    if (linkBlock) {
+        linkBlock.style.display = 'flex';
+    }
+
+    previewBody.style.display = 'block';
+}
+
+window.handlePostWorkoutChange = handlePostWorkoutChange;
+
+
+
+function setPostShareLink(value) {
+    _postShareLink = value;
+    document.querySelectorAll('#postShareLinkBlock .post-toggle-btn').forEach(btn => {
+        const isYes = btn.dataset.share === 'yes';
+        btn.classList.toggle('post-toggle-btn-active',
+                             (value && isYes) || (!value && !isYes));
+    });
+}
+window.setPostShareLink = setPostShareLink;
+
+
+
+async function publishPost() {
+    const btn = document.getElementById('postPublishBtn');
+
+    if (btn.disabled) return;
+
+    if (!_postImageDataUrl) {
+        showToast('⚠️ Загрузите фото');
+        return;
+    }
+
+    const typeSelect = document.getElementById('postTypeSelect');
+    const select = document.getElementById('postWorkoutSelect');
+    const checkbox = document.getElementById('postShareLinkCheckbox');
+
+    const type = typeSelect?.value || 'workout';
+    const index = select.value;
+    const items = select._items || [];
+
+    if (index === '' || !items[index]) {
+        showToast(
+            type === 'program'
+                ? '⚠️ Выберите программу'
+                : '⚠️ Выберите тренировку'
+        );
+        return;
+    }
+
+    const item = items[index];
+    const shouldShareLink = checkbox
+        ? checkbox.checked
+        : _postShareLink;
+
+    btn.disabled = true;
+    btn.textContent = 'Публикация...';
+
+    try {
+        const user = await getFirebaseUser();
+
+        if (!user) {
+            throw new Error('Не авторизован');
+        }
+
+        const profileResult = await getUserProfile(user.uid);
+        const profile = profileResult.success
+            ? profileResult.data
+            : {};
+
+        const isProgram = type === 'program';
+
+        const postData = {
+            userId: user.uid,
+            userName: profile.displayName || 'Пользователь',
+            userGender: profile.gender || 'male',
+
+            contentType: type,
+
+            workoutTitle: item.title || (
+                isProgram ? 'Программа' : 'Тренировка'
+            ),
+
+            workoutIcon: item.icon || null,
+            imageData: _postImageDataUrl,
+
+            stats: {
+                completed: 0,
+                total: 0,
+                minutes: 0,
+                xp: 0
+            },
+
+            likes: [],
+            downloads: 0,
+
+            createdAt:
+                firebase.firestore.FieldValue.serverTimestamp()
+        };
+
+        if (isProgram) {
+            const programStats = getPostProgramStats(item);
+
+            // Полная копия программы с расписанием и упражнениями
+            postData.programData = createShareableProgramData(item);
+
+            postData.programId = item.id || null;
+            postData.programTitle = item.title || 'Программа';
+
+            postData.stats = {
+                durationDays: programStats.durationDays,
+                totalWorkouts: programStats.totalWorkouts,
+                weeklyWorkouts: programStats.weeklyWorkouts
+            };
+
+            // Ссылка будет доступна только при включённом переключателе
+            postData.programShareLink = shouldShareLink === true;
+
+        } else {
+            const exercises = item.exercises || [];
+
+            const totalEx = exercises.length;
+            const completedEx = exercises.filter(
+                ex => ex.completed === true
+            ).length;
+
+            const minutes = Math.floor(
+                (item.durationSeconds || 0) / 60
+            );
+
+            const xp = Math.round(item.xpEarned || 0);
+
+            postData.stats = {
+                completed: completedEx,
+                total: totalEx,
+                minutes,
+                xp
+            };
+
+            if (shouldShareLink && exercises.length > 0) {
+                const linkPayload = {
+                    t: item.title || 'Тренировка',
+                    i: item.icon || null,
+                    r: parseInt(item.restTime) || 30,
+
+                    e: exercises.map(ex => [
+                        String(ex.name || ''),
+                        parseInt(ex.sets) || 3,
+                        String(ex.reps || '12'),
+                        parseFloat(ex.weight) || 0,
+                        ex.icon || null
+                    ])
+                };
+
+                postData.shareLink = _encodeShareBase64(
+                    JSON.stringify(linkPayload)
+                );
+            }
+        }
+
+const postRef = await firebase.firestore()
+    .collection('posts')
+    .add(postData);
+
+// Создаём настоящий адрес программы после получения ID поста
+if (isProgram && shouldShareLink) {
+    const programShareUrl =
+        `${window.location.origin}${window.location.pathname}?p=${postRef.id}`;
+
+    await postRef.update({
+        programShareUrl: programShareUrl
+    });
+}
+
+        const todayKey = getLocalDateKey();
+
+        localStorage.setItem(POST_DATE_KEY, todayKey);
+
+        try {
+            await updateUserProfile(user.uid, {
+                lastPostDate: todayKey
+            });
+        } catch (error) {
+            console.warn(
+                'Не удалось сохранить lastPostDate:',
+                error
+            );
+        }
+
+        _postImageDataUrl = null;
+
+        closeModal('createPostModal');
+
+        showToast('✅ Пост опубликован!');
+
+        setTimeout(() => loadFeed(), 400);
+
+    } catch (error) {
+        console.error('Ошибка публикации:', error);
+
+        if (
+            error.message &&
+            error.message.includes('exceeds the maximum')
+        ) {
+            showToast('❌ Данные программы или фото слишком большие');
+        } else {
+            showToast('❌ Не удалось опубликовать');
+        }
+
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Опубликовать';
+    }
+}
+
+window.publishPost = publishPost;
+
+
+
+let _postLimitTimerInterval = null;
+
+function openPostLimitModal() {
+    // Останавливаем старый, если висел
+    if (_postLimitTimerInterval) {
+        clearInterval(_postLimitTimerInterval);
+        _postLimitTimerInterval = null;
+    }
+
+    updatePostLimitTimer(); // сразу отрисовать
+    _postLimitTimerInterval = setInterval(updatePostLimitTimer, 1000);
+
+    openModal('postLimitModal');
+}
+window.openPostLimitModal = openPostLimitModal;
+
+function updatePostLimitTimer() {
+    const el = document.getElementById('postLimitTimer');
+    if (!el) {
+        if (_postLimitTimerInterval) {
+            clearInterval(_postLimitTimerInterval);
+            _postLimitTimerInterval = null;
+        }
+        return;
+    }
+
+    const total = secondsUntilMidnight();
+    const h = String(Math.floor(total / 3600)).padStart(2, '0');
+    const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+    const s = String(total % 60).padStart(2, '0');
+    el.textContent = `${h}:${m}:${s}`;
+}
+
+// =================== ПАУЗА ТРЕНИРОВКИ ===================
+function pauseSession() {
+    if (isResting) {
+        showToast('⏸️ Сначала дождитесь конца отдыха');
+        return;
+    }
+    if (isSessionPaused) return;
+
+    isSessionPaused = true;
+
+    if (isExerciseTimerRunning && exerciseTimerInterval) {
+        clearInterval(exerciseTimerInterval);
+        exerciseTimerInterval = null;
+        window._resumeExerciseTimerAfterPause = true;
+    }
+
+    // ★ Заполняем время актуальным значением секундомера
+    updatePauseOverlayTime();
+
+    const overlay = document.getElementById('sessionPauseOverlay');
+    if (overlay) overlay.classList.add('visible');
+
+    console.log('⏸️ Тренировка на паузе');
+}
+
+function resumeSession() {
+    if (!isSessionPaused) return;
+
+    isSessionPaused = false;
+
+    // Возобновляем таймер упражнения, если он был активен
+    if (window._resumeExerciseTimerAfterPause) {
+        window._resumeExerciseTimerAfterPause = false;
+        isExerciseTimerRunning = true;
+        startExerciseTimer();
+    }
+
+    // Скрываем оверлей
+    const overlay = document.getElementById('sessionPauseOverlay');
+    if (overlay) overlay.classList.remove('visible');
+
+    console.log('▶️ Тренировка продолжена');
+}
+
+/**
+ * Завершает тренировку так же, как кнопка "Закончить", но после сохранения
+ * открывает модалку создания поста в ленте с уже выбранной тренировкой.
+ */
+function finishWorkoutAndShare(completedCount, xpEarned, exercisesCount, seconds) {
+    if (!currentSessionId) clearStoredPersonalTraining();
+    if (completedCount === 0) {
+        showToast('⚠️ Выполнено 0 упражнений.');
+        sessionExercises = [];
+        sessionCompleted = new Set();
+        sessionSkipped = new Set();
+        sessionCompletedSets = {};
+        sessionSeconds = 0;
+        sessionWorkoutTitle = '';
+        sessionCategory = '';
+        sessionWorkoutIcon = null;
+        window.navigateTo('workouts');
+        return;
+    }
+
+    if (!preventDoubleClick('finishShareBtn', 3000)) {
+        showToast('⏳ Подождите, тренировка уже сохраняется...');
+        return;
+    }
+
+    // Определяем категорию (та же логика, что и в «Закончить»)
+    let finalCategory = sessionCategory;
+    if (!finalCategory || finalCategory === 'Без категории') {
+        const title = sessionWorkoutTitle || '';
+        if (title.includes('Руки')) finalCategory = 'Руки';
+        else if (title.includes('Плечи')) finalCategory = 'Плечи';
+        else if (title.includes('Пресс')) finalCategory = 'Пресс';
+        else if (title.includes('Грудь')) finalCategory = 'Грудь';
+        else if (title.includes('Спина')) finalCategory = 'Спина';
+        else if (title.includes('Ноги')) finalCategory = 'Ноги';
+        else if (title.includes('Кардио')) finalCategory = 'Кардио';
+        else if (title.includes('Растяжка')) finalCategory = 'Гибкость';
+        else if (title.includes('Пилатес') || title.includes('Кроссфит') || title.includes('Всё тело')) finalCategory = 'Всё тело';
+        else if (title.includes('Мужская сила') || title.includes('Женское счастье')) finalCategory = 'Ягодицы';
+        else finalCategory = 'Без категории';
+    }
+
+    const workoutExercises = sessionExercises.map((ex, index) => ({
+        ...ex,
+        icon: ex.icon || null,
+        completed: sessionCompleted.has(index)
+    }));
+
+    const workoutIcon = sessionWorkoutIcon || null;
+
+    const workoutData = {
+        title: sessionWorkoutTitle || 'Тренировка',
+        date: new Date().toISOString(),
+        durationSeconds: seconds,
+        exercises: workoutExercises,
+        xpEarned: xpEarned,
+        category: finalCategory,
+        icon: workoutIcon
+    };
+
+    (async function() {
+        try {
+            const user = await getFirebaseUser();
+            if (user) {
+                const result = await saveWorkoutToFirestore(user.uid, workoutData);
+                if (result.success) {
+                    const profileResult = await getUserProfile(user.uid);
+                    if (profileResult.success) {
+                        const currentXp = profileResult.data.totalXp || 0;
+                        await updateUserProfile(user.uid, { totalXp: currentXp + xpEarned });
+                        if (typeof refreshAutoCarousel === 'function') refreshAutoCarousel(); // ★
+                    }
+                    showToast('💾 Тренировка сохранена');
+                    await updateAchievementsAfterWorkout();
+                    await updateProfileStreak();
+                    // ★ Триггер пересчёта вызовов
+                    if (typeof Challenges !== 'undefined') {
+                        Challenges.onWorkoutFinished(user.uid);
+                    }
+                } else {
+                    addPendingWorkout(workoutData);
+                    showToast('⚠️ Тренировка сохранена локально, синхронизация позже');
+                }
+            } else {
+                addPendingWorkout(workoutData);
+                showToast('⚠️ Тренировка сохранена локально');
+            }
+
+            // Сбрасываем переменные
+            sessionExercises = [];
+            sessionCompleted = new Set();
+            sessionSkipped = new Set();
+            sessionCompletedSets = {};
+            sessionSeconds = 0;
+            sessionWorkoutTitle = '';
+            sessionCategory = '';
+            sessionWorkoutIcon = null;
+
+            // Переходим в ленту → вкладка «Моя» → открываем модалку поста
+            window.navigateTo('feed');
+            setTimeout(() => {
+                setFeedFilter('my');
+                openCreatePostModal({ autoSelectLatest: true });
+            }, 500);
+
+            // Счётчик тренировок и PREMIUM
+            incrementWorkoutsCount();
+            const showPremium = shouldShowPremiumOffer();
+            if (showPremium) {
+                markPremiumOfferShown();
+                setTimeout(() => {
+                    enqueueModal({ type: 'premium' });
+                }, 1500);
+            }
+
+        } catch (error) {
+            console.error('❌ Ошибка сохранения тренировки:', error);
+            showToast('❌ Ошибка сохранения тренировки');
+        }
+    })();
+}
+
+// =================== ИСТОРИЯ ТРЕНИРОВОК: ФИЛЬТРЫ ===================
+
+/**
+ * Инициализация обработчиков фильтров истории.
+ * Вызывается один раз при каждой загрузке статистики.
+ */
+function initHistoryFilters() {
+    const searchInput = document.getElementById('historySearchInput');
+    const categorySelect = document.getElementById('historyCategoryFilter');
+    const periodSelect = document.getElementById('historyPeriodFilter');
+    const resetBtn = document.getElementById('historyResetBtn');
+
+    if (!searchInput || !categorySelect || !periodSelect) return;
+
+    // Чтобы не вешать обработчики повторно
+    if (searchInput._historyBound) return;
+    searchInput._historyBound = true;
+
+    // Поиск (с дебаунсом)
+    let searchTimeout = null;
+    searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(() => {
+            _historySearchQuery = searchInput.value.trim().toLowerCase();
+            renderWorkoutHistory();
+        }, 200);
+    });
+
+    // Категория
+    categorySelect.addEventListener('change', () => {
+        _historyCategory = categorySelect.value;
+        renderWorkoutHistory();
+    });
+
+    // Период
+    periodSelect.addEventListener('change', () => {
+        _historyPeriod = periodSelect.value;
+        renderWorkoutHistory();
+    });
+
+    // Сброс
+    resetBtn.addEventListener('click', () => {
+        searchInput.value = '';
+        categorySelect.value = 'all';
+        periodSelect.value = 'all';
+
+        _historySearchQuery = '';
+        _historyCategory = 'all';
+        _historyPeriod = 'all';
+
+        renderWorkoutHistory();
+    });
+}
+
+/**
+ * Получить нижнюю границу периода (timestamp в мс) или null, если «всё время».
+ */
+function getHistoryPeriodStart(period) {
+    if (period === 'all') return null;
+
+    const now = new Date();
+    const start = new Date(now);
+
+    switch (period) {
+        case 'week':
+            start.setDate(now.getDate() - 7);
+            break;
+        case 'month':
+            start.setMonth(now.getMonth() - 1);
+            break;
+        case '3months':
+            start.setMonth(now.getMonth() - 3);
+            break;
+        case 'year':
+            start.setFullYear(now.getFullYear() - 1);
+            break;
+        default:
+            return null;
+    }
+
+    start.setHours(0, 0, 0, 0);
+    return start.getTime();
+}
+
+/**
+ * Отфильтровать тренировки по текущим условиям.
+ */
+function filterHistoryWorkouts() {
+    let result = _historyAllWorkouts;
+
+    // 1. Поиск по названию
+    if (_historySearchQuery) {
+        result = result.filter(w =>
+            String(w.title || '').toLowerCase().includes(_historySearchQuery)
+        );
+    }
+
+    // 2. Категория
+    if (_historyCategory !== 'all') {
+        result = result.filter(w => {
+            const cat = w.category || 'Без категории';
+            return cat === _historyCategory;
+        });
+    }
+
+    // 3. Период
+    const periodStart = getHistoryPeriodStart(_historyPeriod);
+    if (periodStart !== null) {
+        result = result.filter(w => {
+            const t = new Date(w.date).getTime();
+            return !isNaN(t) && t >= periodStart;
+        });
+    }
+
+    return result;
+}
+
+/**
+ * Отрисовать историю с учётом фильтров.
+ */
+function renderWorkoutHistory() {
+    const container = document.getElementById('workoutHistory');
+    const countEl = document.getElementById('historyFilterCount');
+    const resetBtn = document.getElementById('historyResetBtn');
+    if (!container) return;
+
+    const filtered = filterHistoryWorkouts();
+    const total = _historyAllWorkouts.length;
+    const found = filtered.length;
+
+    // ★ Счётчик и кнопка сброса
+    const hasFilters = _historySearchQuery || _historyCategory !== 'all' || _historyPeriod !== 'all';
+
+    if (countEl) {
+        if (hasFilters) {
+            countEl.textContent = `Найдено ${found} из ${total}`;
+        } else {
+            countEl.textContent = `Всего тренировок: ${total}`;
+        }
+    }
+    if (resetBtn) {
+        resetBtn.style.display = hasFilters ? 'inline-flex' : 'none';
+    }
+
+    // ★ Пустые состояния
+if (total === 0) {
+    container.innerHTML = `
+        <div class="empty-state">
+            <span class="empty-icon">📋</span>
+            <h3 class="empty-title">Нет выполненных тренировок</h3>
+            <p class="empty-text">Выполните свою первую тренировку!</p>
+            <button class="btn btn-primary" onclick="goToWorkoutsFromEmpty()">
+                <i class="fa-solid fa-dumbbell"></i> К тренировкам
+            </button>
+        </div>`;
+    return;
+}
+
+    if (found === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <span class="empty-icon">🔍</span>
+                <h3 class="empty-title">Ничего не найдено</h3>
+                <p class="empty-text">Попробуйте изменить фильтры.</p>
+            </div>`;
+        return;
+    }
+
+    // ★ Рендер
+    container.innerHTML = filtered.map(w => {
+        const totalEx = w.exercises?.length || 0;
+        const completedEx = w.exercises?.filter(e => e.completed === true).length || 0;
+        const xpEarned = w.xpEarned || 0;
+        const minutes = Math.floor((w.durationSeconds || 0) / 60);
+        const detailsText = `${minutes} мин · ${completedEx}/${totalEx} ${declOfNum(totalEx, ['упражнение', 'упражнения', 'упражнений'])} · ${xpEarned.toFixed(1)} XP`;
+
+        return `<div class="history-item">
+            <div class="history-item-header">
+                <strong class="history-item-title">${w.title}</strong>
+                <span class="history-item-date">${new Date(w.date).toLocaleDateString('ru-RU')}</span>
+            </div>
+            <div class="history-item-details">${detailsText}</div>
+        </div>`;
+    }).join('');
+}
+
+// =================== МОДАЛКА: ФУНКЦИЯ НЕ ДОСТУПНА ===================
+function openNotAvailableModal() {
+    openModal('notAvailableModal');
+}
+window.openNotAvailableModal = openNotAvailableModal;
+
+// =================== SKELETON-ЗАГЛУШКИ ===================
+const Skeleton = {
+    // Карточка как .item-card (для списков тренировок, друзей, рейтингов)
+    itemCard() {
+        return `
+            <div class="skeleton-card">
+                <div class="skeleton skeleton-icon"></div>
+                <div class="skeleton-info">
+                    <div class="skeleton skeleton-line skeleton-line-w-60"></div>
+                    <div class="skeleton skeleton-line skeleton-line-w-40"></div>
+                </div>
+            </div>
+        `;
+    },
+
+    // Пачка карточек
+    itemCardList(count = 3) {
+        return Array.from({ length: count }, () => this.itemCard()).join('');
+    },
+
+    // Карточка поста в ленте (большая, квадратная)
+    feedPost() {
+        return `
+            <div class="feed-post">
+                <div class="feed-post-header">
+                    <div class="skeleton skeleton-avatar"></div>
+                    <div class="skeleton-info" style="flex:1; display:flex; flex-direction:column; gap:0.3rem;">
+                        <div class="skeleton skeleton-line skeleton-line-w-60"></div>
+                        <div class="skeleton skeleton-line skeleton-line-w-40"></div>
+                    </div>
+                </div>
+                <div class="skeleton" style="width:100%; aspect-ratio:1/1; border-radius:16px;"></div>
+            </div>
+        `;
+    },
+
+    feedPostList(count = 3) {
+        return Array.from({ length: count }, () => this.feedPost()).join('');
+    },
+
+    // Строка истории (компактная)
+    historyRow() {
+        return `
+            <div class="skeleton-card" style="padding:0.6rem 1rem;">
+                <div class="skeleton-info">
+                    <div class="skeleton skeleton-line skeleton-line-w-80"></div>
+                    <div class="skeleton skeleton-line skeleton-line-w-40"></div>
+                </div>
+            </div>
+        `;
+    },
+
+    historyRowList(count = 4) {
+        return Array.from({ length: count }, () => this.historyRow()).join('');
+    },
+
+    // Карточки со статистикой (для статистики и рейтингов)
+    statCard() {
+        return `
+            <div class="skeleton-card" style="justify-content:center; flex-direction:column; padding:0.8rem;">
+                <div class="skeleton skeleton-line skeleton-line-w-40"></div>
+                <div class="skeleton skeleton-line-lg skeleton-line-w-60" style="margin-top:0.3rem;"></div>
+            </div>
+        `;
+    }
+};
+
+window.Skeleton = Skeleton;
+
+// =================== PWA: УСТАНОВКА НА ДОМАШНИЙ ЭКРАН ===================
+const PWA = {
+    deferredPrompt: null,
+    STORAGE_KEY: 'pwaBannerState',   // 'installed' | 'dismissed_at_<ts>'
+    SHOW_DELAY_MS: 3000,             // показать баннер через 3 сек
+    DISMISS_COOLDOWN_MS: 60 * 60 * 1000,  // ★ 1 час — не показывать после закрытия
+
+    isStandalone() {
+        return window.matchMedia('(display-mode: standalone)').matches
+            || window.navigator.standalone === true;
+    },
+
+    isIOS() {
+        return /iPad|iPhone|iPod/.test(navigator.userAgent)
+            && !window.MSStream;
+    },
+
+    isSafari() {
+        return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    },
+
+    // ★ Установлено навсегда?
+    wasInstalled() {
+        return localStorage.getItem(this.STORAGE_KEY) === 'installed';
+    },
+
+    // ★ Недавно закрывали баннер (в течение часа)?
+    wasDismissedRecently() {
+        const state = localStorage.getItem(this.STORAGE_KEY);
+        if (!state) return false;
+        if (state === 'installed') return true;
+        if (state.startsWith('dismissed_at_')) {
+            const ts = parseInt(state.replace('dismissed_at_', ''), 10);
+            return Date.now() - ts < this.DISMISS_COOLDOWN_MS;
+        }
+        return false;
+    },
+
+    markInstalled() {
+        localStorage.setItem(this.STORAGE_KEY, 'installed');
+    },
+
+    markDismissed() {
+        localStorage.setItem(this.STORAGE_KEY, 'dismissed_at_' + Date.now());
+    },
+
+    // ★ Проверяем ВСЕ условия
+    canShowBanner() {
+        // 1. Уже установлено — нет
+        if (this.isStandalone()) {
+            console.log('📱 PWA: уже установлено');
+            return false;
+        }
+
+        // 2. Недавно закрывали (в течение часа) — нет
+        if (this.wasDismissedRecently()) {
+            console.log('📱 PWA: недавно закрывали баннер');
+            return false;
+        }
+
+        // 3. Только для авторизованных с подтверждённой почтой
+        const user = firebase.auth().currentUser;
+        if (!user) return false;
+        if (!user.emailVerified) return false;
+
+        // 4. Не во время туториала
+        if (typeof tutorialActive !== 'undefined' && tutorialActive) {
+            return false;
+        }
+
+        // 5. Если туториал БЫЛ в этой сессии — не показываем
+        if (sessionStorage.getItem('tutorialRanThisSession') === 'true') {
+            return false;
+        }
+
+        // 6. Только на главных страницах приложения
+        const ALLOWED_PAGES = ['page-workouts', 'page-stats', 'page-profile', 'page-feed'];
+        const isInside = ALLOWED_PAGES.some(id => {
+            const el = document.getElementById(id);
+            return el && el.classList.contains('page-active');
+        });
+        if (!isInside) return false;
+
+        // 7. Не во время тренировки
+        const FORBIDDEN_PAGES = [
+            'page-training-session', 'page-task-session',
+            'page-finish', 'page-coop-finish',
+            'page-coop-waiting', 'page-training-waiting'
+        ];
+        const inTraining = FORBIDDEN_PAGES.some(id => {
+            const el = document.getElementById(id);
+            return el && el.classList.contains('page-active');
+        });
+        if (inTraining) return false;
+
+        // 8. Нет открытой модалки
+        const openModalEl = document.querySelector('.modal-overlay.modal-overlay-visible');
+        if (openModalEl) return false;
+
+        // 9. Нет туториал-оверлея
+        if (document.getElementById('tutorialOverlay')) return false;
+
+        return true;
+    },
+
+    tryShowBanner() {
+        if (!this.canShowBanner()) return;
+        this.showBanner();
+    },
+
+    showBanner() {
+        const banner = document.getElementById('pwaInstallBanner');
+        if (!banner) return;
+        if (banner.classList.contains('pwa-banner-visible')) return;
+
+        banner.style.display = 'block';
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                banner.classList.add('pwa-banner-visible');
+            });
+        });
+    },
+
+    hideBanner() {
+        const banner = document.getElementById('pwaInstallBanner');
+        if (!banner) return;
+        banner.classList.remove('pwa-banner-visible');
+        setTimeout(() => { banner.style.display = 'none'; }, 300);
+    },
+
+    async triggerInstall() {
+        if (!this.deferredPrompt) return;
+        this.deferredPrompt.prompt();
+        const { outcome } = await this.deferredPrompt.userChoice;
+
+        if (outcome === 'accepted') {
+            this.markInstalled();
+            this.hideBanner();
+            showToast('✅ Приложение установлено!');
+        } else {
+            // ★ Отказался — ставим cooldown на час
+            this.markDismissed();
+            this.hideBanner();
+        }
+        this.deferredPrompt = null;
+    },
+
+    showInstallStep(device) {
+        const devices = {
+computer: { title: 'Установка на Windows', guide: 'windows' },
+laptop: { title: 'Установка на Mac', guide: 'mac' },
+            iphone: { title: 'Установка на iPhone', guide: 'iphone' },
+            android: { title: 'Установка на Android', guide: 'android' }
+        };
+
+        const selection = devices[device];
+        const title = document.getElementById('pwaInstallTitle');
+        const picker = document.getElementById('pwaDevicePicker');
+        const guide = document.getElementById('pwaInstallGuide');
+
+        title.textContent = selection?.title ?? 'Выберите устройство';
+        picker.hidden = Boolean(selection);
+        guide.hidden = !selection;
+
+        guide.querySelectorAll('[data-pwa-guide]').forEach(section => {
+            section.hidden = section.dataset.pwaGuide !== selection?.guide;
+        });
+
+        title.focus();
+    },
+
+    showInstallOptions() {
+        this.markDismissed();
+        this.hideBanner();
+        openModal('pwaInstallModal');
+        this.showInstallStep();
+    },
+
+    init() {
+        if (this.isStandalone()) {
+            this.markInstalled();
+            return;
+        }
+
+        // Ловим событие установки (Chrome/Edge/Android)
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            this.deferredPrompt = e;
+            console.log('📱 PWA: beforeinstallprompt получено');
+        });
+
+        // Ловим успешную установку
+        window.addEventListener('appinstalled', () => {
+            console.log('📱 PWA: приложение установлено');
+            this.markInstalled();
+            this.hideBanner();
+            showToast('✅ SportApp добавлен на главный экран!');
+        });
+
+        // Кнопки
+        const installBtn = document.getElementById('pwaBannerInstallBtn');
+        const laterBtn = document.getElementById('pwaBannerLaterBtn');
+        const closeBtn = document.getElementById('pwaBannerCloseBtn');
+
+        if (installBtn) {
+            installBtn.addEventListener('click', () => {
+                this.showInstallOptions();
+            });
+        }
+
+        if (laterBtn) {
+            laterBtn.addEventListener('click', () => {
+                this.markDismissed();  // ★ ставим cooldown
+                this.hideBanner();
+            });
+        }
+
+        if (closeBtn) {
+            closeBtn.addEventListener('click', () => {
+                this.markDismissed();  // ★ ставим cooldown
+                this.hideBanner();
+            });
+        }
+
+        console.log('📱 PWA: инициализация завершена');
+    }
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    PWA.init();
+});
+
+window.PWA = PWA;
+
+
+// =================== МОДАЛКА: ЧТО НОВОГО ===================
+const CHANGELOG = {
+    // ★★★ ТЕКУЩАЯ ВЕРСИЯ — меняй при выпуске обновления ★★★
+    CURRENT_VERSION: '1.2.3',
+
+    STORAGE_KEY: 'changelogSeenVersion',
+
+    // ★★★ ИСТОРИЯ ВЕРСИЙ — добавляй сверху новую версию ★★★
+    // Порядок: от новых к старым
+    // ★★★ ИСТОРИЯ ВЕРСИЙ — от новых к старым ★★★
+    VERSIONS: [
+        {
+    version: '1.2.3',
+    date: '23 ноября 2026',
+    title: 'Установка SportApp и обновление PREMIUM',
+    changes: [
+        '📲 <strong>Установка SportApp</strong> - нажмите «Установить» и выберите своё устройство: Windows PC, Mac, iPhone или Android. Для каждого устройства доступна пошаговая инструкция.',
+        '💎 <strong>Знакомство с PREMIUM</strong> - после каждой третьей тренировки предложение PREMIUM теперь открывается как полноэкранное слайд-шоу. Фотографии подбираются под светлую или тёмную тему, а после просмотра можно открыть окно покупки.'
+    ]
+},
+    {
+        version: '1.2.2',
+        date: '21 ноября 2026',
+        title: 'Обновление программ и вызовов',
+        changes: [
+            '🎓 <strong>Обучение</strong> - Обновлён процесс обучения, чтобы новым пользователям было проще познакомиться с возможностями SportApp.',
+            '⚔️ <strong>Вызовы</strong> - Обновлена система вызовов. Стало удобнее отправлять, принимать и отслеживать соревнования с друзьями.',
+            '📋 <strong>Программы</strong> - Теперь при создании поста можно прикрепить не только тренировку, но и целую программу. Появилась возможность добавлять опубликованные программы в свои личные программы, а также копировать и отправлять ссылки на них.'
+        ]
+    },
+{
+    version: '1.2.1',
+    date: '19 ноября 2026',
+    title: 'Информация об упражнениях',
+    changes: [
+        '💪 <strong>Информация об упражнениях</strong> - добавлена плашка с названием следующего упражнения во время отдыха, а также модальное окно с фотографиями и подробным описанием техники выполнения.'
+    ]
+},
+{
+    version: '1.2.0',
+    date: '18 ноября 2026',
+    title: 'Программы тренировок',
+    changes: [
+        '📅 <strong>Готовые программы</strong> - выбирай готовые планы тренировок с расписанием, тренировочными днями и днями отдыха. Следи за прогрессом и отмечай выполненные дни программы.',
+
+        '⚙️ <strong>Создание личных программ</strong> - создавай собственные программы с нуля. Настраивай продолжительность, количество тренировочных дней и расписание. Назначай на каждый день готовые или свои тренировки, планируй отдых и редактируй программу под себя.',
+
+        '🛠️ <strong>Исправления и улучшения</strong> - обновлён интерфейс программ, улучшено отображение прогресса, управление личными тренировками и работа расписания. Исправлены ошибки и улучшена стабильность приложения.'
+    ]
+},
+        {
+            version: '1.1.0',
+            date: '12 октября 2026',
+            title: 'Вызовы друзьям',
+            changes: [
+                '⚡ <strong>Вызовы друзьям</strong> - бросай вызов другу: кто больше тренировок, минут, отжиманий, подтягиваний или приседаний за выбранный срок - 3, 7, 14 или 30 дней. Принимай входящие вызовы прямо в приложении, следи за прогрессом в реальном времени и смотри результаты - победа, проигрыш или ничья. Без PREMIUM доступно до 3 активных вызовов и 1 друг в каждом, с PREMIUM - до 5 активных вызовов и до 3 друзей одновременно.',
+                '🎨 <strong>Мелкие улучшения</strong> - немного доработали интерфейс.'
+            ]
+        },
+        {
+            version: '1.0.0',
+            date: '11 октября 2026',
+            title: 'Первый релиз!',
+            changes: [
+                '🏋️ <strong>Что такое SportApp?</strong><br>Это твой личный тренер, дневник тренировок и социальная сеть в одном приложении. Здесь ты можешь тренироваться по готовым программам или создавать свои, следить за прогрессом тела, соревноваться с друзьями и получать опыт (XP) за каждую тренировку.<br>Более 200 упражнений на все группы мышц, 3 уровня сложности, поддержка гантелей, турника и коврика - тренируйся так, как удобно именно тебе. Приложение работает офлайн: если пропал интернет, тренировка сохранится и синхронизируется позже.',
+
+                '📸 <strong>Страница «Лента»</strong><br>Делись своими тренировками с друзьями и смотри, как тренируются другие. Загрузи фото после тренировки - приложение автоматически наложит статистику: время, количество упражнений и заработанный XP.<br>Вкладка «Все» показывает посты всех пользователей, вкладка «Моя» - только твои публикации. Можно скачать готовый постер с тренировкой, а если понравилась чужая - добавить её себе в личные в один клик.',
+
+                '📊 <strong>Страница «Статистика»</strong><br>Здесь собрана вся информация о твоих тренировках в одном месте. Личная статистика: общее количество тренировок, минут и упражнений, нагрузка по группам мышц, календарь активности, нагрузочный индекс по неделям и графики прогресса тела, история тренировок с фильтрами по названию, категории и периоду, выполняй ежедневные задания и получи значок месяца.<br>Мировая статистика: сколько всего минут, тренировок и упражнений сделали пользователи SportApp за всё время, сколько человек зарегистрировано и сколько сейчас онлайн, достижений сообщества где проценты показывают, у скольких пользователей есть каждый из 7 значков, и два рейтинга топ-30 пользователей по XP за всё время и рейтинг друзей, где ты соревнуешься только с теми, кого добавил.',
+
+                '💪 <strong>Страница «Тренировки»</strong><br>Выбирай из готовых тренировок в трёх категориях: Силовые, Фитнес и PREMIUM. Силовые: руки, плечи, пресс, грудь, спина, ноги, всё тело, каждая в трёх уровнях сложности. Фитнес: зарядка, кардио, растяжка, пилатес, для тех, кто хочет быть в тонусе. PREMIUM: кроссфит, ГТО, «Мужская сила», «Женское счастье».<br>Или создай свою тренировку: добавь упражнения из каталога, настрой подходы, повторения, вес и время отдыха.<br>Пригласи друга на совместную тренировку - тренируйтесь одновременно и смотрите прогресс друг друга в реальном времени.',
+
+                '👤 <strong>Страница «Профиль»</strong><br>Твой личный кабинет: имя, аватар, уровень и прогресс до следующего. Система XP - 15 уровней от «Новичка» до «Заслуженного мастера спорта». За каждую тренировку получаешь опыт в зависимости от упражнений и веса.<br>Достижения - 7 значков за разные успехи. Серия тренировок - тренируйся каждый день и продлевай серию. Задания: сначала 5 обязательных, потом ежедневные - за каждое +10 XP. Настройки - здесь всё под тебя. В основных: PREMIUM, установка приложения инвентарь, акцентный цвет, тема, обучение и связь с администрацией. В дополнительных: показ достижений, история друзей, редактирование страниц и редактирование тренировок. В невозвратных: сброс прогресса, выход и удаление аккаунта - отменить нельзя.',
+
+                '👥 <strong>Друзья и всё про них</strong><br>Добавляй друзей через поиск по имени или по ссылке из QR-кода. Смотри профили: уровень, достижения, статистику и историю тренировок (если она открыта). Соревнуйся в рейтинге друзей - кто больше тренируется и получает XP, тот выше.<br>История друзей: смотри, кто недавно тренировался, получал новый уровень или достижение. Совместные тренировки: приглашай 1 друга (или до 3 с PREMIUM) на тренировку в реальном времени.',
+
+                '💎 <strong>PREMIUM</strong><br>PREMIUM - расширенная версия приложения для тех, кто хочет большего. Открывает доступ к особым тренировкам: кроссфит, ГТО, «Мужская сила» и «Женское счастье» - программы, которых нет в бесплатной версии. Увеличивает лимит друзей в совместной тренировке с 1 до 3 - можно тренироваться целой компанией. Добавляет расширенную палитру акцентных цветов, чтобы полностью настроить приложение под себя. Оформить можно помесячно или сразу на год со скидкой.'
+            ]
+        }
+    ],
+
+    // Уже видел эту версию?
+    wasSeen() {
+        const seen = localStorage.getItem(this.STORAGE_KEY);
+        return seen === this.CURRENT_VERSION;
+    },
+
+    markSeen() {
+        localStorage.setItem(this.STORAGE_KEY, this.CURRENT_VERSION);
+    },
+
+    // Рендер списка версий
+    render() {
+        const list = document.getElementById('changelogList');
+        const versionEl = document.getElementById('changelogCurrentVersion');
+        if (!list) return;
+
+        if (versionEl) versionEl.textContent = this.CURRENT_VERSION;
+
+        list.innerHTML = this.VERSIONS.map((v, i) => `
+            <div class="changelog-version">
+                <div class="changelog-version-header">
+                    <span class="changelog-version-number">Версия ${v.version}</span>
+                    <span class="changelog-version-date">${v.date}</span>
+                </div>
+                <div class="changelog-version-title">${v.title}</div>
+                <ul class="changelog-version-changes">
+                    ${v.changes.map(c => `<li>${c}</li>`).join('')}
+                </ul>
+            </div>
+        `).join('');
+    },
+
+    // Проверить — надо ли показать модалку
+    canShow() {
+        // Уже видел эту версию — нет
+        if (this.wasSeen()) {
+            console.log('📋 Changelog: уже видел версию', this.CURRENT_VERSION);
+            return false;
+        }
+
+        // Не авторизован — нет
+        const user = firebase.auth().currentUser;
+        if (!user) {
+            console.log('📋 Changelog: не авторизован');
+            return false;
+        }
+
+        // Туториал активен — нет
+        if (typeof tutorialActive !== 'undefined' && tutorialActive) {
+            console.log('📋 Changelog: туториал активен');
+            return false;
+        }
+
+        // В этой сессии был туториал — нет
+        if (sessionStorage.getItem('tutorialRanThisSession') === 'true') {
+            console.log('📋 Changelog: туториал был в этой сессии');
+            return false;
+        }
+
+        // Не на главных страницах приложения — нет
+        const ALLOWED = ['page-workouts', 'page-stats', 'page-profile', 'page-feed'];
+        const isInside = ALLOWED.some(id => {
+            const el = document.getElementById(id);
+            return el && el.classList.contains('page-active');
+        });
+        if (!isInside) return false;
+
+        return true;
+    },
+
+// Показать с проверками
+tryShow() {
+    if (!this.canShow()) return;
+
+    // ★ ПЕРЕИМЕНОВАЛИ: openModal → openModalEl,
+    // чтобы не перекрывать глобальную функцию openModal
+    const openModalEl = document.querySelector('.modal-overlay.modal-overlay-visible');
+    if (openModalEl) {
+        console.log('📋 Changelog: открыта другая модалка, ждём');
+        setTimeout(() => this.tryShow(), 5000);
+        return;
+    }
+
+    console.log('📋 Changelog: показываем модалку версии', this.CURRENT_VERSION);
+    this.render();
+    openModal('changelogModal');
+}
+};
+
+// Глобальная функция закрытия
+function closeChangelogModal() {
+    CHANGELOG.markSeen();
+    closeModal('changelogModal');
+    console.log('📋 Changelog: версия', CHANGELOG.CURRENT_VERSION, 'отмечена как просмотренная');
+}
+
+window.CHANGELOG = CHANGELOG;
+window.closeChangelogModal = closeChangelogModal;
+
+// Открыть историю обновлений из номера версии в настройках профиля
+function openVersionChangelog() {
+    const versionEl = document.getElementById('profileAppVersion');
+    if (versionEl) versionEl.textContent = CHANGELOG.CURRENT_VERSION;
+
+    CHANGELOG.render();
+    openModal('changelogModal');
+}
+window.openVersionChangelog = openVersionChangelog;
+
+// =================== FCM: PUSH-УВЕДОМЛЕНИЯ ===================
+const FCM = {
+    messaging: null,
+    token: null,
+    _inited: false,
+
+    /**
+     * Инициализация БЕЗ запроса разрешения.
+     * Только подписываемся на onMessage, если разрешение уже есть.
+     */
+    async autoInit() {
+        if (this._inited) return;
+        if (!('serviceWorker' in navigator) || !('Notification' in window)) return;
+
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+
+        this._inited = true;
+
+        // Если разрешение уже дано — просто получаем токен
+        if (Notification.permission === 'granted') {
+            await this._getTokenAndSave();
+            this._subscribeForeground();
+        }
+        // Если default или denied — ничего не делаем. Ждём кнопку.
+    },
+
+    /**
+     * Вызывается ТОЛЬКО по тапу пользователя (из кнопки).
+     * Это критично для iOS.
+     */
+    async requestPermission() {
+        if (!('Notification' in window)) {
+            showToast('⚠️ Уведомления не поддерживаются');
+            return false;
+        }
+
+        if (Notification.permission === 'granted') {
+            await this._getTokenAndSave();
+            this._subscribeForeground();
+            return true;
+        }
+
+        if (Notification.permission === 'denied') {
+            showToast('❌ Уведомления заблокированы в настройках браузера');
+            return false;
+        }
+
+        // ★ Главный момент: вызывается из обработчика клика
+        const permission = await Notification.requestPermission();
+        if (permission !== 'granted') {
+            showToast('⚠️ Уведомления не включены');
+            return false;
+        }
+
+        await this._getTokenAndSave();
+        this._subscribeForeground();
+        return true;
+    },
+
+    async _getTokenAndSave() {
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+
+        try {
+            this.messaging = firebase.messaging();
+
+            this.token = await this.messaging.getToken({
+                vapidKey: 'BGpP4nhyFFPERRlmdfDi2fTLUB-bb6cGCD4KhwkZQFbJiFWXC10TMEyz4ydhlzEdbJXrc-T-9A37vdG9QHOM8RI'
+            });
+
+            if (!this.token) {
+                console.warn('FCM: токен не получен');
+                return;
+            }
+
+            console.log('📬 FCM Token:', this.token);
+
+            // ★ Сохраняем в массив (для нескольких устройств)
+            await firebase.firestore()
+                .collection('users')
+                .doc(user.uid)
+                .set({
+                    fcmTokens: firebase.firestore.FieldValue.arrayUnion(this.token)
+                }, { merge: true });
+
+            console.log('✅ FCM токен сохранён в Firestore');
+        } catch (err) {
+            console.error('FCM: ошибка получения токена', err);
+        }
+    },
+
+    _subscribeForeground() {
+        if (!this.messaging) this.messaging = firebase.messaging();
+
+        this.messaging.onMessage((payload) => {
+            console.log('📬 Push в фореграунде:', payload);
+            const title = payload.notification?.title || 'SportApp';
+            const body = payload.notification?.body || '';
+            showToast(`🔔 ${title}: ${body}`);
+        });
+    },
+
+    /**
+     * Проверка: нужно ли показывать кнопку «Включить уведомления»?
+     */
+    needsPermission() {
+        if (!('Notification' in window)) return false;
+        return Notification.permission === 'default';
+    }
+};
+
+// Автоинициализация без запроса разрешения
+window.addEventListener('load', () => {
+    setTimeout(() => FCM.autoInit(), 3000);
+});
+
+// =================== КНОПКА «УВЕДОМЛЕНИЯ» В НАСТРОЙКАХ ===================
+function updateNotificationsSettingsItem() {
+    const item = document.getElementById('notificationsSettingsItem');
+    const statusEl = document.getElementById('notificationsStatus');
+    if (!item) return;
+
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    const isStandalone = window.navigator.standalone === true;
+    if (isIOS && !isStandalone) {
+        item.style.display = 'none';
+        return;
+    }
+
+    if (!('Notification' in window)) {
+        item.style.display = 'none';
+        return;
+    }
+
+    // ★ Если уже разрешено — скрываем пункт вообще
+    if (Notification.permission === 'granted') {
+        item.style.display = 'none';
+        return;
+    }
+
+    if (Notification.permission === 'denied') {
+        item.style.display = 'flex';
+        if (statusEl) statusEl.textContent = 'Заблокированы в браузере';
+        return;
+    }
+
+    item.style.display = 'flex';
+    if (statusEl) statusEl.textContent = 'Включить push-уведомления';
+}
+
+/**
+ * Обработчик клика по пункту «Уведомления».
+ * ★ Это ВАЖНО: Notification.requestPermission() вызывается
+ * внутри обработчика клика → iOS показывает диалог.
+ */
+async function onEnableNotificationsClick() {
+    if (Notification.permission === 'granted') {
+        showToast('✅ Уведомления уже включены');
+        return;
+    }
+
+    if (Notification.permission === 'denied') {
+        showToast('❌ Уведомления заблокированы в настройках браузера');
+        return;
+    }
+
+    // Запрашиваем разрешение
+    const ok = await FCM.requestPermission();
+    if (ok) {
+        showToast('✅ Уведомления включены');
+    }
+
+    // Обновляем пункт в настройках
+    updateNotificationsSettingsItem();
+}
+
+window.onEnableNotificationsClick = onEnableNotificationsClick;
+window.updateNotificationsSettingsItem = updateNotificationsSettingsItem;
+
+// =================== ВЫЗОВЫ ДРУЗЬЯМ (новая схема) ===================
+const Challenges = {
+    list: [],
+    unsubscribe: null,
+
+    // Очередь входящих приглашений
+    _incomingQueue: [],
+    _currentIncoming: null,
+    _incomingModalOpen: false,
+    _incomingRetryTimer: null,
+
+    // Текущий вызов в модалке деталей
+    _detailId: null,
+
+    // Состояние загрузки
+    _loading: true,
+    _loaded: false,
+
+    // Троттлинг пересчёта прогресса
+    _statusRefreshing: false,
+    _lastStatusCheck: 0,
+    _STATUS_CHECK_COOLDOWN: 30_000,
+
+    // Дебаунс рендера
+    _renderScheduled: false,
+
+    // Выбранные друзья в модалке создания
+    _selectedFriends: new Set(),
+
+    // ─────────────────────────────────────────
+    // КОНСТАНТЫ
+    // ─────────────────────────────────────────
+    PENDING_TIMEOUT_MS: 24 * 60 * 60 * 1000,   // 24 часа
+
+    _TITLES: {
+        workouts: 'Кто больше тренировок',
+        minutes:  'Кто больше минут',
+        pushups:  'Кто больше отжиманий',
+        pullups:  'Кто больше подтягиваний',
+        squats:   'Кто больше приседаний'
+    },
+
+    _UNITS: {
+        workouts: { one: 'тренировка',   few: 'тренировки',   many: 'тренировок' },
+        minutes:  { one: 'минута',       few: 'минуты',       many: 'минут' },
+        pushups:  { one: 'отжимание',    few: 'отжимания',    many: 'отжиманий' },
+        pullups:  { one: 'подтягивание', few: 'подтягивания', many: 'подтягиваний' },
+        squats:   { one: 'приседание',   few: 'приседания',   many: 'приседаний' }
+    },
+
+    // ─────────────────────────────────────────
+    // ЛИМИТЫ
+    // ─────────────────────────────────────────
+    getMaxActiveChallenges() {
+        return hasPremium() ? 5 : 3;
+    },
+
+    getMaxParticipants() {
+        return hasPremium() ? 4 : 2;
+    },
+
+    _getActiveCount() {
+        return this.list.filter(c =>
+            c.status === 'pending' || c.status === 'active'
+        ).length;
+    },
+
+    // ─────────────────────────────────────────
+// АЛИАСЫ ДЛЯ СОВМЕСТИМОСТИ
+// (используются в closeModal и др. местах)
+// ─────────────────────────────────────────
+checkIncoming() {
+    this._checkIncomingQueue();
+},
+
+_tryShowNextResult() {
+    this._tryShowNextIncoming();
+},
+
+    // ─────────────────────────────────────────
+    // СЛУШАТЕЛЬ FIRESTORE
+    // ─────────────────────────────────────────
+subscribe() {
+    const user = firebase.auth().currentUser;
+    if (!user) return;
+
+    // Отписываемся от старого слушателя
+    if (this.unsubscribe) {
+        this.unsubscribe();
+        this.unsubscribe = null;
+    }
+
+    // Сброс защёлки рендера (из правки №2)
+    if (this._renderScheduleTimer) {
+        clearTimeout(this._renderScheduleTimer);
+        this._renderScheduleTimer = null;
+    }
+    this._renderScheduled = false;
+
+    // ★ Сбрасываем старый таймер-страховку, если он висел с прошлого раза
+    if (this._loadingTimeout) {
+        clearTimeout(this._loadingTimeout);
+        this._loadingTimeout = null;
+    }
+
+    this._loading = true;
+    this._loaded = false;
+    this.render();
+
+    // Заводим новый таймер-страховку
+    this._loadingTimeout = setTimeout(() => {
+        this._loadingTimeout = null;          // ★ не забываем обнулить ссылку
+        if (this._loading && !this._loaded) {
+            this._loading = false;
+            this._loaded = true;
+            this.render();
+        }
+    }, 3000);
+
+    this.unsubscribe = firebase.firestore()
+        .collection('challenges')
+        .where('participantIds', 'array-contains', user.uid)
+        .onSnapshot(
+            snapshot => {
+                // ★★★ УСПЕХ — отменяем страховочный таймер ★★★
+                if (this._loadingTimeout) {
+                    clearTimeout(this._loadingTimeout);
+                    this._loadingTimeout = null;
+                }
+
+                const list = [];
+                snapshot.forEach(doc => list.push({ id: doc.id, ...doc.data() }));
+                this.list = list;
+                this._loading = false;
+                this._loaded = true;
+                this._scheduleRender();
+                this._checkIncomingQueue();
+                this._maybeRefreshStatuses();
+            },
+            err => {
+                // ★★★ ОШИБКА — тоже отменяем ★★★
+                if (this._loadingTimeout) {
+                    clearTimeout(this._loadingTimeout);
+                    this._loadingTimeout = null;
+                }
+
+                console.error('❌ Challenges listener error:', err);
+                this._loading = false;
+                this._loaded = true;
+                this._scheduleRender();
+            }
+        );
+},
+
+    unsubscribeAll() {
+        if (this.unsubscribe) {
+            this.unsubscribe();
+            this.unsubscribe = null;
+        }
+        this._incomingQueue = [];
+        this._currentIncoming = null;
+        this._incomingModalOpen = false;
+    },
+
+_renderScheduled: false,
+_renderScheduleTimer: null,
+
+_scheduleRender() {
+    // Если уже запланировано — не дублируем
+    if (this._renderScheduled) return;
+    this._renderScheduled = true;
+
+    // Чистим предыдущий таймер, если висел
+    if (this._renderScheduleTimer) {
+        clearTimeout(this._renderScheduleTimer);
+    }
+
+    // setTimeout работает и в фоне, и при скрытой вкладке
+    this._renderScheduleTimer = setTimeout(() => {
+        this._renderScheduleTimer = null;
+        this._renderScheduled = false;
+        try {
+            this.render();
+            if (this._detailId) this._renderDetail();
+        } catch (err) {
+            console.error('Challenges.render error:', err);
+        }
+    }, 16);
+},
+
+    // ─────────────────────────────────────────
+    // ХЕЛПЕРЫ
+    // ─────────────────────────────────────────
+    _getMyId() {
+        const u = firebase.auth().currentUser;
+        return u ? u.uid : null;
+    },
+
+    _getMe(challenge) {
+        const myId = this._getMyId();
+        if (!myId) return null;
+
+        // 1. Сначала ищем в participants
+        const p = (challenge.participants || []).find(p => p.id === myId);
+        if (p) return p;
+
+        // 2. Фолбэк — если есть только participantIds
+        if ((challenge.participantIds || []).includes(myId)) {
+            return { id: myId, name: 'Вы', accepted: true, surrendered: false, progress: 0 };
+        }
+
+        return null;
+    },
+
+    /**
+ * Возвращает статус вызова С ТОЧКИ ЗРЕНИЯ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ.
+ * Если я сдался в активном вызове — для меня он «completed».
+ */
+_getEffectiveStatus(c) {
+    const myId = this._getMyId();
+    if (!myId) return c.status;
+
+    // Я сдался, а вызов всё ещё active для остальных —
+    // для меня он завершён
+    if (c.status === 'active' && c.surrenderedAt && c.surrenderedAt[myId]) {
+        return 'completed';
+    }
+
+    return c.status;
+},
+
+    _isMyChallenge(challenge) {
+        return !!this._getMe(challenge);
+    },
+
+    _getAcceptedCount(challenge) {
+        return (challenge.participants || [])
+            .filter(p => p.accepted === true && !p.surrendered).length;
+    },
+
+    _getActiveParticipants(challenge) {
+        return (challenge.participants || [])
+            .filter(p => p.accepted === true && !p.surrendered);
+    },
+
+    _formatUnit(type, count) {
+        const u = this._UNITS[type] || this._UNITS.workouts;
+        return declOfNum(count, [u.one, u.few, u.many]);
+    },
+
+    _formatDate(iso) {
+        if (!iso) return '—';
+        const d = new Date(iso);
+        const day = String(d.getDate()).padStart(2, '0');
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const year = d.getFullYear();
+        return `${day}.${month}.${year}`;
+    },
+
+    _formatTs(ts) {
+        if (!ts) return '—';
+        const ms = ts.seconds ? ts.seconds * 1000 : new Date(ts).getTime();
+        return this._formatDate(new Date(ms).toISOString());
+    },
+
+    _isChallengeHidden(challenge) {
+        const myId = this._getMyId();
+        if (!myId) return false;
+        return (challenge.hiddenFor || []).includes(myId);
+    },
+
+    // ─────────────────────────────────────────
+    // СОЗДАНИЕ ВЫЗОВА
+    // ─────────────────────────────────────────
+    async openCreate() {
+        const container = document.getElementById('challengeFriendSelect');
+        if (!container) return;
+
+        // Сброс
+        this._selectedFriends = new Set();
+        this._updateFriendsCounter();
+
+        container.innerHTML = '<div class="challenge-friends-loading">Загрузка...</div>';
+
+        const user = firebase.auth().currentUser;
+        if (!user) {
+            container.innerHTML = '<div class="challenge-friends-loading">Не авторизован</div>';
+            openModal('createChallengeModal');
+            return;
+        }
+
+        // Проверка лимита активных
+        const activeCount = this._getActiveCount();
+        const maxActive = this.getMaxActiveChallenges();
+        if (activeCount >= maxActive) {
+            if (!hasPremium()) {
+                openModal('premiumModal');
+                showToast(`⚠️ Максимум ${maxActive} активных вызовов. С Premium — 5.`);
+            } else {
+                showToast(`⚠️ Максимум ${maxActive} активных вызовов`);
+            }
+            return;
+        }
+
+        const result = await getFriendsList();
+        if (!result.success || result.data.length === 0) {
+            container.innerHTML = '<div class="challenge-friends-loading">Нет друзей</div>';
+            openModal('createChallengeModal');
+            return;
+        }
+
+        // Собираем ID друзей, с которыми уже есть pending/active вызов
+        const busyIds = new Set();
+        this.list.forEach(c => {
+            if (c.status === 'pending' || c.status === 'active') {
+                (c.participants || []).forEach(p => {
+                    if (p.id !== user.uid) busyIds.add(p.id);
+                });
+            }
+        });
+
+        const friends = result.data;
+        const maxParticipants = this.getMaxParticipants();
+
+container.innerHTML = friends.map(f => {
+    const initial = (f.displayName || 'П')[0].toUpperCase();
+    const level = getCurrentLevel(f.totalXp || 0).id;
+    const xp = Math.round(f.totalXp || 0);
+    return `
+        <div class="friend-itemMOD" data-uid="${f.id}" onclick="Challenges._toggleFriend('${f.id}')">
+            <div class="friend-avatar">${initial}</div>
+            <div class="friend-info">
+                <strong>${f.displayName || 'Пользователь'}</strong>
+                <span>Уровень ${level} · ${xp} XP</span>
+            </div>
+            <span class="challenge-friend-mark">
+                <i class="fa-solid fa-check"></i>
+            </span>
+        </div>
+    `;
+}).join('');
+
+        // Ограничение по умолчанию
+        this._updateFriendsCounter();
+
+        document.getElementById('challengeTypeSelect').value = 'workouts';
+        document.getElementById('challengeDurationSelect').value = '7';
+        document.getElementById('challengeTargetInput').value = '10';
+        updateChallengeHint();
+
+        openModal('createChallengeModal');
+    },
+
+    _toggleFriend(uid) {
+        const maxFriends = this.getMaxParticipants() - 1;  // я уже участвую
+
+        if (this._selectedFriends.has(uid)) {
+            this._selectedFriends.delete(uid);
+        } else {
+            if (this._selectedFriends.size >= maxFriends) {
+                if (!hasPremium() && maxFriends === 1) {
+                    openModal('premiumModal');
+                    showToast('⚠️ С Premium можно пригласить до 3 друзей');
+                } else {
+                    showToast(`⚠️ Максимум ${maxFriends} друзей`);
+                }
+                return;
+            }
+            this._selectedFriends.add(uid);
+        }
+
+        // Обновляем визуал
+document.querySelectorAll('#challengeFriendSelect .friend-itemMOD').forEach(el => {
+    const isSel = this._selectedFriends.has(el.dataset.uid);
+    el.classList.toggle('selected', isSel);
+});
+
+        this._updateFriendsCounter();
+    },
+
+    _updateFriendsCounter() {
+        const el = document.getElementById('challengeFriendsCounter');
+        if (!el) return;
+        const maxFriends = this.getMaxParticipants() - 1;
+        const premium = hasPremium() ? ' (Premium)' : '';
+        el.textContent = `Выбрано: ${this._selectedFriends.size} из ${maxFriends}${premium}`;
+    },
+
+    async send() {
+        const user = firebase.auth().currentUser;
+        if (!user) { showToast('❌ Не авторизован'); return; }
+
+        const selectedFriends = Array.from(this._selectedFriends);
+        if (selectedFriends.length === 0) {
+            showToast('⚠️ Выберите хотя бы одного друга');
+            return;
+        }
+
+        const maxFriends = this.getMaxParticipants() - 1;
+        if (selectedFriends.length > maxFriends) {
+            if (!hasPremium()) {
+                openModal('premiumModal');
+            } else {
+                showToast(`⚠️ Максимум ${maxFriends} друзей`);
+            }
+            return;
+        }
+
+        // Проверка лимита активных ещё раз
+        if (this._getActiveCount() >= this.getMaxActiveChallenges()) {
+            showToast(`⚠️ Максимум ${this.getMaxActiveChallenges()} активных вызовов`);
+            return;
+        }
+
+        const type = document.getElementById('challengeTypeSelect').value;
+        const duration = parseInt(document.getElementById('challengeDurationSelect').value);
+        const target = parseInt(document.getElementById('challengeTargetInput').value);
+
+        if (!target || target < 1) { showToast('⚠️ Укажите цель'); return; }
+
+        const btn = document.getElementById('challengeSendBtn');
+        btn.disabled = true;
+        btn.textContent = 'Отправка...';
+
+        try {
+            // Мой профиль
+            const ownProfile = await getUserProfile(user.uid);
+            const myName = ownProfile.success
+                ? (ownProfile.data.displayName || 'Пользователь')
+                : (user.displayName || 'Пользователь');
+
+            // Профили друзей (батч)
+            const profilesMap = await getProfilesBatch(selectedFriends);
+
+            // Формируем участников
+            const participants = [
+                {
+                    id: user.uid,
+                    name: myName,
+                    accepted: true,       // я сразу принял
+                    surrendered: false,
+                    progress: 0
+                }
+            ];
+
+            selectedFriends.forEach(fid => {
+                const p = profilesMap[fid] || {};
+                participants.push({
+                    id: fid,
+                    name: p.displayName || 'Пользователь',
+                    accepted: null,        // ждём ответа
+                    surrendered: false,
+                    progress: 0
+                });
+            });
+
+            const participantIds = participants.map(p => p.id);
+
+            const docRef = await firebase.firestore().collection('challenges').add({
+                participants,
+                participantIds,
+                type,
+                target,
+                duration,
+                status: 'pending',
+                createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+                startedAt: null,
+                endDate: null,
+                completedAt: null,
+                winners: [],
+                completedReason: null,
+                hiddenFor: []
+            });
+
+            // Уведомления друзьям (не ждём завершения)
+            const notifPromises = selectedFriends.map(fid =>
+                firebase.firestore().collection('notifications').add({
+                    to: fid,
+                    from: user.uid,
+                    fromName: myName,
+                    type: 'challenge_invite',
+                    challengeId: docRef.id,
+                    message: `${myName} бросает вам вызов!`,
+                    read: false,
+                    createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                }).catch(() => {})
+            );
+            Promise.all(notifPromises);
+
+            closeModal('createChallengeModal');
+            showToast(`✅ Вызов отправлен ${selectedFriends.length} ${declOfNum(selectedFriends.length, ['другу', 'друзьям', 'друзьям'])}`);
+        } catch (err) {
+            console.error('Challenge send error:', err);
+            showToast('❌ Не удалось отправить вызов');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Отправить';
+        }
+    },
+
+    // ─────────────────────────────────────────
+    // ВХОДЯЩИЕ ПРИГЛАШЕНИЯ (очередь)
+    // ─────────────────────────────────────────
+    _checkIncomingQueue() {
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+
+        // Ищем pending, где я не ответил
+        const pendingForMe = this.list.filter(c =>
+            c.status === 'pending' &&
+            (c.participants || []).some(p => p.id === user.uid && p.accepted === null)
+        );
+
+        // Добавляем новые в очередь, не дублируя
+        pendingForMe.forEach(c => {
+            const alreadyQueued = this._incomingQueue.some(x => x.id === c.id);
+            const isCurrent = this._currentIncoming && this._currentIncoming.id === c.id;
+            if (!alreadyQueued && !isCurrent) {
+                this._incomingQueue.push(c);
+            }
+        });
+
+        this._tryShowNextIncoming();
+    },
+
+    _tryShowNextIncoming() {
+        if (this._incomingModalOpen) return;
+        if (!this._currentIncoming && this._incomingQueue.length === 0) return;
+
+        // Проверяем, можно ли сейчас показывать
+        if (!this._canShowChallengeModal()) {
+            if (this._incomingRetryTimer) clearTimeout(this._incomingRetryTimer);
+            this._incomingRetryTimer = setTimeout(() => {
+                this._tryShowNextIncoming();
+            }, 1500);
+            return;
+        }
+
+        // Если текущий уже показан — выходим
+        if (this._currentIncoming && this._incomingModalOpen) return;
+
+        // Берём следующий
+        if (!this._currentIncoming) {
+            this._currentIncoming = this._incomingQueue.shift();
+        }
+        if (!this._currentIncoming) return;
+
+        // Обновляем данные из свежего snapshot
+        const fresh = this.list.find(c => c.id === this._currentIncoming.id);
+        if (!fresh || fresh.status !== 'pending') {
+            // Уже неактуально — берём следующий
+            this._currentIncoming = null;
+            this._tryShowNextIncoming();
+            return;
+        }
+        this._currentIncoming = fresh;
+
+        this._showIncomingModal(fresh);
+    },
+
+    _showIncomingModal(challenge) {
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+
+        const me = (challenge.participants || []).find(p => p.id === user.uid);
+        if (!me || me.accepted !== null) return;  // уже ответил
+
+        const textEl = document.getElementById('incomingChallengeText');
+        const taskEl = document.getElementById('incomingChallengeTask');
+        const durationEl = document.getElementById('incomingChallengeDuration');
+
+        // Кто пригласил? Первый принявший не я = автор
+        const other = (challenge.participants || []).find(p => p.id !== user.uid);
+        const fromName = other ? other.name : 'Пользователь';
+
+        if (textEl) textEl.textContent = `${fromName} бросает вам вызов!`;
+
+        const u = this._UNITS[challenge.type] || this._UNITS.workouts;
+        const targetWord = declOfNum(challenge.target, [u.one, u.few, u.many]);
+        const durationWord = declOfNum(challenge.duration, ['день', 'дня', 'дней']);
+
+        if (taskEl) taskEl.textContent = `Выполнить ${challenge.target} ${targetWord}`;
+        if (durationEl) durationEl.textContent = `за ${challenge.duration} ${durationWord}`;
+
+        this._incomingModalOpen = true;
+        openModal('incomingChallengeModal');
+    },
+
+    async acceptIncoming() {
+        const c = this._currentIncoming;
+        if (!c) return;
+
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+
+        try {
+            const updatedParticipants = (c.participants || []).map(p =>
+                p.id === user.uid ? { ...p, accepted: true } : p
+            );
+
+            const updateData = { participants: updatedParticipants };
+            const transition = this._computePendingTransition({
+                ...c,
+                participants: updatedParticipants
+            });
+            Object.assign(updateData, transition || {});
+
+            await firebase.firestore().collection('challenges').doc(c.id).update(updateData);
+
+            showToast('✅ Вызов принят!');
+        } catch (err) {
+            console.error('Challenge accept error:', err);
+            showToast('❌ Не удалось принять вызов');
+        }
+
+        this._incomingModalOpen = false;
+        this._currentIncoming = null;
+        closeModal('incomingChallengeModal');
+        setTimeout(() => this._tryShowNextIncoming(), 400);
+    },
+
+    async declineIncoming() {
+        const c = this._currentIncoming;
+        if (!c) return;
+
+        const user = firebase.auth().currentUser;
+        if (!user) return;
+
+        try {
+            const updatedParticipants = (c.participants || []).map(p =>
+                p.id === user.uid ? { ...p, accepted: false } : p
+            );
+
+            const updateData = { participants: updatedParticipants };
+            const transition = this._computePendingTransition({
+                ...c,
+                participants: updatedParticipants
+            });
+            Object.assign(updateData, transition || {});
+
+            await firebase.firestore().collection('challenges').doc(c.id).update(updateData);
+
+            showToast('❌ Вызов отклонён');
+        } catch (err) {
+            console.error('Challenge decline error:', err);
+        }
+
+        this._incomingModalOpen = false;
+        this._currentIncoming = null;
+        closeModal('incomingChallengeModal');
+        setTimeout(() => this._tryShowNextIncoming(), 400);
+    },
+
+    // ─────────────────────────────────────────
+    // ЛОГИКА ПЕРЕХОДА pending → active/cancelled
+    // ─────────────────────────────────────────
+    /**
+     * Проверяет: все ли определились? Возвращает объект с полями,
+     * которые нужно записать в Firestore, или null если ещё ждём.
+     */
+    _computePendingTransition(challenge) {
+        const participants = challenge.participants || [];
+        const allAnswered = participants.every(p => p.accepted !== null);
+
+        if (!allAnswered) return null;
+
+        const acceptedCount = participants.filter(p => p.accepted === true).length;
+
+        if (acceptedCount >= 2) {
+            const now = new Date();
+            const endDate = new Date(now);
+            endDate.setDate(endDate.getDate() + challenge.duration);
+
+            return {
+                status: 'active',
+                startedAt: firebase.firestore.FieldValue.serverTimestamp(),
+                endDate: endDate.toISOString()
+            };
+        } else {
+            return {
+                status: 'cancelled'
+            };
+        }
+    },
+
+    // ─────────────────────────────────────────
+    // ПРОВЕРКА ТАЙМАУТА pending (24 часа)
+    // ─────────────────────────────────────────
+    _checkPendingTimeout(challenge) {
+        if (challenge.status !== 'pending') return null;
+        const createdAt = challenge.createdAt?.seconds
+            ? challenge.createdAt.seconds * 1000
+            : (challenge.createdAt ? new Date(challenge.createdAt).getTime() : 0);
+        if (!createdAt) return null;
+        if (Date.now() - createdAt < this.PENDING_TIMEOUT_MS) return null;
+
+        // Все не ответившие = отклонившие
+        const updatedParticipants = (challenge.participants || []).map(p => ({
+            ...p,
+            accepted: p.accepted === null ? false : p.accepted
+        }));
+
+        return updatedParticipants;
+    },
+
+    // ─────────────────────────────────────────
+    // МОДАЛКА ДЕТАЛЕЙ
+    // ─────────────────────────────────────────
+    openDetail(challengeId) {
+        const user = firebase.auth().currentUser;
+        if (!user) { showToast('❌ Не авторизован'); return; }
+
+        const c = this.list.find(x => x.id === challengeId);
+        if (!c) {
+            showToast('❌ Вызов не найден');
+            console.warn('[Challenge] нет в списке:', challengeId);
+            return;
+        }
+
+        const me = this._getMe(c);
+        if (!me) {
+            showToast('❌ Вы не участник вызова');
+            console.warn('[Challenge] _getMe вернул null', {
+                myId: user.uid,
+                participants: c.participants,
+                participantIds: c.participantIds
+            });
+            return;
+        }
+
+        // Если я ещё не ответил — показываем старую incomingChallengeModal
+        if (c.status === 'pending' && me.accepted === null) {
+            this._currentIncoming = c;
+            this._incomingModalOpen = false;
+            this._showIncomingModal(c);
+            return;
+        }
+
+        this._detailId = challengeId;
+        this._renderDetail();
+        openModal('challengeDetailModal');
+    },
+
+    _renderDetail() {
+        const c = this.list.find(x => x.id === this._detailId);
+        if (!c) {
+            closeModal('challengeDetailModal');
+            return;
+        }
+
+        const myId = this._getMyId();
+        const me = this._getMe(c);
+
+        // Заголовок
+        document.getElementById('challengeDetailTitle').textContent =
+            this._TITLES[c.type] || 'Вызов';
+
+        // Subtitle
+        const subEl = document.getElementById('challengeDetailSubtitle');
+        subEl.textContent = this._getSubtitle(c);
+
+        // Инфо
+        document.getElementById('challengeDetailTarget').textContent =
+            `${c.target} ${this._formatUnit(c.type, c.target)}`;
+        document.getElementById('challengeDetailStart').textContent = this._formatTs(c.startedAt);
+                const endDateToShow = c.status === 'completed'
+            ? c.completedAt
+            : c.endDate;
+
+        document.getElementById('challengeDetailEnd').textContent =
+            endDateToShow
+                ? (c.status === 'completed'
+                    ? this._formatTs(endDateToShow)   // completedAt — Timestamp
+                    : this._formatDate(endDateToShow)) // endDate — ISO-строка
+                : '—';
+        document.getElementById('challengeDetailParticipants').textContent =
+            (c.participants || []).length;
+
+        // Лидерборд
+        this._renderLeaderboard(c);
+
+        // Кнопка действия
+        const finishBtn = document.getElementById('challengeDetailFinishBtn');
+        const action = this._getFinishAction(c, me);
+        if (action) {
+            finishBtn.style.display = '';
+            finishBtn.textContent = action.text;
+            finishBtn.className = 'btn ' + (action.variant === 'danger' ? 'btn-danger' : 'btn-secondary');
+            finishBtn.onclick = () => action.handler();
+        } else {
+            finishBtn.style.display = 'none';
+        }
+    },
+
+    _renderLeaderboard(c) {
+    const container = document.getElementById('challengeLeaderboard');
+    if (!container) return;
+
+    const myId = this._getMyId();
+    const participants = c.participants || [];
+
+    if (participants.length === 0) {
+        container.innerHTML = `
+            <div style="text-align:center; color:var(--slate); padding:1rem; font-size:0.8rem;">
+                Нет участников
+            </div>`;
+        return;
+    }
+
+    // Сортируем: активные по прогрессу desc, сдавшиеся — в конец
+    const sorted = [...participants].sort((a, b) => {
+        // сдавшиеся в конец
+        if (a.surrendered && !b.surrendered) return 1;
+        if (!a.surrendered && b.surrendered) return -1;
+        // ожидающие ответа — в конец
+        if (a.accepted === null && b.accepted !== null) return 1;
+        if (a.accepted !== null && b.accepted === null) return -1;
+        // иначе — по прогрессу
+        return (b.progress || 0) - (a.progress || 0);
+    });
+
+    const isCompleted = c.status === 'completed';
+    const winners = c.winners || [];
+
+    container.innerHTML = sorted.map((p, i) => {
+        const isMe = p.id === myId;
+        const isWinner = winners.includes(p.id);
+        const place = i + 1;
+
+        // Процент прогресса
+        const pct = c.target > 0
+            ? Math.min(100, Math.round((p.progress || 0) / c.target * 100))
+            : 0;
+
+        // Статус-метка
+        let status = '';
+        if (p.surrendered) {
+            status = ' · сдался';
+        } else if (p.accepted === null) {
+            status = ' · ждём ответа';
+        } else if (p.accepted === false) {
+            status = ' · отклонил';
+        }
+
+        return `
+            <div class="challenge-lb-row">
+                <div class="challenge-lb-place">${place}</div>
+                <div class="challenge-lb-body">
+                    <div class="challenge-lb-name-row">
+                        <span class="challenge-lb-name">
+                            ${isMe ? 'Вы' : (p.name || 'Пользователь')}${status}
+                        </span>
+                        <span class="challenge-lb-value">
+                            ${p.progress || 0}/${c.target}
+                        </span>
+                    </div>
+                    <div class="challenge-lb-bar">
+                        <div class="challenge-lb-fill" style="width:${pct}%;"></div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+},
+
+_getSubtitle(c) {
+    if (c.status === 'pending') {
+        const total = (c.participants || []).length;
+        const answered = (c.participants || []).filter(p => p.accepted !== null).length;
+        return `Ожидаем ответов · ${answered} из ${total}`;
+    }
+    if (c.status === 'active') {
+        const days = Math.max(0, Math.ceil(
+            (new Date(c.endDate).getTime() - Date.now()) / 86400000
+        ));
+        return `Активный · ${days} ${declOfNum(days, ['день', 'дня', 'дней'])} осталось`;
+    }
+    if (c.status === 'completed') {
+        const myId = this._getMyId();
+        const winners = c.winners || [];
+
+        // Победа / Проигрыш / Ничья
+        if (winners.length === 0) {
+            return 'Ничья';
+        }
+        if (winners.length > 1 && winners.includes(myId)) {
+            return 'Ничья (лидеры)';
+        }
+        if (winners.includes(myId)) {
+            return 'Победа!';
+        }
+        return 'Проигрыш';
+    }
+    if (c.status === 'cancelled') {
+        return 'Отменён';
+    }
+    return '';
+},
+
+    _getFinishAction(c, me) {
+        const myId = this._getMyId();
+        if (!me) return null;
+
+        // Сдаться (pending, я принял, но не могу ждать / active)
+        if ((c.status === 'pending' || c.status === 'active') && !me.surrendered && me.accepted === true) {
+            return {
+                text: 'Сдаться',
+                variant: 'danger',
+                handler: () => this._confirmSurrender(c)
+            };
+        }
+
+        // Скрыть из истории (completed)
+        if (c.status === 'completed' && !this._isChallengeHidden(c)) {
+            return {
+                text: 'Скрыть из истории',
+                variant: 'danger',
+                handler: () => this._confirmHideFromHistory(c)
+            };
+        }
+
+        return null;
+    },
+
+    // ─────────────────────────────────────────
+    // ДЕЙСТВИЯ ИЗ МОДАЛКИ
+    // ─────────────────────────────────────────
+    _confirmSurrender(c) {
+        showConfirmModal(
+            'Сдаться?',
+            'Вы выйдете из вызова. Остальные продолжат соревноваться. Отменить действие нельзя.',
+            () => this._surrender(c),
+            'Сдаться'
+        );
+    },
+
+    _confirmHideFromHistory(c) {
+        showConfirmModal(
+            'Скрыть из истории?',
+            'Вызов исчезнет из вашего списка. Если его скроют все участники — он удалится навсегда.',
+            () => this._hideFromHistory(c),
+            'Скрыть'
+        );
+    },
+
+async _surrender(c) {
+    const myId = this._getMyId();
+    if (!myId) return;
+
+    try {
+        const updatedParticipants = (c.participants || []).map(p =>
+            p.id === myId ? { ...p, surrendered: true } : p
+        );
+
+        const updateData = { participants: updatedParticipants };
+
+        // Активные после моей сдачи (приняли и не сдались)
+        const activeList = updatedParticipants.filter(p =>
+            p.accepted === true && !p.surrendered
+        );
+
+        // Активные с прогрессом > 0 — кандидаты в победители
+        const withProgress = activeList.filter(p => (p.progress || 0) > 0);
+
+        if (activeList.length >= 2) {
+            // ★ Есть 2+ активных — соревнование продолжается.
+            // Статус НЕ меняем. Я просто выхожу.
+            // Помечаем, что вызов для меня «завершён» — через поле.
+            updateData[`surrenderedAt.${myId}`] =
+                firebase.firestore.FieldValue.serverTimestamp();
+        } else {
+            // 0 или 1 активных — соревнование не может продолжаться.
+            if (withProgress.length > 0) {
+                // ★ Есть кто-то с прогрессом → он побеждает
+                const maxProg = Math.max(...withProgress.map(p => p.progress || 0));
+                const winners = withProgress
+                    .filter(p => (p.progress || 0) === maxProg)
+                    .map(p => p.id);
+
+                updateData.status = 'completed';
+                updateData.winners = winners;
+                updateData.completedReason = 'surrender';
+                updateData.completedAt = firebase.firestore.FieldValue.serverTimestamp();
+            } else {
+                // ★ Никто не имеет прогресса → удаляем вызов
+                await firebase.firestore()
+                    .collection('challenges').doc(c.id).delete();
+                showToast('🏳️ Вызов отменён');
+                this._detailId = null;
+                closeModal('challengeDetailModal');
+                return;
+            }
+        }
+
+        await firebase.firestore()
+            .collection('challenges').doc(c.id).update(updateData);
+
+        showToast('🏳️ Вы сдались');
+    } catch (err) {
+        console.error('Surrender error:', err);
+        showToast('❌ Не удалось сдаться');
+    }
+
+    this._detailId = null;
+    closeModal('challengeDetailModal');
+},
+
+    async _hideFromHistory(c) {
+        const myId = this._getMyId();
+        if (!myId) return;
+
+        try {
+            const hiddenFor = Array.from(new Set([...(c.hiddenFor || []), myId]));
+            const allHidden = (c.participants || []).every(p => hiddenFor.includes(p.id));
+
+            if (allHidden) {
+                // Все скрыли — удаляем документ
+                await firebase.firestore().collection('challenges').doc(c.id).delete();
+            } else {
+                await firebase.firestore().collection('challenges').doc(c.id).update({
+                    hiddenFor
+                });
+            }
+
+            showToast('✅ Скрыто из истории');
+        } catch (err) {
+            console.error('Hide error:', err);
+        }
+
+        this._detailId = null;
+        closeModal('challengeDetailModal');
+    },
+
+    // ─────────────────────────────────────────
+    // ПЕРЕСЧЁТ ПРОГРЕССА
+    // ─────────────────────────────────────────
+    _maybeRefreshStatuses() {
+        const now = Date.now();
+        if (now - this._lastStatusCheck < this._STATUS_CHECK_COOLDOWN) return;
+        if (this._statusRefreshing) return;
+
+        this._lastStatusCheck = now;
+        this.refreshStatuses();
+    },
+
+    async refreshStatuses() {
+        if (this._statusRefreshing) return;
+        this._statusRefreshing = true;
+
+        try {
+            const user = firebase.auth().currentUser;
+            if (!user) return;
+
+            // 1. Таймауты pending
+            for (const c of this.list) {
+                if (c.status !== 'pending') continue;
+                const timeout = this._checkPendingTimeout(c);
+                if (timeout) {
+                    const transition = this._computePendingTransition({
+                        ...c,
+                        participants: timeout
+                    });
+                    const updateData = { participants: timeout };
+                    Object.assign(updateData, transition || {});
+                    try {
+                        await firebase.firestore().collection('challenges').doc(c.id).update(updateData);
+                    } catch (e) {}
+                }
+            }
+
+            // 2. Пересчёт активных
+            const activeList = this.list.filter(c => c.status === 'active');
+            for (const c of activeList) {
+                await this._refreshActiveChallenge(c);
+            }
+        } finally {
+            this._statusRefreshing = false;
+        }
+    },
+
+    async _refreshActiveChallenge(c) {
+        const participants = c.participants || [];
+        const accepted = participants.filter(p => p.accepted === true && !p.surrendered);
+
+        if (accepted.length === 0) return;
+
+        let changed = false;
+        const updated = [...participants];
+
+        // Пересчёт прогресса для каждого
+        for (let i = 0; i < updated.length; i++) {
+            const p = updated[i];
+            if (p.accepted !== true || p.surrendered) continue;
+            try {
+                const newProg = await this.calcProgress(p.id, c.type, c.startedAt, c.endDate);
+                if (newProg !== p.progress) {
+                    updated[i] = { ...p, progress: newProg };
+                    changed = true;
+                }
+            } catch (e) {}
+        }
+
+        // Проверяем условия завершения
+        const now = Date.now();
+        const endMs = new Date(c.endDate).getTime();
+        const timeExpired = now >= endMs;
+
+        const reached = updated.filter(p =>
+            p.accepted === true && !p.surrendered && p.progress >= c.target
+        );
+
+        let finalize = null;
+
+        if (reached.length > 0) {
+            // Кто-то достиг цели
+            const maxProg = Math.max(...reached.map(p => p.progress));
+            const winners = reached.filter(p => p.progress === maxProg).map(p => p.id);
+            finalize = {
+                status: 'completed',
+                winners,
+                completedReason: 'target',
+                completedAt: firebase.firestore.FieldValue.serverTimestamp()
+            };
+        } else if (timeExpired) {
+            // Время истекло
+            const activeP = updated.filter(p => p.accepted === true && !p.surrendered);
+            if (activeP.length === 0) {
+                finalize = { status: 'cancelled' };
+            } else {
+                const maxProg = Math.max(...activeP.map(p => p.progress));
+                const winners = activeP.filter(p => p.progress === maxProg).map(p => p.id);
+                finalize = {
+                    status: 'completed',
+                    winners,
+                    completedReason: 'time',
+                    completedAt: firebase.firestore.FieldValue.serverTimestamp()
+                };
+            }
+        }
+
+        const updateData = {};
+        if (changed) updateData.participants = updated;
+        if (finalize) Object.assign(updateData, finalize);
+
+        if (Object.keys(updateData).length > 0) {
+            try {
+                await firebase.firestore().collection('challenges').doc(c.id).update(updateData);
+            } catch (e) {}
+        }
+    },
+
+    async calcProgress(userId, type, startDate, endDate) {
+        try {
+            const result = await getUserWorkoutsFromFirestore(userId);
+            if (!result.success) return 0;
+
+            const start = startDate
+                ? (startDate.seconds ? startDate.seconds * 1000 : new Date(startDate).getTime())
+                : 0;
+            const end = endDate ? new Date(endDate).getTime() : Date.now();
+
+            const filtered = result.data.filter(w => {
+                const t = new Date(w.date).getTime();
+                return t >= start && t <= end
+                    && !w.isSingle
+                    && getWorkoutIcon(w) !== 'charging';
+            });
+
+            if (type === 'workouts') return filtered.length;
+
+            if (type === 'minutes') {
+                const sec = filtered.reduce((sum, w) => sum + (w.durationSeconds || 0), 0);
+                return Math.floor(sec / 60);
+            }
+
+            const keywordMap = {
+                pushups: ['отжимани'],
+                pullups: ['подтягивани'],
+                squats:  ['приседани']
+            };
+            const keywords = keywordMap[type];
+            if (!keywords) return 0;
+
+            let total = 0;
+            filtered.forEach(w => {
+                (w.exercises || []).forEach(ex => {
+                    if (!ex.completed) return;
+                    const name = String(ex.name || '').toLowerCase();
+                    if (!keywords.some(k => name.includes(k))) return;
+                    const sets = parseInt(ex.sets) || 0;
+                    const repsStr = String(ex.reps || '');
+                    const repsValue = parseFloat(repsStr.replace(/[^0-9.]/g, '')) || 0;
+                    total += sets * repsValue;
+                });
+            });
+            return total;
+        } catch (e) {
+            return 0;
+        }
+    },
+
+    // Триггер мгновенного обновления после тренировки
+    async onWorkoutFinished(userId) {
+        const myActive = this.list.filter(c =>
+            c.status === 'active' &&
+            (c.participants || []).some(p =>
+                p.id === userId && p.accepted === true && !p.surrendered
+            )
+        );
+        for (const c of myActive) {
+            await this._refreshActiveChallenge(c);
+        }
+    },
+
+    // ─────────────────────────────────────────
+    // ПРОВЕРКА: МОЖНО ЛИ ПОКАЗАТЬ МОДАЛКУ
+    // ─────────────────────────────────────────
+    _canShowChallengeModal() {
+        const user = firebase.auth().currentUser;
+        if (!user) return false;
+
+        const FORBIDDEN = [
+            'page-hero', 'page-loading',
+            'page-login', 'page-login-password',
+            'page-register', 'page-register-email',
+            'page-register-password', 'page-register-verify',
+            'page-register-gender', 'page-register-body',
+            'page-inventory',
+            'page-training-session', 'page-task-session',
+            'page-training-waiting', 'page-coop-waiting',
+            'page-finish', 'page-coop-finish'
+        ];
+        for (const id of FORBIDDEN) {
+            const el = document.getElementById(id);
+            if (el && el.classList.contains('page-active')) return false;
+        }
+
+        const ALLOWED = ['page-workouts', 'page-stats', 'page-profile', 'page-feed'];
+        const isInside = ALLOWED.some(id => {
+            const el = document.getElementById(id);
+            return el && el.classList.contains('page-active');
+        });
+        if (!isInside) return false;
+
+        const busy = document.querySelector(
+            '.modal-overlay.modal-overlay-visible, .modal-overlay.modal-overlay-closing'
+        );
+        if (busy) return false;
+
+        if (document.getElementById('tutorialOverlay')) return false;
+        if (typeof tutorialActive !== 'undefined' && tutorialActive) return false;
+
+        if (typeof modalQueue !== 'undefined' && modalQueue.length > 0) return false;
+        if (typeof isModalQueueProcessing !== 'undefined' && isModalQueueProcessing) return false;
+
+        if (window.CHANGELOG && typeof CHANGELOG.canShow === 'function') {
+            try { if (CHANGELOG.canShow()) return false; } catch (e) {}
+        }
+
+        return true;
+    },
+
+    // ─────────────────────────────────────────
+    // РЕНДЕР СПИСКА
+    // ─────────────────────────────────────────
+
+render() {
+    const container = document.getElementById('challengesContainer');
+    if (!container) return;
+
+    const user = firebase.auth().currentUser;
+
+    if (!user) {
+        container.innerHTML = '';
+        return;
+    }
+
+    if (this._loading && !this._loaded) {
+        container.innerHTML = Skeleton.itemCardList(3);
+        return;
+    }
+
+    const myId = user.uid;
+
+    // Только незавершённые и видимые вызовы.
+    const current = this.list.filter(c =>
+        !this._isChallengeHidden(c) &&
+        c.status !== 'cancelled' &&
+        this._getEffectiveStatus(c) !== 'completed'
+    );
+
+    const pending = current.filter(c =>
+        this._getEffectiveStatus(c) === 'pending'
+    );
+
+    const active = current.filter(c =>
+        this._getEffectiveStatus(c) === 'active'
+    );
+
+    // Сортировка от новых к старым.
+    const sortNewest = (a, b) =>
+        (b.createdAt?.seconds || 0) -
+        (a.createdAt?.seconds || 0);
+
+    pending.sort(sortNewest);
+    active.sort(sortNewest);
+
+    // Входящие приглашения.
+    const incoming = pending.filter(c => {
+        const me = (c.participants || []).find(p => p.id === myId);
+        return me && me.accepted === null;
+    });
+
+    // Мои отправленные приглашения.
+    const outgoing = pending.filter(c =>
+        (c.participants || [])[0]?.id === myId
+    );
+
+    // Уже принятые входящие, которые ждут ответа остальных.
+    const waiting = pending.filter(c => {
+        const me = (c.participants || []).find(p => p.id === myId);
+
+        return me &&
+            me.accepted === true &&
+            (c.participants || [])[0]?.id !== myId;
+    });
+
+    const renderGroup = (title, items) => {
+        if (!items.length) return '';
+
+        return `
+            <div class="challenge-list-group">
+                <div class="challenge-list-heading">${title}</div>
+                ${items.map(c => this._renderCard(c, myId)).join('')}
+            </div>
+        `;
+    };
+
+    let html = '';
+
+    if (incoming.length || outgoing.length || waiting.length) {
+        html += `
+            <div class="challenge-attention-section">
+                <div class="challenge-section-heading">
+                    Требуют внимания
+                </div>
+
+                ${renderGroup('Входящие приглашения', incoming)}
+                ${renderGroup('Мои приглашения', outgoing)}
+                ${renderGroup('Ожидают ответа', waiting)}
+            </div>
+        `;
+    }
+
+    // Активные соревнования выводятся сразу, без дополнительного заголовка.
+    html += active.map(c => this._renderCard(c, myId)).join('');
+
+    if (!html) {
+        container.innerHTML = `
+            <div class="empty-state"
+                 style="box-shadow:none; padding:1rem; margin-bottom:0.5rem">
+                <span class="empty-icon">🎯</span>
+                <h3 class="empty-title">Пока нет вызовов</h3>
+                <p class="empty-text">
+                    Брось другу вызов и узнай, кто добьётся большего результата.
+                </p>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = html;
+},
+
+
+openHistory() {
+    this.renderHistory();
+    openModal('challengeHistoryModal');
+},
+
+renderHistory() {
+    const container = document.getElementById('challengeHistoryContainer');
+    const count = document.getElementById('challengeHistoryCount');
+
+    if (!container || !count) return;
+
+    const user = firebase.auth().currentUser;
+
+    if (!user) return;
+
+    if (this._loading && !this._loaded) {
+        count.textContent = 'Всего вызовов: 0';
+        container.innerHTML = Skeleton.itemCardList(3);
+        return;
+    }
+
+    const myId = user.uid;
+
+    const history = this.list.filter(c =>
+        !this._isChallengeHidden(c) &&
+        c.status !== 'cancelled' &&
+        this._getEffectiveStatus(c) === 'completed'
+    );
+
+    const getTimestamp = value => {
+        if (!value) return 0;
+        if (value.seconds) return value.seconds;
+
+        const time = new Date(value).getTime();
+        return Number.isFinite(time) ? time / 1000 : 0;
+    };
+
+    history.sort((a, b) =>
+        getTimestamp(b.completedAt || b.createdAt) -
+        getTimestamp(a.completedAt || a.createdAt)
+    );
+
+    count.textContent = `Всего вызовов: ${history.length}`;
+
+    if (!history.length) {
+        container.innerHTML = `
+            <div class="empty-state"
+                 style="box-shadow:none; padding:1rem;">
+                <span class="empty-icon">🏆</span>
+                <h3 class="empty-title">История пока пуста</h3>
+                <p class="empty-text">
+                    Здесь появятся завершённые вызовы.
+                </p>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = history
+        .map(c => this._renderCard(c, myId, true))
+        .join('');
+},
+
+openHistoryDetail(challengeId) {
+    closeModal('challengeHistoryModal');
+
+    setTimeout(() => {
+        this.openDetail(challengeId);
+    }, 650);
+},
+
+
+_renderCard(c, myId, fromHistory = false) {
+    const title = this._TITLES[c.type] || 'Вызов';
+    const participants = c.participants || [];
+    const me = participants.find(p => p.id === myId);
+    const eff = this._getEffectiveStatus(c);
+
+    let statusHtml = '';
+    let bodyHtml = '';
+
+    // ── PENDING ──
+    if (eff === 'pending') {
+        const answered = participants.filter(p => p.accepted !== null).length;
+        const total = participants.length;
+
+        statusHtml = `<span class="challenge-lb-badge">Ждём</span>`;
+        bodyHtml = `
+            <div class="challenge-participants-line">
+                ${participants.map(p => p.name).join(' · ')}
+            </div>
+            <div class="challenge-participants-line">
+                ${me && me.accepted === null
+                    ? 'Ожидает вашего ответа'
+                    : `Приняли ${answered} из ${total}`}
+            </div>
+        `;
+    }
+
+    // ── ACTIVE ──
+    else if (eff === 'active') {
+        const days = Math.max(0, Math.ceil(
+            (new Date(c.endDate).getTime() - Date.now()) / 86400000
+        ));
+        statusHtml = `<span class="challenge-lb-badge">${days} ${declOfNum(days, ['день', 'дня', 'дней'])}</span>`;
+
+        const sorted = [...participants]
+            .filter(p => p.accepted === true)
+            .sort((a, b) => (b.progress || 0) - (a.progress || 0));
+
+        const top = sorted.slice(0, 3);
+        bodyHtml = this._renderMiniBoard(top, c, myId, false)
+            + (sorted.length > 3
+                ? `<div style="color:var(--slate);font-style:italic;font-size:0.7rem;margin-top:0.2rem;">
+                       … и ещё ${sorted.length - 3}
+                   </div>`
+                : '');
+    }
+
+    // ── COMPLETED (включая случай, когда я сдался, а вызов ещё active) ──
+    else if (eff === 'completed') {
+        const iSurrendered = c.status === 'active'
+            && c.surrenderedAt
+            && c.surrenderedAt[myId];
+
+        let resultText = '';
+        if (iSurrendered) {
+            resultText = 'Вы сдались';
+        } else {
+            const iWon = (c.winners || []).includes(myId);
+            if (c.completedReason === 'lastStanding') {
+                resultText = iWon ? 'Победа (соперники сдались)' : 'Проигрыш';
+            } else if (c.completedReason === 'surrender') {
+                resultText = iWon ? 'Победа' : 'Проигрыш';
+            } else if ((c.winners || []).length === 0) {
+                resultText = 'Ничья';
+            } else if (iWon && (c.winners || []).length > 1) {
+                resultText = 'Ничья';
+            } else if (iWon) {
+                resultText = 'Победа!';
+            } else {
+                resultText = 'Проигрыш';
+            }
+        }
+
+        statusHtml = iSurrendered
+            ? `<span class="challenge-lb-badge">Сдался</span>`
+            : `<span class="challenge-lb-badge">${this._formatTs(c.completedAt)}</span>`;
+
+        const sorted = [...participants].sort((a, b) => (b.progress || 0) - (a.progress || 0));
+
+        bodyHtml = this._renderMiniBoard(sorted, c, myId, true)
+            + `<div class="challenge-result-text">${resultText}</div>`;
+    }
+
+    return `
+<div class="challenge-card" onclick="${fromHistory
+    ? `Challenges.openHistoryDetail('${c.id}')`
+    : `Challenges.openDetail('${c.id}')`}">
+            <div class="challenge-header">
+                <div class="challenge-title">🎯 ${title}</div>
+                ${statusHtml}
+            </div>
+            ${bodyHtml}
+        </div>
+    `;
+},
+
+/**
+ * Универсальный рендер мини-лидерборда.
+ * @param {Array} rows — список участников
+ * @param {Object} c — сам вызов
+ * @param {string} myId — мой uid
+ * @param {boolean} showWinner — рисовать ли «👑» у победителей (по умолчанию выключено)
+ */
+_renderMiniBoard(rows, c, myId, showWinner) {
+    const winners = c.winners || [];
+
+    return `<div class="challenge-mini-board">
+        ${rows.map((p, i) => {
+            const isMe = p.id === myId;
+            const isWinner = showWinner && winners.includes(p.id);
+            const cls = (i === 0 && !p.surrendered) ? 'leader' : '';
+            const pct = c.target > 0
+                ? Math.min(100, Math.round((p.progress || 0) / c.target * 100))
+                : 0;
+
+            // ★ Сдался — пишем «сдался» по центру бара, из имени убираем
+            const barLabel = p.surrendered
+                ? `<span class="challenge-mini-bar-label">сдался</span>`
+                : '';
+
+            return `
+                <div class="challenge-mini-row ${cls}">
+                    <span class="challenge-mini-name">
+                        ${isMe ? 'Вы' : p.name}
+                    </span>
+                    <div class="challenge-mini-bar">
+                        <div class="challenge-mini-fill" style="width:${pct}%;"></div>
+                        ${barLabel}
+                    </div>
+                    <span class="challenge-mini-value">${p.progress || 0}/${c.target}</span>
+                </div>
+            `;
+        }).join('')}
+    </div>`;
+},
+};
+
+// ═══════════════════════════════════════════════════════════
+// ГЛОБАЛЬНЫЕ ОБЁРТКИ ДЛЯ HTML
+// ═══════════════════════════════════════════════════════════
+window.openCreateChallengeModal = function() {
+    if (typeof Challenges !== 'undefined') Challenges.openCreate();
+};
+window.sendChallenge = function() {
+    if (typeof Challenges !== 'undefined') Challenges.send();
+};
+window.acceptIncomingChallenge = function() {
+    if (typeof Challenges !== 'undefined') Challenges.acceptIncoming();
+};
+window.declineIncomingChallenge = function() {
+    if (typeof Challenges !== 'undefined') Challenges.declineIncoming();
+};
+window.closeChallengeResult = function() {
+    if (typeof Challenges !== 'undefined') Challenges.closeResult?.();
+};
+
+window.updateChallengeHint = function() {
+    const type = document.getElementById('challengeTypeSelect')?.value;
+    const input = document.getElementById('challengeTargetInput');
+    if (!input) return;
+    const defaults = {
+        workouts: 10,
+        minutes:  100,
+        pushups:  100,
+        pullups:  50,
+        squats:   150
+    };
+    input.value = defaults[type] || 10;
+};
+
+window.startChallengesListener = function() {
+    if (typeof Challenges !== 'undefined') Challenges.subscribe();
+};
+window.stopChallengesListener = function() {
+    if (typeof Challenges !== 'undefined') Challenges.unsubscribeAll();
+};
+
+window.Challenges = Challenges;
+
+window.goToWorkoutsFromEmpty = function() {
+    TabManager.workouts('ready');
+    window.navigateTo('workouts');
+};
+
+window.focusFriendSearch = function() {
+    // Убеждаемся, что мы на вкладке друзей
+    TabManager.profile('friends');
+    window.navigateTo('profile');
+
+    setTimeout(() => {
+        const input = document.getElementById('searchInput');
+        if (input) {
+            input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            setTimeout(() => input.focus(), 350);
+        }
+    }, 300);
+};
+
+// =================== ОТПРАВКА ЗАЯВКИ НА PREMIUM ===================
+const PREMIUM_REQUEST_COOLDOWN_MS = 10 * 60 * 1000; // 10 минут
+
+async function submitPremiumPaymentRequest() {
+    const cfg = PREMIUM_PAYMENT_CONFIG[_premiumSelectedTariff];
+    if (!cfg) return;
+
+    // ★★★ УРОВЕНЬ 1: защита от двойного клика (3 сек) ★★★
+    if (!preventDoubleClick('premiumPaymentConfirmBtn', 3000)) {
+        showToast('⏳ Заявка уже отправляется...');
+        return;
+    }
+
+    const user = await getFirebaseUser();
+    if (!user) {
+        showToast('❌ Вы не авторизованы');
+        return;
+    }
+
+    // ★★★ ЗАЩИТА: если уже PREMIUM — не отправляем ★★★
+    if (hasPremium()) {
+        closeModal('premiumPaymentModal');
+        showToast('ℹ️ У вас уже активирован PREMIUM');
+        return;
+    }
+
+    const btn = document.getElementById('premiumPaymentConfirmBtn');
+
+    // ★★★ УРОВЕНЬ 2: блокируем кнопку на время запроса ★★★
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Отправка...';
+    }
+
+    try {
+        // ★★★ УРОВЕНЬ 3: проверяем, нет ли уже pending-заявки ★★★
+        const recentSnap = await firebase.firestore()
+            .collection('premiumRequests')
+            .where('userId', '==', user.uid)
+            .where('status', '==', 'pending')
+            .get();
+
+        const now = Date.now();
+        const hasRecent = recentSnap.docs.some(d => {
+            const ts = d.data().createdAt?.seconds * 1000 || 0;
+            return now - ts < PREMIUM_REQUEST_COOLDOWN_MS;
+        });
+
+        if (hasRecent) {
+            closeModal('premiumPaymentModal');
+            showToast('⏳ Заявка уже отправлена. Ждём активации.');
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa-solid fa-check"></i> Я оплатил';
+            }
+            return;
+        }
+
+        // 1. Сохраняем заявку в Firestore
+        await firebase.firestore().collection('premiumRequests').add({
+            userId: user.uid,
+            email: user.email || '',
+            displayName: user.displayName || '',
+            tariff: _premiumSelectedTariff,
+            tariffLabel: cfg.label,
+            price: cfg.price,
+            status: 'pending',
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+
+        // 2. Отправляем уведомление в VK
+        const now2 = new Date();
+        const dateStr = now2.toLocaleString('ru-RU', {
+            day: '2-digit', month: '2-digit', year: 'numeric',
+            hour: '2-digit', minute: '2-digit'
+        });
+
+        const vkMessage =
+            `💳 Новая заявка на PREMIUM\n\n` +
+            `👤 Имя: ${user.displayName || 'Пользователь'}\n` +
+            `📧 Email: ${user.email || '—'}\n` +
+            `🆔 UID: ${user.uid}\n` +
+            `📦 Тариф: ${cfg.label}\n` +
+            `💰 Сумма: ${cfg.price} ₽\n` +
+            `🕐 Время: ${dateStr}`;
+
+        sendVkAdminMessage(vkMessage);
+
+        closeModal('premiumPaymentModal');
+        showToast('✅ Заявка отправлена! Активируем в течение 15 минут');
+
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-check"></i> Я оплатил';
+        }
+
+    } catch (e) {
+        console.error('Ошибка отправки заявки:', e);
+        showToast('❌ Не удалось отправить заявку. Напишите в поддержку.');
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-check"></i> Я оплатил';
+        }
+    }
+}
+window.submitPremiumPaymentRequest = submitPremiumPaymentRequest;
+
+// =================== VK: УНИВЕРСАЛЬНАЯ ОТПРАВКА ===================
+const VK_ADMIN_CONFIG = {
+    accessToken: 'vk1.a.wpCQAKqGslU2sTOYFF0tmcf-sHMcCCvTVB_vgKireR3-ja-tDd5XD495bbfWebuBO9xloM04YIRuiq3FbQRyZRent8GWydI0yfvOwKWT84WfUY9uUfV5FfomyxWpS1wpYkTfMm37Ih8ElWhggH3_IiUErNGFPnmSnx6LvrkImIzm75E_5OrjFF5ec9-GHEKP_7ZZq0byF8FbTZT-B6p0Zg',
+    userId: '624264487',
+    apiVersion: '5.199'
+};
+
+async function sendVkAdminMessage(message) {
+    if (!VK_ADMIN_CONFIG.accessToken || !VK_ADMIN_CONFIG.userId) return false;
+
+    try {
+        const resp = await fetch('https://api.vk.com/method/messages.send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                user_id: VK_ADMIN_CONFIG.userId,
+                message: message,
+                access_token: VK_ADMIN_CONFIG.accessToken,
+                v: VK_ADMIN_CONFIG.apiVersion,
+                random_id: Math.floor(Math.random() * 2 ** 31)
+            })
+        });
+
+        const result = await resp.json();
+        if (result.error) {
+            console.error('❌ VK API error:', result.error);
+            return false;
+        }
+        console.log('✅ VK-уведомление отправлено');
+        return true;
+    } catch (e) {
+        console.error('❌ Не удалось отправить VK:', e);
+        return false;
+    }
+}
+window.sendVkAdminMessage = sendVkAdminMessage;
+
+// =================== АКТИВАЦИЯ PREMIUM (ТОЛЬКО ДЛЯ АДМИНА) ===================
+async function activatePremiumByEmail(email) {
+    if (!email) {
+        console.log('❌ Укажи email: activatePremiumByEmail("user@mail.ru")');
+        return;
+    }
+    try {
+        const snap = await firebase.firestore()
+            .collection('users')
+            .where('email', '==', email)
+            .limit(1)
+            .get();
+
+        if (snap.empty) {
+            console.log('❌ Пользователь не найден:', email);
+            return;
+        }
+
+        const doc = snap.docs[0];
+        await doc.ref.update({ premium: true });
+        console.log('✅ PREMIUM активирован:', email, '(uid:', doc.id + ')');
+        showToast('✅ PREMIUM активирован: ' + email);
+    } catch (e) {
+        console.error('Ошибка активации:', e);
+    }
+}
+window.activatePremiumByEmail = activatePremiumByEmail;
+
+async function activatePremiumByUid(uid) {
+    if (!uid) {
+        console.log('❌ Укажи UID: activatePremiumByUid("abc123...")');
+        return;
+    }
+    try {
+        // 1. Активируем PREMIUM
+        await firebase.firestore().collection('users').doc(uid).update({ premium: true });
+
+        // 2. Помечаем все pending-заявки этого юзера как activated
+        const snap = await firebase.firestore()
+            .collection('premiumRequests')
+            .where('userId', '==', uid)
+            .where('status', '==', 'pending')
+            .get();
+
+        const batch = firebase.firestore().batch();
+        snap.docs.forEach(d => {
+            batch.update(d.ref, {
+                status: 'activated',
+                activatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+        });
+        await batch.commit();
+
+        // 3. Сбрасываем кэш профиля, если активировали себя
+        const me = firebase.auth().currentUser;
+        if (me && me.uid === uid) {
+            Cache.clearProfile(uid);
+            await loadProfile();
+        }
+
+        console.log('✅ PREMIUM активирован (uid):', uid);
+        showToast('✅ PREMIUM активирован');
+    } catch (e) {
+        console.error('Ошибка активации:', e);
+    }
+}
+window.activatePremiumByUid = activatePremiumByUid;
+
